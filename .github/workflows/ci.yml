@@ -22,5 +22,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q -rs
+      - name: save guard on real disk images (details)
+        if: runner.os != 'Linux'
+        run: python -m pytest -q -rs -s tests/test_guard_real.py
       - name: selftest (quick)
         run: recover-anything selftest --quick
