@@ -12,10 +12,11 @@ from array import array
 
 
 class Result:
-    __slots__ = ("end", "complete", "ext", "reason", "kind", "break_pos")
+    __slots__ = ("end", "complete", "ext", "reason", "kind", "break_pos", "refs")
 
-    def __init__(self, end, complete, ext, reason="ok", kind=None, break_pos=None):
+    def __init__(self, end, complete, ext, reason="ok", kind=None, break_pos=None, refs=()):
         self.end, self.complete, self.ext, self.reason, self.kind, self.break_pos = end, complete, ext, reason, kind, break_pos
+        self.refs = refs  # offsets (from the start) of files this one contains, e.g. a RAW's previews
 
 
 # ------------------------------------------------------------------ ISO BMFF
@@ -365,22 +366,40 @@ def probe_riff(head: bytes) -> bool:
     return head[:4] == b"RIFF" and head[8:12] in RIFF_EXT
 
 
-def measure_riff(read, start: int, limit: int) -> Result:
+def measure_riff(read, start: int, limit: int, want_refs: bool = False) -> Result:
     h = read(start, 12)
     size = struct.unpack("<I", h[4:8])[0] + 8
     size += size & 1
     ext = RIFF_EXT.get(h[8:12], ".riff")
     if size > limit:
         return Result(0, False, ext, "too long")
+    refs = set()
     # walk top-level chunks to make sure the size is believable
     pos = 12
     while pos + 8 <= size:
-        c = read(start + pos, 8)
+        c = read(start + pos, 12)
         if len(c) < 8 or not all(32 <= x < 127 for x in c[:4]):
             return Result(size, False, ext, "chunk structure broken at %d" % pos, break_pos=pos)
         n = struct.unpack("<I", c[4:8])[0]
+        if want_refs and c[:4] == b"LIST" and c[8:12] == b"movi":
+            _riff_frames(read, start, pos + 12, min(size, pos + 8 + n), refs)
         pos += 8 + n + (n & 1)
-    return Result(size, pos == size or pos == size - 1, ext)
+    return Result(size, pos == size or pos == size - 1, ext, refs=refs)
+
+
+def _riff_frames(read, start: int, pos: int, end: int, refs: set, depth: int = 0) -> None:
+    """Where each chunk's data starts inside an AVI 'movi' list (one level of
+    'rec ' lists): a Motion-JPEG AVI stores every frame as a JPEG there."""
+    while pos + 8 <= end and len(refs) < 1000000:
+        c = read(start + pos, 12)
+        if len(c) < 8:
+            return
+        n = struct.unpack("<I", c[4:8])[0]
+        if c[:4] == b"LIST" and depth == 0:
+            _riff_frames(read, start, pos + 12, min(end, pos + 8 + n), refs, 1)
+        else:
+            refs.add(pos + 8)
+        pos += 8 + n + (n & 1)
 
 
 # --------------------------------------------------------------------- TIFF
@@ -408,6 +427,7 @@ def measure_tiff(read, start: int, limit: int) -> Result:
     seen = set()
     todo = [struct.unpack(bo + "I", head[4:8])[0]]
     strip_pairs = {(0x0111, 0x0117), (0x0144, 0x0145), (0x0201, 0x0202)}
+    refs = set()
     while todo and len(seen) < 64:
         ifd = todo.pop()
         if ifd in seen or ifd < 8 or ifd > limit:
@@ -450,6 +470,8 @@ def measure_tiff(read, start: int, limit: int) -> Result:
                 for o, ln in zip(offs, lens):
                     if o + ln <= limit:
                         end = max(end, o + ln)
+                        if len(refs) < 100000:
+                            refs.add(o)
     if ext == ".tif":
         m = make.upper()
         if m.startswith(b"NIKON"):
@@ -460,7 +482,7 @@ def measure_tiff(read, start: int, limit: int) -> Result:
             ext = ".pef"
         elif m.startswith(b"CANON"):
             ext = ".cr2"
-    return Result(end, end > 1024, ext, "ok" if end > 1024 else "too small")
+    return Result(end, end > 1024, ext, "ok" if end > 1024 else "too small", refs=refs)
 
 
 def _vals(read, start, bo, typ, count, off):

@@ -109,8 +109,9 @@ def _member_crc(read, at: int, csize: int, usize: int, method: int) -> int:
     return crc & 0xFFFFFFFF
 
 
-def validate_zip(read, length: int) -> tuple[str, str]:
-    """Check every member's CRC (stored and deflated members)."""
+def validate_zip(read, length: int, refs: set | None = None) -> tuple[str, str]:
+    """Check every member's CRC (stored and deflated members). If `refs` is
+    given, the offset of every member's data is added to it."""
     import struct
     import zlib
     tail = read(max(0, length - 65558), min(length, 65558))
@@ -132,13 +133,15 @@ def validate_zip(read, length: int) -> tuple[str, str]:
         if len(lh) < 30 or lh[:4] != b"PK\x03\x04":
             return "corrupt", "a member is missing (byte %d)" % lho
         ln, lx = struct.unpack("<HH", lh[26:30])
+        data_at = lho + 30 + ln + lx
+        if refs is not None:
+            refs.add(data_at)
         if (method not in (0, 8) or 0xFFFFFFFF in (csize, usize) or csize > cbudget or usize > ubudget
                 or (method == 0 and csize != usize)):
             skipped += 1
             continue
         cbudget -= csize
         ubudget -= usize
-        data_at = lho + 30 + ln + lx
         try:
             got = _member_crc(read, data_at, csize, usize, method)
         except _ZipBad as e:
