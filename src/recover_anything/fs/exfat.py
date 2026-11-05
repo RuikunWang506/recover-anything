@@ -11,7 +11,6 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import struct
-from array import array
 
 from ..records import Found, Geometry
 
@@ -44,23 +43,38 @@ class ExfatVolume:
         bs = src.read(offset, 512)
         if bs[3:11] != b"EXFAT   ":
             raise ValueError("not exFAT")
+        vol_len = struct.unpack_from("<Q", bs, 72)[0]
         (fat_off, fat_len, heap_off, self.cluster_count, self.root_cluster) = struct.unpack_from("<IIIII", bs, 80)
         bps_shift, spc_shift, self.nfats = bs[108], bs[109], bs[110]
+        # Out-of-range shifts or offsets mean a damaged boot sector: refuse, so
+        # the caller falls back to the backup copy or raw carving.
+        if not (9 <= bps_shift <= 12 and spc_shift <= 25 - bps_shift and self.nfats in (1, 2)):
+            raise ValueError("implausible exFAT geometry")
         self.bps = 1 << bps_shift
         self.cluster_size = 1 << (bps_shift + spc_shift)
+        size = getattr(src, "size", 0) or 0
+        vol_bytes = vol_len * self.bps
+        if size and vol_bytes > (size - offset) * 1.05 + (1 << 20):
+            vol_bytes = size - offset  # claims to be bigger than the device: trust the device
+        if not (0 < fat_off < heap_off) or heap_off * self.bps >= max(vol_bytes, 1) or self.cluster_count < 1:
+            raise ValueError("implausible exFAT layout")
         self.fat_offset = offset + fat_off * self.bps
         self.data_offset = offset + heap_off * self.bps
+        fits = (offset + vol_bytes - self.data_offset) // self.cluster_size
+        if size:
+            fits = min(fits, (size - self.data_offset) // self.cluster_size)
+        self.cluster_count = max(0, min(self.cluster_count, fits))
+        if not 2 <= self.root_cluster < self.cluster_count + 2:
+            raise ValueError("implausible exFAT root folder")
         self.kind = "exFAT"
         self.label = ""
         self.geometry = Geometry(self.data_offset, self.cluster_size, 2, self.cluster_count)
-        n = self.cluster_count + 2
-        a = array("I")
-        a.frombytes(src.read(self.fat_offset, n * 4).ljust(n * 4, b"\x00"))
-        if struct.pack("<I", 1) != b"\x01\x00\x00\x00":
-            a.byteswap()
-        self.fat = a
         self.bitmap = None
         self.visited_dirs: set[int] = set()
+
+    def _fat(self, c: int) -> int:
+        b = self.src.read(self.fat_offset + 4 * c, 4)
+        return struct.unpack("<I", b)[0] if len(b) == 4 else 0
 
     def cluster_offset(self, c: int) -> int:
         return self.data_offset + (c - 2) * self.cluster_size
@@ -78,7 +92,7 @@ class ExfatVolume:
                 return None
             seen.add(c)
             out.append(c)
-            nxt = self.fat[c]
+            nxt = self._fat(c)
             if nxt >= 0xFFFFFFF8:
                 return out
             if nxt < 2 or nxt == 0xFFFFFFF7:
@@ -112,9 +126,10 @@ class ExfatVolume:
 
     def _dir_blob(self, first: int, length: int | None, no_fat_chain: bool, live: bool) -> bytes:
         if length:
+            length = min(length, 256 << 20)  # the exFAT maximum for a directory
             ext, _ = self._data(first, length, no_fat_chain, live)
             return b"".join(self.src.read(o, n) for o, n in ext)
-        ch = self.chain(first) if live else None
+        ch = self.chain(first, limit=4096) if live else None
         if ch:
             return b"".join(self.src.read(self.cluster_offset(c), self.cluster_size) for c in ch[:4096])
         return self.src.read(self.cluster_offset(first), self.cluster_size)
@@ -128,7 +143,9 @@ class ExfatVolume:
                 break
             if t == 0x81 and self.bitmap is None:
                 first, length = struct.unpack_from("<IQ", e, 20)
-                self.bitmap = self.src.read(self.cluster_offset(first), min(length, 1 << 26))
+                if 2 <= first < self.cluster_count + 2:
+                    self.bitmap = self.src.read(self.cluster_offset(first),
+                                                min(length, (self.cluster_count + 7) // 8, 1 << 26))
             if t in (0x85, 0x05):
                 sc = e[1]
                 if 2 <= sc <= 18 and i + sc < n:
@@ -163,10 +180,14 @@ class ExfatVolume:
         if depth > 32 or first in self.visited_dirs:
             return
         self.visited_dirs.add(first)
-        blob = self._dir_blob(first, length, nfc, live)
+        try:
+            blob = self._dir_blob(first, length, nfc, live)
+            ents = list(self.parse_sets(blob))
+        except Exception:
+            return  # one unreadable folder must not hide the others
         for c in range(first, first + max(1, len(blob) // self.cluster_size)):
             self.visited_dirs.add(c)
-        for ent in self.parse_sets(blob):
+        for ent in ents:
             if ent["is_dir"]:
                 if ent["start"] >= 2:
                     yield from self._walk(ent["start"], ent["size"], ent["no_fat_chain"], path + ent["name"] + "/",
@@ -188,7 +209,8 @@ class ExfatVolume:
         rec.meta["start_cluster"] = ent["start"]
         if deleted and self.bitmap is not None:
             n = (ent["size"] + self.cluster_size - 1) // self.cluster_size
-            reused = sum(1 for c in range(ent["start"], min(ent["start"] + n, self.cluster_count + 2))
+            reused = sum(1 for c in range(ent["start"], min(ent["start"] + n, ent["start"] + 4096,
+                                                             self.cluster_count + 2))
                          if self.is_allocated(c))
             if reused:
                 rec.meta["reused_clusters"] = reused
@@ -196,6 +218,8 @@ class ExfatVolume:
         return rec
 
     def _looks_like_dir(self, blob: bytes, o: int) -> bool:
+        if o + 96 > len(blob):
+            return False
         t = blob[o]
         if t not in (0x85, 0x05):
             return False
@@ -224,7 +248,12 @@ class ExfatVolume:
         if not dirs:
             return
         dirset = set(dirs)
-        parsed = {d: list(self.parse_sets(self.src.read(self.cluster_offset(d), cs))) for d in dirs}
+        parsed = {}
+        for d in dirs:
+            try:
+                parsed[d] = list(self.parse_sets(self.src.read(self.cluster_offset(d), cs)))
+            except Exception:
+                continue
         names, parent = {}, {}
         for d, ents in parsed.items():
             for e in ents:

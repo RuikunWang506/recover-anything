@@ -19,9 +19,11 @@ _MARKER_RE = re.compile(rb"\xff[^\x00]")
 _ZERO_RUN = bytes(4096)
 
 
+_FIRST_MARKERS = set(range(0xE0, 0xF0)) | {0xFE, 0xDB, 0xC0, 0xC1, 0xC2, 0xC4, 0xDD}
+
+
 def probe(head: bytes) -> bool:
-    return len(head) >= 4 and head[0] == 0xFF and head[1] == 0xD8 and head[2] == 0xFF and head[3] in (
-        0xE0, 0xE1, 0xE2, 0xE3, 0xE8, 0xEB, 0xED, 0xEE, 0xFE, 0xDB, 0xC0, 0xC4, 0xDD)
+    return len(head) >= 4 and head[0] == 0xFF and head[1] == 0xD8 and head[2] == 0xFF and head[3] in _FIRST_MARKERS
 
 
 class JpegError(Exception):
@@ -149,6 +151,8 @@ def parse_header(read, start: int, limit: int = 4 * 1024 * 1024) -> Header:
                 h.restart = struct.unpack(">H", seg[:2])[0]
         elif m == 0xDA:
             ns = seg[0] if seg else 0
+            if len(seg) < 1 + 2 * ns:
+                raise JpegError("short SOS")
             for i in range(ns):
                 cid, t = seg[1 + 2 * i:3 + 2 * i]
                 h.scan.append((cid, t >> 4, t & 15))
@@ -329,7 +333,9 @@ class Decoder:
             self.bh, self.bv = self.units[0][2], self.units[0][3]
         self.total = self.mcu_w * self.mcu_h
         self.bw = self.mcu_w * self.bh  # luma blocks per row
-        self.dc = array("i", bytes(4 * self.bw * self.mcu_h * self.bv))
+        if self.total > 50_000_000:
+            raise JpegError("image too large to decode")
+        self.dc = array("q", bytes(8 * self.bw * self.mcu_h * self.bv))
         self.buf = b""
         self.reset()
 

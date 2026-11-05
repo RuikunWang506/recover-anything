@@ -88,15 +88,32 @@ class Source:
         self._cache_blocks = cache_blocks
         self._lock = threading.Lock()
         self.bad_ranges: list[tuple[int, int]] = []
+        if self.size <= 0 and self.is_device:
+            self.size = 0
 
-    # Reads are aligned to 1 MiB blocks, which also satisfies the sector
-    # alignment Windows and macOS raw devices demand.
-    def _raw(self, off: int, n: int) -> bytes:
+    # Raw devices (macOS /dev/rdisk*, Windows \\.\PhysicalDrive*) only accept
+    # reads whose offset and length are multiples of the sector size, which
+    # can be 512 or 4096 bytes. Device reads are therefore always widened to
+    # 4096-byte boundaries and trimmed afterwards.
+    ALIGN = 4096
+
+    def _pread(self, off: int, n: int) -> bytes:
         with self._lock:
             if hasattr(os, "pread"):
                 return os.pread(self._fd, n, off)
             os.lseek(self._fd, off, os.SEEK_SET)
             return os.read(self._fd, n)
+
+    def _raw(self, off: int, n: int, align: int = 0) -> bytes:
+        if not self.is_device:
+            return self._pread(off, n)
+        align = align or self.ALIGN
+        a0 = off - off % align
+        a1 = -(-(off + n) // align) * align
+        if self.size:
+            a1 = min(a1, self.size)
+        data = self._pread(a0, a1 - a0)
+        return data[off - a0:off - a0 + n]
 
     def _block(self, idx: int) -> bytes:
         blk = self._cache.get(idx)
@@ -117,14 +134,24 @@ class Source:
         return blk
 
     def _careful_read(self, off: int, n: int) -> bytes:
-        """Sector-by-sector read; unreadable sectors become zeros and are logged."""
+        """Read around bad spots: 4 KB at a time, then sector by sector inside a
+        failing 4 KB. Unreadable sectors become zeros and are logged."""
         out = bytearray()
-        for s in range(off, off + n, SECTOR):
+        end = off + n
+        pos = off
+        while pos < end:
+            step = min(self.ALIGN - pos % self.ALIGN, end - pos)
             try:
-                out += self._raw(s, SECTOR)
+                out += self._raw(pos, step)
             except OSError:
-                out += bytes(SECTOR)
-                self.bad_ranges.append((s, SECTOR))
+                for s in range(pos, pos + step, SECTOR):
+                    k = min(SECTOR, pos + step - s)
+                    try:
+                        out += self._raw(s, k, align=SECTOR)
+                    except OSError:
+                        out += bytes(k)
+                        self.bad_ranges.append((s, k))
+            pos += step
         return bytes(out)
 
     def read(self, off: int, n: int) -> bytes:

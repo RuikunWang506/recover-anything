@@ -13,7 +13,6 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import struct
-from array import array
 
 from ..records import Found, Geometry
 
@@ -62,6 +61,33 @@ def probe(bs: bytes) -> bool:
     return nfats in (1, 2) and reserved >= 1
 
 
+class _LazyFat:
+    """FAT entries read on demand (through the source's block cache), so a
+    corrupted or huge FAT never has to be held in memory."""
+
+    def __init__(self, src, offset: int, count: int, kind: str):
+        self.src, self.offset, self.count, self.kind = src, offset, count, kind
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, c: int) -> int:
+        if not 0 <= c < self.count:
+            raise IndexError(c)
+        if self.kind == "FAT32":
+            b = self.src.read(self.offset + 4 * c, 4)
+            return (struct.unpack("<I", b)[0] & 0x0FFFFFFF) if len(b) == 4 else 0
+        if self.kind == "FAT16":
+            b = self.src.read(self.offset + 2 * c, 2)
+            return struct.unpack("<H", b)[0] if len(b) == 2 else 0
+        i = c * 3 // 2
+        b = self.src.read(self.offset + i, 2)
+        if len(b) < 2:
+            return 0
+        v = b[0] | (b[1] << 8)
+        return v >> 4 if c & 1 else v & 0xFFF
+
+
 class FatVolume:
     def __init__(self, src, offset: int = 0):
         self.src = src
@@ -82,6 +108,23 @@ class FatVolume:
         self.data_offset = self.root_offset + root_sectors * self.bps
         data_sectors = total - (reserved + self.nfats * self.fatsz + root_sectors)
         self.cluster_count = max(0, data_sectors // self.spc)
+        size = getattr(src, "size", 0) or 0
+        vol_bytes = total * self.bps
+        # A damaged boot sector can claim anything. Refuse geometry that cannot
+        # be right so the caller falls back to the backup copy or raw carving.
+        if (total <= 0 or self.fatsz <= 0 or self.cluster_count < 1 or reserved < 1
+                or (size and self.data_offset >= size)
+                or self.nfats * self.fatsz * self.bps > max(vol_bytes, 1)
+                or self.fatsz * self.bps < (min(self.cluster_count, 1 << 20) + 2) * (1.5 if fatsz16 else 4) * 0.5):
+            raise ValueError("implausible FAT geometry")
+        self.truncated = False
+        if size:
+            fits = max(0, (size - self.data_offset) // self.cluster_size)
+            if fits < self.cluster_count:
+                # An image cut short (dd stopped at a read error) or a size field
+                # that is too big: use the clusters that actually exist.
+                self.truncated = vol_bytes > (size - offset)
+                self.cluster_count = fits
         if fatsz16 == 0:
             self.kind = "FAT32"
         elif self.cluster_count < 4085:
@@ -92,31 +135,8 @@ class FatVolume:
         self.root_size = root_sectors * self.bps
         self.label = (bs[71:82] if self.kind == "FAT32" else bs[43:54]).decode("latin-1").strip()
         self.geometry = Geometry(self.data_offset, self.cluster_size, 2, self.cluster_count)
-        self.fat = self._read_fat()
+        self.fat = _LazyFat(src, self.fat_offset, self.cluster_count + 2, self.kind)
         self.visited_dirs: set[int] = set()
-
-    # ------------------------------------------------------------------ FAT
-    def _read_fat(self):
-        n = self.cluster_count + 2
-        raw = self.src.read(self.fat_offset, self.fatsz * self.bps)
-        if self.kind == "FAT32":
-            a = array("I")
-            a.frombytes(raw[: n * 4].ljust(n * 4, b"\x00"))
-            if struct.pack("<I", 1) != b"\x01\x00\x00\x00":
-                a.byteswap()
-            return [v & 0x0FFFFFFF for v in a]
-        if self.kind == "FAT16":
-            a = array("H")
-            a.frombytes(raw[: n * 2].ljust(n * 2, b"\x00"))
-            if struct.pack("<H", 1) != b"\x01\x00":
-                a.byteswap()
-            return list(a)
-        out = []
-        for c in range(n):
-            i = c * 3 // 2
-            v = raw[i] | (raw[i + 1] << 8) if i + 1 < len(raw) else 0
-            out.append(v >> 4 if c & 1 else v & 0xFFF)
-        return out
 
     @property
     def eoc(self) -> int:
@@ -261,7 +281,7 @@ class FatVolume:
     def _dir_blob(self, start: int, live: bool) -> bytes:
         if start == 0 and self.kind != "FAT32":
             return self.src.read(self.root_offset, self.root_size)
-        clusters = self.chain(start) if live else None
+        clusters = self.chain(start, limit=4096) if live else None
         if clusters:
             return b"".join(self.src.read(self.cluster_offset(c), self.cluster_size) for c in clusters)
         # broken or deleted chain: read clusters while they still look like a directory
@@ -269,10 +289,12 @@ class FatVolume:
         c = start
         while 2 <= c < self.cluster_count + 2 and len(out) < 64:
             data = self.src.read(self.cluster_offset(c), self.cluster_size)
+            if len(data) < 32:
+                break
             if out and (data[:11] == b".          " or not self.looks_like_dir_cluster(data)):
                 break
             out.append(data)
-            if b"\x00" * 32 in data[-32:] or data[-32] == 0:
+            if data[-32] == 0:
                 break
             c += 1
         return b"".join(out)
@@ -286,8 +308,12 @@ class FatVolume:
         if depth > 32 or start in self.visited_dirs:
             return
         self.visited_dirs.add(start)
-        blob = self._dir_blob(start, live)
-        for ent in self.parse_entries(blob):
+        try:
+            blob = self._dir_blob(start, live)
+            ents = list(self.parse_entries(blob))
+        except Exception:
+            return  # one unreadable folder must not hide the others
+        for ent in ents:
             if ent["is_dir"]:
                 if ent["start"] >= 2:
                     yield from self._walk_dir(ent["start"], path + ent["name"] + "/", live and not ent["deleted"],
@@ -321,7 +347,8 @@ class FatVolume:
         rec.meta["chain"] = "assumed-contiguous"
         rec.meta["start_cluster"] = start
         n = (size + self.cluster_size - 1) // self.cluster_size
-        reused = sum(1 for c in range(start, min(start + n, self.cluster_count + 2)) if self.is_allocated(c))
+        reused = sum(1 for c in range(start, min(start + n, start + 4096, self.cluster_count + 2))
+                     if self.is_allocated(c))
         if deleted and reused:
             rec.meta["reused_clusters"] = reused
             rec.note = "some of its space now belongs to another file"
@@ -343,6 +370,8 @@ class FatVolume:
             blob = self.src.read_uncached(self.cluster_offset(c), n * cs)
             for k in range(n):
                 o = k * cs
+                if o + 64 > len(blob):
+                    break
                 if blob[o:o + 11] == b".          " and blob[o + 11] & 0x10 and blob[o + 32:o + 43] == b"..         ":
                     me = (struct.unpack_from("<H", blob, o + 20)[0] << 16) | struct.unpack_from("<H", blob, o + 26)[0]
                     if me == c + k:
@@ -361,7 +390,10 @@ class FatVolume:
         names: dict[int, str] = {}
         parsed: dict[int, list] = {}
         for c in orphans:
-            ents = list(self.parse_entries(self._dir_blob(c, live=False)))
+            try:
+                ents = list(self.parse_entries(self._dir_blob(c, live=False)))
+            except Exception:
+                continue
             parsed[c] = ents
             for e in ents:
                 if e["is_dir"] and e["start"] in orphans:

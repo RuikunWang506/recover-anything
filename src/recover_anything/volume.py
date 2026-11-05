@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import struct
+import zlib
 from dataclasses import dataclass
 
 from .fs import fat as fatfs
@@ -30,7 +31,11 @@ def identify(src, off: int) -> tuple[str, str]:
     if bs[:6] == b"LUKS\xba\xbe":
         return "LUKS", ""
     if bs[3:11] == b"EXFAT   ":
-        return "exFAT", ""
+        try:
+            exfatfs.ExfatVolume(src, off)
+            return "exFAT", ""
+        except Exception:
+            return "damaged", ""
     if bs[3:11] == b"NTFS    ":
         return "NTFS", ""
     if bs[32:36] == b"NXSB":
@@ -44,7 +49,7 @@ def identify(src, off: int) -> tuple[str, str]:
             v = fatfs.FatVolume(src, off)
             return v.kind, v.label
         except Exception:
-            return "FAT?", ""
+            return "damaged", ""
     return "unknown", ""
 
 
@@ -59,25 +64,39 @@ def _mbr_parts(src) -> list[tuple[int, int, int]]:
         e = mbr[446 + 16 * i:462 + 16 * i]
         typ = e[4]
         start, count = struct.unpack("<II", e[8:16])
-        if typ and count and e[0] in (0x00, 0x80):
-            parts.append((typ, start * 512, count * 512))
+        off, size = start * 512, count * 512
+        if typ and count and e[0] in (0x00, 0x80) and 0 < off < src.size:
+            parts.append((typ, off, min(size, src.size - off)))
     return parts
 
 
 def _gpt_parts(src) -> list[tuple[int, int, int]]:
-    hdr = src.read(512, 92)
-    if hdr[:8] != b"EFI PART":
-        return []
-    lba, n, esize = struct.unpack("<QII", hdr[72:88])
-    out = []
-    table = src.read(lba * 512, n * esize)
-    for i in range(n):
-        e = table[i * esize:(i + 1) * esize]
-        if len(e) < 48 or e[:16] == bytes(16):
+    for sector in (512, 4096):
+        hdr = src.read(sector, sector)
+        if hdr[:8] != b"EFI PART":
             continue
-        first, last = struct.unpack("<QQ", e[32:48])
-        out.append((0xEE, first * 512, (last - first + 1) * 512))
-    return out
+        hsize = struct.unpack("<I", hdr[12:16])[0]
+        if not 92 <= hsize <= sector:
+            continue
+        crc = struct.unpack("<I", hdr[16:20])[0]
+        if zlib.crc32(hdr[:16] + b"\x00\x00\x00\x00" + hdr[20:hsize]) & 0xFFFFFFFF != crc:
+            continue  # damaged header: don't trust its numbers
+        lba, n, esize = struct.unpack("<QII", hdr[72:88])
+        if not (1 <= n <= 1024 and 128 <= esize <= 1024 and esize % 8 == 0) or lba * sector >= src.size:
+            continue
+        out = []
+        table = src.read(lba * sector, n * esize)
+        for i in range(n):
+            e = table[i * esize:(i + 1) * esize]
+            if len(e) < 48 or e[:16] == bytes(16):
+                continue
+            first, last = struct.unpack("<QQ", e[32:48])
+            off = first * sector
+            if last < first or off >= src.size:
+                continue
+            out.append((0xEE, off, min((last - first + 1) * sector, src.size - off)))
+        return out
+    return []
 
 
 def find_volumes(src) -> list[Volume]:
@@ -86,16 +105,19 @@ def find_volumes(src) -> list[Volume]:
     if parts:
         for _t, off, size in parts:
             fs, label = identify(src, off)
-            if fs == "unknown":
+            if fs in ("unknown", "damaged"):
                 fs2, label2, boff = _backup_boot(src, off)
                 if fs2 != "unknown":
                     vols.append(Volume(off, size, fs2, label2, "main boot sector is damaged; using the backup copy",
                                        from_backup=True))
                     continue
+                if fs == "damaged":
+                    vols.append(Volume(off, size, "unknown", "", "the filesystem is damaged; searching the raw data"))
+                    continue
             vols.append(Volume(off, size, fs, label))
         return vols
     fs, label = identify(src, 0)
-    if fs == "unknown":
+    if fs in ("unknown", "damaged"):
         fs2, label2, _ = _backup_boot(src, 0)
         if fs2 != "unknown":
             return [Volume(0, src.size, fs2, label2, "main boot sector is damaged; using the backup copy", True)]
@@ -104,19 +126,28 @@ def find_volumes(src) -> list[Volume]:
         for guess in (4 << 20, 8 << 20, 1 << 20, 32256, 16 << 20):
             if guess < src.size:
                 g, gl = identify(src, guess)
-                if g != "unknown":
+                if g not in ("unknown", "damaged"):
                     return [Volume(guess, src.size - guess, g, gl, "partition table missing; found the filesystem anyway")]
+        if fs == "damaged":
+            return [Volume(0, src.size, "unknown", "", "the filesystem is damaged; searching the raw data")]
     return [Volume(0, src.size, fs, label)]
 
 
 def _backup_boot(src, off: int) -> tuple[str, str, int]:
-    # FAT32 keeps a copy at sector 6, exFAT at sector 12.
-    for sec in (6, 12):
+    # FAT32 keeps a copy at sector 6, exFAT at sector 12. Only accept a copy
+    # whose geometry actually makes sense.
+    for sec, kind in ((6, "FAT"), (12, "exFAT")):
         bs = src.read(off + sec * 512, 512)
-        if bs[3:11] == b"EXFAT   " and sec == 12:
-            return "exFAT", "", off + sec * 512
-        if fatfs.probe(bs) and sec == 6:
-            return "FAT32", "", off + sec * 512
+        view = _Patched(src, off, sec)
+        try:
+            if kind == "exFAT" and bs[3:11] == b"EXFAT   ":
+                exfatfs.ExfatVolume(view, off)
+                return "exFAT", "", off + sec * 512
+            if kind == "FAT" and fatfs.probe(bs):
+                v = fatfs.FatVolume(view, off)
+                return v.kind, v.label, off + sec * 512
+        except Exception:
+            continue
     return "unknown", "", 0
 
 
@@ -155,4 +186,16 @@ class _Patched:
         return data
 
     def read_uncached(self, off: int, n: int) -> bytes:
-        return self.read(off, n)
+        data = self.src.read_uncached(off, n)
+        s, e = self.vol_off, self.vol_off + 512
+        if off < e and off + n > s:
+            b = bytearray(data)
+            lo, hi = max(off, s), min(off + len(data), e)
+            if hi > lo:
+                b[lo - off:hi - off] = self.boot[lo - s:hi - s]
+            data = bytes(b)
+        return data
+
+    @property
+    def bad_ranges(self):
+        return getattr(self.src, "bad_ranges", [])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import errno
 import hashlib
 import json
 import os
@@ -16,9 +17,18 @@ FOLDER = {"photo": "Photos", "video": "Videos", "document": "Documents"}
 _BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
-def _safe(name: str) -> str:
-    name = _BAD.sub("_", name).strip(" .")
-    return name[:180] or "file"
+_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
+
+
+def _safe(name: str, max_bytes: int = 200) -> str:
+    name = _BAD.sub("_", name).strip(" .") or "file"
+    stem, ext = os.path.splitext(name)
+    if stem.upper() in _RESERVED:
+        stem = "_" + stem
+    ext = ext[:16]
+    while len((stem + ext).encode("utf-8")) > max_bytes and stem:
+        stem = stem[:-1]
+    return (stem or "file") + ext
 
 
 def _unique(path: str) -> str:
@@ -31,8 +41,39 @@ def _unique(path: str) -> str:
     return "%s (%d)%s" % (base, i, ext)
 
 
+def _write_one(reader, r, folder, name, seen):
+    dest = _unique(os.path.join(folder, _safe(name)))
+    h = hashlib.sha256()
+    tmp = dest + ".part"
+    try:
+        with open(tmp, "wb") as f:
+            pos, step = 0, 8 << 20
+            while pos < reader.length:
+                chunk = reader.read(pos, step)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                pos += len(chunk)
+            if r.kind == "jpeg" and r.status == "partial":
+                f.write(b"\xff\xd9")  # lets viewers show the part that exists
+                h.update(b"\xff\xd9")
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    digest = h.hexdigest()
+    if digest in seen:
+        os.remove(tmp)
+        return "duplicate", seen[digest]
+    os.replace(tmp, dest)
+    return dest, digest
+
+
 def plan_size(found) -> int:
-    return sum(r.size for r in found if r.status in ("ok", "partial", "unverified"))
+    return sum(r.size for r in found if r.status in ("ok", "partial", "unverified", "corrupt"))
 
 
 def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> dict:
@@ -40,7 +81,8 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
     os.makedirs(out_dir, exist_ok=True)
     seen: dict[str, str] = {}
     written = []
-    rank = {"ok": 0, "unverified": 1, "partial": 2}
+    rank = {"ok": 0, "unverified": 1, "partial": 2, "corrupt": 3}
+    failed = []
     todo = [r for r in res.found if r.status in rank and r.extents and (keep_partial or r.status != "partial")]
     todo.sort(key=lambda r: (rank[r.status], r.name is None, r.start))
     for i, r in enumerate(todo):
@@ -48,7 +90,7 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
         when = capture_time(r.kind, reader.read, reader.length) if r.kind != "other" else None
         when = when or r.fs_time
         group = GROUP.get(r.kind, "other")
-        if r.status == "partial":
+        if r.status in ("partial", "corrupt"):
             top = "Partly recovered"
         elif r.status == "unverified" and r.kind == "other":
             top = "Other files"
@@ -66,28 +108,25 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
         else:
             name = "Recovered %010d%s" % (r.start // 512, ext)
         folder = os.path.join(out_dir, top, sub) if sub else os.path.join(out_dir, top)
-        os.makedirs(folder, exist_ok=True)
-        dest = _unique(os.path.join(folder, _safe(name)))
-        h = hashlib.sha256()
-        tmp = dest + ".part"
-        with open(tmp, "wb") as f:
-            pos, step = 0, 8 << 20
-            while pos < reader.length:
-                chunk = reader.read(pos, step)
-                if not chunk:
+        fallback = "Recovered %010d%s" % (r.start // 512, _safe(ext, 16) if ext else "")
+        dest = digest = None
+        for attempt, nm in enumerate((name, fallback)):
+            try:
+                os.makedirs(folder, exist_ok=True)
+                dest, digest = _write_one(reader, r, folder, nm, seen)
+                break
+            except OSError as e:
+                if attempt == 1 or getattr(e, "errno", None) in (errno.EFBIG, errno.ENOSPC):
+                    why = ("too big for the output drive's filesystem (FAT32 drives can't hold files over 4 GB)"
+                           if getattr(e, "errno", None) == errno.EFBIG else str(e))
+                    failed.append((os.path.join(top, nm), why))
+                    dest = None
                     break
-                f.write(chunk)
-                h.update(chunk)
-                pos += len(chunk)
-            if r.kind == "jpeg" and r.status == "partial":
-                f.write(b"\xff\xd9")  # lets viewers show the part that exists
-                h.update(b"\xff\xd9")
-        digest = h.hexdigest()
-        if digest in seen:
-            os.remove(tmp)
-            r.meta["duplicate_of"] = seen[digest]
+        if dest is None:
             continue
-        os.replace(tmp, dest)
+        if dest == "duplicate":
+            r.meta["duplicate_of"] = digest
+            continue
         seen[digest] = dest
         if when:
             try:
@@ -104,6 +143,7 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
     manifest = {
         "tool": "recover-anything",
         "source": res.source,
+        "image": getattr(res, "image", None),
         "source_size": res.size,
         "created": _dt.datetime.now().isoformat(timespec="seconds"),
         "volumes": [{"offset": v.offset, "size": v.size, "filesystem": v.fs, "note": v.note} for v in res.volumes],
@@ -127,12 +167,13 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
         ],
         "not_recoverable": [
             {"original_name": r.name, "original_folder": r.path, "reason": r.note}
-            for r in res.found if r.status in ("lost", "corrupt") and r.name
+            for r in res.found if r.status == "lost" and r.name
         ],
     }
+    manifest["could_not_save"] = [{"file": f, "reason": why} for f, why in failed]
     with open(os.path.join(out_dir, "recovery.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
-    return {"written": written, "manifest": manifest}
+    return {"written": written, "manifest": manifest, "failed": failed}
 
 
 def free_space(path: str) -> int:

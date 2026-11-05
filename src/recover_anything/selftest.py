@@ -26,6 +26,64 @@ def _hash_tree(root: str) -> dict:
     return out
 
 
+def stress(cards: int, keep: str | None = None, as_json: bool = False, seed0: int = 6) -> int:
+    """Randomized multi-round cards (the README's stress numbers)."""
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        print("selftest needs Pillow to generate test photos: pip install pillow", file=sys.stderr)
+        return 2
+    from .organize import write_all
+    from .pipeline import scan
+    from .simcard import scenarios as S
+    work = keep or tempfile.mkdtemp(prefix="recover-anything-stress-")
+    os.makedirs(work, exist_ok=True)
+    tot = {"files": [0, 0], "fragmented photos": [0, 0], "videos": [0, 0], "fragmented videos": [0, 0]}
+    wrong_total = 0
+    rows = []
+    try:
+        for i in range(cards):
+            seed = seed0 + i
+            cs = (32768, 16384, 8192)[i % 3]
+            sc = S.stress(work, seed, cluster_size=cs, mixed=bool(i % 2 == 0))
+            out = os.path.join(work, "out-%d" % seed)
+            shutil.rmtree(out, ignore_errors=True)
+            t0 = time.time()
+            res = scan(sc.image)
+            write_all(res, out)
+            res._src.close()
+            got = _hash_tree(out)
+            hits = {h for h in sc.truth if h in got}
+            wrong = [p for h, p in got.items() if h not in sc.truth and "Partly recovered" not in p
+                     and "Other files" not in p]
+            wrong_total += len(wrong)
+            tot["files"][0] += len(hits)
+            tot["files"][1] += len(sc.truth)
+            for g, hs in sc.groups.items():
+                tot[g][0] += len(hs & hits)
+                tot[g][1] += len(hs)
+            rows.append({"seed": seed, "cluster_size": cs, "recovered": len(hits), "files": len(sc.truth),
+                         "unexpected_files": len(wrong), "seconds": round(time.time() - t0, 1)})
+            if not as_json:
+                print("  card %d/%d (seed %d, %d KB clusters): %d/%d files byte for byte, %d unexpected, %.0fs" % (
+                    i + 1, cards, seed, cs // 1024, len(hits), len(sc.truth), len(wrong), time.time() - t0),
+                    file=sys.stderr)
+            if not keep:
+                os.remove(sc.image)
+                shutil.rmtree(out, ignore_errors=True)
+    finally:
+        if not keep:
+            shutil.rmtree(work, ignore_errors=True)
+    if as_json:
+        print(json.dumps({"cards": rows, "totals": tot, "unexpected_files": wrong_total}, indent=1))
+    else:
+        print()
+        for k, (a, b) in tot.items():
+            print("%-18s %d / %d" % (k, a, b))
+        print("%-18s %d" % ("marked recovered but wrong", wrong_total))
+    return 0 if wrong_total == 0 else 1
+
+
 def run(quick: bool = False, keep: str | None = None, as_json: bool = False) -> int:
     try:
         import PIL  # noqa: F401

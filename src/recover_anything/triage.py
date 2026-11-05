@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import random
+import sys
 
 from . import devices
 from .source import Source
@@ -88,6 +89,12 @@ def triage(path: str) -> dict:
         fss = {v["filesystem"] for v in info["volumes"]}
 
     ssd_trim = bool(dev and dev.get("ssd") and dev.get("trim") and not dev.get("removable"))
+    mounts = [m for m in (dev or {}).get("mounted_at") or [] if m]
+    if mounts:
+        how = {"darwin": "diskutil unmountDisk %s" % path.replace("/dev/r", "/dev/"),
+               "win32": "don't open it in Explorer while recovering"}.get(sys.platform, "sudo umount %s" % " ".join(mounts))
+        info["warnings"].append("The card is mounted (%s), so the computer may still write small files to it "
+                                "(search indexes, thumbnails). Unmount it first: %s." % (", ".join(mounts), how))
     if dev and dev.get("system_disk"):
         info["warnings"].append("This is the disk your computer is running from. Every minute it runs, it writes to "
                                 "this disk. Recovering from it is risky; the safest move is to shut down and image it "

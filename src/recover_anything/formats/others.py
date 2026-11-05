@@ -110,22 +110,10 @@ def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
             continue
         codec = None
         offsets, sizes, stsc = [], [], []
-        for t2, b2, e2 in _boxes(read, *stbl):
-            body = read(b2, min(e2 - b2, 64 << 20))
-            if t2 == b"stsd" and len(body) >= 16:
-                codec = body[12:16]
-            elif t2 == b"stco":
-                n = struct.unpack(">I", body[4:8])[0]
-                offsets = list(struct.unpack(">%dI" % n, body[8:8 + 4 * n]))
-            elif t2 == b"co64":
-                n = struct.unpack(">I", body[4:8])[0]
-                offsets = list(struct.unpack(">%dQ" % n, body[8:8 + 8 * n]))
-            elif t2 == b"stsz":
-                fixed, n = struct.unpack(">II", body[4:12])
-                sizes = [fixed] * n if fixed else list(struct.unpack(">%dI" % n, body[12:12 + 4 * n]))
-            elif t2 == b"stsc":
-                n = struct.unpack(">I", body[4:8])[0]
-                stsc = [struct.unpack(">III", body[8 + 12 * i:20 + 12 * i]) for i in range(n)]
+        tables = sample_tables(read, stbl)
+        if tables is None:
+            return "corrupt", "the video's index is damaged", None
+        codec, offsets, sizes, stsc = tables
         if not offsets or not sizes:
             continue
         nal = codec in (b"avc1", b"avc3", b"hvc1", b"hev1")
@@ -160,6 +148,64 @@ def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
     return "ok", "%d frames checked" % checked, None
 
 
+MAX_SAMPLES = 20_000_000
+
+
+def _counted(body: bytes, at: int, width: int):
+    """Read a count followed by `count` big-endian integers, refusing counts
+    that don't fit in the box (damaged or hostile files)."""
+    if len(body) < at + 4:
+        return None
+    n = struct.unpack(">I", body[at:at + 4])[0]
+    if n > MAX_SAMPLES or len(body) < at + 4 + width * n:
+        return None
+    return list(struct.unpack(">%d%s" % (n, "I" if width == 4 else "Q"), body[at + 4:at + 4 + width * n]))
+
+
+def sample_tables(read, stbl):
+    """(codec, chunk offsets, sample sizes, stsc) for one track, or None if the
+    tables are inconsistent. Sizes are only expanded for H.264/HEVC video."""
+    codec, offsets, sizes, stsc = None, [], [], []
+    fixed_size = None
+    for t2, b2, e2 in _boxes(read, *stbl):
+        if e2 - b2 > (256 << 20):
+            return None
+        body = read(b2, e2 - b2)
+        if t2 == b"stsd":
+            if len(body) >= 16:
+                codec = body[12:16]
+        elif t2 == b"stco":
+            offsets = _counted(body, 4, 4)
+        elif t2 == b"co64":
+            offsets = _counted(body, 4, 8)
+        elif t2 == b"stsz":
+            if len(body) < 12:
+                return None
+            fixed, n = struct.unpack(">II", body[4:12])
+            if n > MAX_SAMPLES:
+                return None
+            if fixed:
+                fixed_size = (fixed, n)
+            else:
+                if len(body) < 12 + 4 * n:
+                    return None
+                sizes = list(struct.unpack(">%dI" % n, body[12:12 + 4 * n]))
+        elif t2 == b"stsc":
+            if len(body) < 8:
+                return None
+            n = struct.unpack(">I", body[4:8])[0]
+            if n > MAX_SAMPLES or len(body) < 8 + 12 * n:
+                return None
+            stsc = [struct.unpack(">III", body[8 + 12 * i:20 + 12 * i]) for i in range(n)]
+        if offsets is None:
+            return None
+    if fixed_size:
+        if codec not in (b"avc1", b"avc3", b"hvc1", b"hev1"):
+            return codec, [], [], stsc  # e.g. PCM audio: nothing to check per sample
+        sizes = [fixed_size[0]] * fixed_size[1]
+    return codec, offsets, sizes, stsc
+
+
 def _find(read, b, e, path):
     for name in path:
         for typ, b2, e2 in _boxes(read, b, e):
@@ -189,11 +235,19 @@ def measure_png(read, start: int, limit: int) -> Result:
         typ = h[4:8]
         if ln > 0x7FFFFFFF or not typ.isalpha():
             return Result(pos, False, ".png", "bad chunk", break_pos=pos)
-        body = read(start + pos + 4, 4 + ln + 4)
-        if len(body) < 8 + ln:
+        if pos + 12 + ln > limit:
+            return Result(pos, False, ".png", "chunk runs past the end", break_pos=pos)
+        crc_run, got, at = 0, 0, start + pos + 4
+        while got < 4 + ln:
+            piece = read(at + got, min(1 << 20, 4 + ln - got))
+            if not piece:
+                break
+            crc_run = zlib.crc32(piece, crc_run)
+            got += len(piece)
+        tail = read(start + pos + 8 + ln, 4)
+        if got < 4 + ln or len(tail) < 4:
             return Result(pos, False, ".png", "truncated", break_pos=pos)
-        crc = struct.unpack(">I", body[4 + ln:8 + ln])[0]
-        if zlib.crc32(body[:4 + ln]) & 0xFFFFFFFF != crc:
+        if crc_run & 0xFFFFFFFF != struct.unpack(">I", tail)[0]:
             return Result(pos, False, ".png", "checksum mismatch", break_pos=pos)
         pos += 12 + ln
         if typ == b"IEND":
@@ -382,7 +436,7 @@ def measure_pdf(read, start: int, limit: int, stop_at=None) -> Result:
 
 # ---------------------------------------------------------------------- ZIP
 def probe_zip(head: bytes) -> bool:
-    return head[:4] == b"PK\x03\x04" and 10 <= struct.unpack("<H", head[4:6])[0] <= 63
+    return len(head) >= 6 and head[:4] == b"PK\x03\x04" and 10 <= struct.unpack("<H", head[4:6])[0] <= 63
 
 
 def measure_zip(read, start: int, limit: int) -> Result:
@@ -396,6 +450,8 @@ def measure_zip(read, start: int, limit: int) -> Result:
             rec = data[i:i + 22]
             if len(rec) < 22:
                 rec = read(start + pos + i, 22)
+            if len(rec) < 22:
+                break
             _, _, _, _, total, cd_size, cd_off, clen = struct.unpack("<IHHHHIIH", rec[:22])
             eocd = pos + i
             if cd_off + cd_size == eocd:

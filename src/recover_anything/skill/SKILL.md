@@ -21,8 +21,10 @@ other dependencies; `pip install` works too).
 2. **Never write to the source.** Never run `chkdsk`, `fsck`, Disk Utility First Aid,
    Windows "Scan and fix", TestDisk's write/repair actions, `mkfs`, `format`, or
    anything that "repairs" the card. Repairs write; writes destroy deleted data.
-3. **Never save recovered files onto the same device.** The tool refuses, but don't
-   even suggest it.
+3. **Never save recovered files onto the same device.** The tool refuses (it checks
+   the physical disk, and refuses when it can't tell). Never pass
+   `--trust-output-location` unless the person has confirmed the output folder is on
+   a different physical drive.
 4. **Don't promise.** Say what triage says. Deleted files on an internal SSD with TRIM,
    on a phone, or on an encrypted volume are usually gone. Say so kindly and switch
    to `hunt`.
@@ -39,19 +41,21 @@ Cards show up as removable with a size that matches the card. Confirm with the
 person ("the 64 GB SanDisk card?") before going further. Device paths:
 Linux `/dev/sdb` or `/dev/mmcblk0`; macOS `/dev/rdisk4` (use the *r* form, it's
 faster); Windows `\\.\PhysicalDrive2`. Reading a raw device needs admin rights:
-`sudo` on macOS/Linux, an Administrator terminal on Windows. On macOS you may need
-`diskutil unmountDisk /dev/disk4` first (unmounting does not write to the card).
+`sudo` on macOS/Linux, an Administrator terminal on Windows. If triage says the card
+is mounted, unmount it (macOS: `diskutil unmountDisk /dev/disk4`) so the computer
+stops writing indexes and thumbnails to it. Point the tool at the device, never at
+the card's folder (`/Volumes/NO NAME` is refused for a reason).
 
 ### 2. Triage
 ```
-recover-anything triage /dev/rdisk4
+sudo recover-anything triage /dev/rdisk4
 ```
 Relay the verdict in plain words: what it is, the odds, and the don'ts. If the verdict
 is `ssd-trim`, `encrypted` or `empty`, go to step 5 (hunt) instead of promising a scan.
 
 ### 3. Recover
 ```
-recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
+sudo recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
 ```
 - It images the card first when there's room (safest for failing cards), then works
   from the copy. `--direct` reads the card directly (still read-only).

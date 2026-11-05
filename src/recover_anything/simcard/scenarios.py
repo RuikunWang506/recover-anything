@@ -129,3 +129,52 @@ def fragmented(workdir: str, n: int = 60, fs: str = "FAT32", size: int = 4 * 102
 
 
 ALL = [deleted, formatted, formatted_then_used, fragmented]
+
+
+def stress(workdir: str, seed: int, cluster_size: int = 32768, mixed: bool = True) -> Scenario:
+    """A randomized card with three rounds of shooting and deleting (so photos
+    and videos end up split across the holes), formatted in-camera (folders
+    recreated, so no names survive). Ground truth: every file present at the
+    format whose clusters weren't reused by the new folders."""
+    import random as _random
+    rng = _random.Random(seed)
+    img = os.path.join(workdir, "stress-%d-%d.img" % (seed, cluster_size))
+    present: dict = {}
+    counter = [0]
+
+    def shoot(card, k):
+        for _ in range(k):
+            counter[0] += 1
+            n = counter[0]
+            if rng.random() < 0.08:
+                data = make_video(seed * 1000 + n, frames=rng.randint(60, 200))
+                name = "MVI_%04d.MP4" % n
+            else:
+                w = rng.choice([1200, 1600, 2000, 2400])
+                kw = rng.choice([{}, {"restart_blocks": 8}, {"optimize": True}, {"quality": 95}]) if mixed else {}
+                data = make_photo(seed * 1000 + n, width=w, height=w * 3 // 4, style=PHOTO_STYLE, **kw)
+                name = "IMG_%04d.JPG" % n
+            cl = card.write_file("DCIM/100CANON/" + name, data, _when(n))
+            present[name] = (data, set(cl))
+
+    def delete(card, k):
+        for name in rng.sample(sorted(present), k):
+            card.delete("DCIM/100CANON/" + name)
+            del present[name]
+
+    with Fat32Card(img, size=4 * 1024**3, cluster_size=cluster_size) as card:
+        shoot(card, 40)
+        delete(card, 15)
+        shoot(card, 20)
+        delete(card, 12)
+        shoot(card, 15)
+        card.format(recreate_dirs=["DCIM", "DCIM/100CANON"])
+        used = card.allocated_clusters()
+    truth = {_sha(d): nm for nm, (d, cl) in present.items() if not (cl & used)}
+    frag = {_sha(d) for nm, (d, cl) in present.items()
+            if len(cl) > 1 and max(cl) - min(cl) + 1 != len(cl) and _sha(d) in truth}
+    sc = Scenario("stress", "Randomized, 3 rounds of shoot/delete, camera-formatted", img, truth)
+    sc.groups["fragmented photos"] = {h for h in frag if truth[h].endswith(".JPG")}
+    sc.groups["videos"] = {h for h in truth if truth[h].endswith(".MP4")}
+    sc.groups["fragmented videos"] = {h for h in frag if truth[h].endswith(".MP4")}
+    return sc

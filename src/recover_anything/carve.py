@@ -98,6 +98,7 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
           claimed: Claimed, progress=None, kinds=None):
     """Carve every recognizable file in a region. Returns Found records."""
     out = []
+    region_end = min(region_end, getattr(src, "size", region_end) or region_end)
     headers = list(find_headers(src, region_start, region_end, align, base, progress=progress))
     starts = [h[0] for h in headers]
     for idx, (off, kind) in enumerate(headers):
@@ -109,7 +110,10 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
         # A PDF's end is found by searching for its last end marker, so don't let
         # the search run into the next file on the card.
         limit = (nxt - off) if kind == "pdf" else region_end - off
-        length, complete, ext, reason, brk, header = measure(src, kind, off, limit)
+        try:
+            length, complete, ext, reason, brk, header = measure(src, kind, off, limit)
+        except Exception:
+            continue  # a header we can't make sense of: skip it, keep going
         if length <= 0:
             continue
         if kind != "jpeg" and not complete and length < 4096:

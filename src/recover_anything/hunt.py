@@ -20,7 +20,19 @@ import sys
 import urllib.parse
 from dataclasses import dataclass, field
 
-HOME = os.path.expanduser("~")
+def _real_home() -> str:
+    """Under sudo, look in the invoking user's home, not root's."""
+    user = os.environ.get("SUDO_USER")
+    if user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            import pwd
+            return pwd.getpwnam(user).pw_dir
+        except (ImportError, KeyError):
+            pass
+    return os.path.expanduser("~")
+
+
+HOME = _real_home()
 
 
 @dataclass
@@ -431,29 +443,53 @@ def hunt(query: str | None = None, project: str | None = None) -> list[Lead]:
     return leads
 
 
-def save(leads: list[Lead], out_dir: str) -> list[str]:
+class SaveError(Exception):
+    pass
+
+
+def save(leads: list[Lead], out_dir: str, project: str | None = None) -> list[str]:
+    """Copy every restorable lead into out_dir, never into the folder where the
+    files were lost (writing there could overwrite what is still recoverable)."""
+    out = os.path.realpath(os.path.abspath(out_dir))
+    if project:
+        proj = os.path.realpath(os.path.abspath(project))
+        if out == proj or out.startswith(proj.rstrip(os.sep) + os.sep):
+            raise SaveError("choose a folder outside %s: saving inside it could overwrite what is still "
+                            "recoverable there" % project)
+    for lead in leads:
+        if lead.original and os.path.isabs(lead.original):
+            d = os.path.dirname(os.path.realpath(lead.original))
+            if out == d:
+                raise SaveError("choose a different folder: %s is where the lost files lived" % out_dir)
     os.makedirs(out_dir, exist_ok=True)
     written = []
     for i, lead in enumerate(leads):
         if not lead.restorable:
             continue
-        name = os.path.basename(lead.original.split(" (blob")[0].rstrip("/\\")) or "file"
-        sub = os.path.join(out_dir, re.sub(r"[^\w .-]", "_", lead.where))
-        os.makedirs(sub, exist_ok=True)
-        dest = os.path.join(sub, name)
-        k = 2
-        while os.path.exists(dest):
-            b, e = os.path.splitext(name)
-            dest = os.path.join(sub, "%s (%d)%s" % (b, k, e))
-            k += 1
-        if lead.content is not None:
-            with open(dest, "wb") as f:
-                f.write(lead.content)
-        else:
-            import shutil
-            if os.path.isdir(lead.copy_from):
-                shutil.copytree(lead.copy_from, dest)
-            else:
-                shutil.copy2(lead.copy_from, dest)
-        written.append(dest)
+        try:
+            written.append(_save_one(lead, out_dir))
+        except OSError as e:
+            lead.extra["save_error"] = str(e)
     return written
+
+
+def _save_one(lead: Lead, out_dir: str) -> str:
+    name = os.path.basename(lead.original.split(" (blob")[0].rstrip("/\\")) or "file"
+    sub = os.path.join(out_dir, re.sub(r"[^\w .-]", "_", lead.where))
+    os.makedirs(sub, exist_ok=True)
+    dest = os.path.join(sub, name)
+    k = 2
+    while os.path.exists(dest):
+        b, e = os.path.splitext(name)
+        dest = os.path.join(sub, "%s (%d)%s" % (b, k, e))
+        k += 1
+    if lead.content is not None:
+        with open(dest, "wb") as f:
+            f.write(lead.content)
+    else:
+        import shutil
+        if os.path.isdir(lead.copy_from):
+            shutil.copytree(lead.copy_from, dest)
+        else:
+            shutil.copy2(lead.copy_from, dest)
+    return dest
