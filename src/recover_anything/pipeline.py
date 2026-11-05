@@ -127,34 +127,118 @@ def _trim(extents, length):
     return out
 
 
-def _drop_embedded(recs: list[Found]) -> None:
-    """A header inside a file that verified is part of that file (a JPEG
-    inside a ZIP, a preview inside a RAW), or its space was reused."""
-    from bisect import bisect_left
-    spans = sorted((o, o + n, id(r), r) for r in recs if r.status == "ok" for o, n in r.extents)
+def _logical(rec: Found, off: int):
+    """Offset within the file of the source byte `off`, or None."""
+    pos = 0
+    for eo, en in rec.extents:
+        if eo <= off < eo + en:
+            return pos + off - eo
+        pos += en
+    return None
+
+
+class _Owner:
+    """Answers "is the byte at this offset part of this file?" for a file that
+    checked out, from what was actually verified or what its own structure
+    points to (a RAW's previews, an AVI's frames, a ZIP's members, the extra
+    pictures of a multi-picture JPEG). Work is done lazily, once per file."""
+
+    def __init__(self, src, rec: Found):
+        from .validate import ExtentReader
+        self.rec, self.reader = rec, ExtentReader(src, rec.extents)
+        self.header = self.main_end = self.verified = self.refs = None
+
+    def claims(self, at: int) -> bool:
+        from .formats import jpeg
+        rec, r = self.rec, self.reader
+        if rec.kind == "jpeg":
+            if self.header is None:
+                try:
+                    self.header = jpeg.parse_header(r.read, 0)
+                except Exception:
+                    self.header = False
+            h = self.header
+            if not h:
+                return False
+            if at < h.entropy_start or at in h.mpf_starts:
+                return True  # inside its header segments (a thumbnail) or an indexed extra picture
+            if self.main_end is None:
+                # another file's start can't hide inside a picture that parses to its end marker
+                m = jpeg.measure(r.read, 0, r.length + 1)
+                self.main_end = (m.header.main_end or 0) if m.header else 0
+            return at < self.main_end
+        if self.verified is None:
+            self.verified, self.refs = self._contents()
+        return at < self.verified or at in self.refs
+
+    def _contents(self):
+        from .formats import others
+        from .validate import validate_zip
+        rec, r = self.rec, self.reader
+        kind, check = rec.kind, rec.meta.get("check")
+        try:
+            if kind == "png" and check == "full":
+                return r.length, set()  # every chunk's checksum matched
+            if kind == "zip":
+                if check == "full":
+                    return r.length, set()  # every member's checksum matched
+                refs: set = set()
+                validate_zip(r.read, r.length, refs)
+                return 0, refs
+            if kind == "tiff":
+                return 0, set(others.measure_tiff(r.read, 0, r.length).refs)
+            if kind == "riff":
+                return 0, set(others.measure_riff(r.read, 0, r.length, want_refs=True).refs)
+            if kind == "isobmff":
+                refs = set()
+                others.validate_isobmff(r.read, r.length, refs)
+                return 0, refs
+        except Exception:
+            pass
+        return 0, set()
+
+
+def _drop_embedded(src, recs: list[Found]) -> None:
+    """A file found inside another file that checked out is either part of it
+    (a preview inside a RAW, a photo stored in a ZIP, a frame of a Motion-JPEG
+    video) or its space was reused. Only bytes that were actually verified, or
+    an offset the container's own structure points to, can claim a file: a RAW
+    is checked by structure only, and a fragmented one "contains" whatever
+    happens to follow its first piece on the card."""
+    import heapq
+    spans = sorted((o, o + n, i, r) for i, r in enumerate(recs) if r.status == "ok" and r.extents
+                   for o, n in r.extents)
     if not spans:
         return
-    starts = [s[0] for s in spans]
-    best_end, best_owner = [], []
-    cur_end, cur_owner = -1, None
-    for o, e, _i, owner in spans:
-        if e > cur_end:
-            cur_end, cur_owner = e, owner
-        best_end.append(cur_end)
-        best_owner.append(cur_owner)
-    for r in recs:
-        if not r.extents or r.status in ("lost", "embedded"):
-            continue
-        i = bisect_left(starts, r.start) - 1
-        if i < 0 or best_end[i] <= r.start or best_owner[i] is r:
-            continue
-        owner = best_owner[i]
-        if r.origin == "carved":
-            r.status = "embedded"
-            r.note = "part of %s" % (owner.name or "another recovered file")
-        else:
-            r.status = "lost"
-            r.note = "its space now belongs to %s" % (owner.name or "another recovered file")
+    owners: dict[int, _Owner] = {}
+    active: list = []
+    j = 0
+    for r in sorted((r for r in recs if r.extents and r.status not in ("lost", "embedded")), key=lambda r: r.start):
+        q = r.start
+        while j < len(spans) and spans[j][0] < q:
+            _s0, e0, i, owner = spans[j]
+            heapq.heappush(active, (e0, i, j, owner))
+            j += 1
+        while active and active[0][0] <= q:
+            heapq.heappop(active)
+        for _e, i, _k, owner in sorted(active, key=lambda t: t[1]):
+            if owner is r:
+                continue
+            at = _logical(owner, q)
+            if not at:
+                continue
+            if i not in owners:
+                owners[i] = _Owner(src, owner)
+            if not owners[i].claims(at):
+                continue
+            if r.origin == "carved":
+                r.status = "embedded"
+                r.note = "part of %s" % (owner.name or "another recovered file")
+            elif r.status != "ok":
+                r.status = "lost"
+                r.note = "its space now belongs to %s" % (owner.name or "another recovered file")
+            # a named file that checks out on its own is kept: its folder entry says it starts here
+            break
 
 
 def _lenient(head: bytes, want: str) -> bool:
@@ -336,7 +420,7 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
             reassemble_all(src, res, all_found, progress=lambda d, t: prog("reassemble", d, t))
         except Exception as e:
             res.warnings.append("Rebuilding fragmented files stopped early (%s)." % e)
-    _drop_embedded(all_found)
+    _drop_embedded(src, all_found)
     for r in all_found:
         # A photo with foreign data mixed in: keep the part before the damage.
         if r.kind == "jpeg" and r.status == "corrupt" and r.meta.get("bad_at"):

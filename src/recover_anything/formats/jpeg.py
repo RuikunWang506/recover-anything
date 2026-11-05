@@ -44,6 +44,8 @@ class Header:
         self.scan: list[tuple[int, int, int]] = []  # (comp id, dc table, ac table)
         self.entropy_start = 0  # offset (from SOI) of the first entropy byte
         self.mpf_end = None  # end offset implied by an MPF index (multi-picture files)
+        self.mpf_starts: tuple = ()  # where the MPF index says the other pictures start (from SOI)
+        self.main_end = None  # end of the main picture (its first EOI), set by measure()
         self.has_exif = False
 
     @property
@@ -52,34 +54,37 @@ class Header:
                 and len(self.scan) == len(self.components) and len(self.components) in (1, 3, 4))
 
 
-def _parse_mpf(seg: bytes, seg_tiff_pos: int) -> int | None:
-    """APP2 'MPF\\0' index -> end of the last picture, relative to SOI."""
+def _parse_mpf(seg: bytes, seg_tiff_pos: int):
+    """APP2 'MPF\\0' index -> (end of the last picture, starts of the other
+    pictures), both relative to SOI; (None, ()) if the index is unreadable."""
     tiff = seg[4:]
     if len(tiff) < 8:
-        return None
+        return None, ()
     bo = "<" if tiff[:2] == b"II" else ">" if tiff[:2] == b"MM" else None
     if bo is None:
-        return None
+        return None, ()
     ifd = struct.unpack(bo + "I", tiff[4:8])[0]
     if ifd + 2 > len(tiff):
-        return None
+        return None, ()
     n = struct.unpack(bo + "H", tiff[ifd:ifd + 2])[0]
     for i in range(n):
         e = ifd + 2 + 12 * i
         if e + 12 > len(tiff):
-            return None
+            return None, ()
         tag, typ, count, val = struct.unpack(bo + "HHII", tiff[e:e + 12])
         if tag == 0xB002 and count >= 16:
-            end = 0
+            end, starts = 0, []
             for j in range(count // 16):
                 p = val + 16 * j
                 if p + 16 > len(tiff):
-                    return None
+                    return None, ()
                 _attr, size, off = struct.unpack(bo + "III", tiff[p:p + 12])
                 base = 0 if off == 0 else seg_tiff_pos
                 end = max(end, base + off + size)
-            return end or None
-    return None
+                if off:
+                    starts.append(base + off)
+            return (end or None), tuple(starts)
+    return None, ()
 
 
 def parse_header(read, start: int, limit: int = 4 * 1024 * 1024) -> Header:
@@ -119,7 +124,7 @@ def parse_header(read, start: int, limit: int = 4 * 1024 * 1024) -> Header:
         if m == 0xE1 and seg[:6] == b"Exif\x00\x00":
             h.has_exif = True
         elif m == 0xE2 and seg[:4] == b"MPF\x00":
-            h.mpf_end = _parse_mpf(seg, pos + 8)
+            h.mpf_end, h.mpf_starts = _parse_mpf(seg, pos + 8)
         elif m in SOF_ALL:
             if len(seg) < 6:
                 raise JpegError("short SOF")
@@ -219,6 +224,7 @@ def measure(read, start: int, limit: int = MAX_JPEG, stop_at=None) -> Measure:
                 continue
             if m == 0xD9:
                 end = absj + 2
+                h.main_end = end
                 if h.mpf_end and h.mpf_end > end and h.mpf_end - end < 64 * 1024 * 1024:
                     tail = read(start + end, 4)
                     if tail[:3] == b"\xff\xd8\xff":
