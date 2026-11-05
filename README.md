@@ -1,0 +1,168 @@
+# Recover Anything
+
+**Your deleted photos are probably still there. Get them back safely, with one command or by asking your AI agent.**
+
+[![tests](https://github.com/RuikunWang506/recover-anything/actions/workflows/ci.yml/badge.svg)](https://github.com/RuikunWang506/recover-anything/actions/workflows/ci.yml)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-green)
+
+![A fragmented photo carved as one piece (gray from the first break) next to the same photo rebuilt by Recover Anything](docs/before-after.jpg)
+
+Deleted photos from your camera? Formatted the wrong SD card? Seeing "this card needs to be formatted"? Recover Anything reads the card **without ever writing to it**. It finds every photo, video and document it can, and **rebuilds photos that were stored in scattered pieces**. Original file names come back **even after a format**. It checks every file and gives you a sorted folder plus a plain-language report.
+
+It's one pure-Python package with zero dependencies. It also ships a skill, so Claude Code or Codex can run the whole rescue for someone who has never opened a terminal.
+
+## Quick start
+
+```bash
+pipx install git+https://github.com/RuikunWang506/recover-anything
+
+recover-anything devices                                   # which disk is the card?
+recover-anything triage /dev/rdisk4                        # honest odds, and what not to do
+sudo recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
+```
+
+Linux cards look like `/dev/sdb` or `/dev/mmcblk0`; Windows uses `\\.\PhysicalDrive2` in an Administrator terminal. You can also point it at a disk image.
+
+You get a folder sorted by month, plus a report you can open in any browser:
+
+<img src="docs/report.jpg" alt="Recovery report: 60 photos recovered, 60 kept their original names, 20 rebuilt from scattered pieces" width="100%">
+
+### Or let your agent do it
+
+```bash
+recover-anything install-skill      # installs the skill for Claude Code and Codex
+```
+
+Then ask: *"I formatted my camera's SD card by accident. Can you get my photos back?"* The [skill](skills/recover-anything/SKILL.md) teaches the agent the rules a recovery expert follows:
+- stop using the card
+- never "repair" it
+- copy it first
+- never save onto it
+- be honest about the odds
+
+## Results
+
+Every number here is reproducible with one command: `recover-anything selftest`. It builds simulated SD cards (FAT32 and exFAT, camera-style photos with EXIF and thumbnails) and wrecks them the way people do. Then it runs the real recovery and compares every recovered file byte for byte with the original.
+
+| Simulated card | Filesystem | Recovered byte for byte | Kept original names | Notes |
+|---|---|---|---|---|
+| Accidentally deleted (63 photos + 1 video) | FAT32 | **64 / 64 (100%)** | 64 | |
+| Formatted | FAT32 | **64 / 64 (100%)** | 64 | names restored from folders that survived the format |
+| Formatted, then 20 new photos taken | FAT32 | **43 / 43 (100%)** of what survived | n/a | 20 old photos were physically overwritten by the new ones: gone for any tool |
+| Heavily fragmented, then formatted | FAT32 | **60 / 60 (100%)** | 60 | all 20 photos that were split into pieces rebuilt |
+| Accidentally deleted | exFAT | **64 / 64 (100%)** | 64 | |
+| Formatted | exFAT | **64 / 64 (100%)** | 64 | |
+| Heavily fragmented, then formatted | exFAT | **60 / 60 (100%)** | 60 | all 20 fragmented photos rebuilt |
+
+Each card is a 4 GB SD card image with 32 KB clusters; each run takes 20 to 40 seconds on a 2-core cloud VM.
+
+**Stress test.** We ran randomized cards with three rounds of shooting and deleting, mixed JPEG encoders (standard, optimized, restart markers, high quality) and 8 to 32 KB clusters. Each card was then formatted in-camera, which recreates the folders and erases the names. Across 9 randomized cards, it rebuilt **103 of 103 fragmented photos and 33 of 33 videos**, and recovered **432 of 432 files byte for byte**. In every run, no file was ever marked recovered unless it matched the original exactly.
+
+> These are simulated cards built to behave like real ones. Reports from real hardware are very welcome: open an issue with what happened and what came back.
+
+## What makes it different
+
+- **It never writes to your card.** It opens the device read-only and copies it to an image first when there's room. It refuses to save onto the source, and it never runs "repair" tools. That is the whole safety model, and it's enforced in code.
+- **Fragmented photos and videos come back whole.** When a camera fills the hole left by a deleted photo, the next photo (or video) is split across several places. After a format, ordinary carvers glue the pieces together in disk order, and you get the gray half-picture above. Recover Anything decodes each photo as it walks the card. It notices the moment the bytes stop belonging to that photo, then finds the piece that continues the picture. Videos are rebuilt using their own index, which lists where every frame must start. A photo only counts as recovered when its last block decodes and the image ends exactly where it should; a video only counts when every frame is where its index says.
+- **Original names survive a format.** A quick format wipes the file table but usually leaves folders like `DCIM/100CANON` sitting in the data area. Recover Anything finds them, so you get `IMG_0042.JPG` back instead of `f12345678.jpg`.
+- **Every file is checked.** Photos are decoded block by block, and videos are checked frame by frame against their own index. PNG checksums are verified, and archives and documents are checked for structure. Anything incomplete goes to a separate *Partly recovered* folder with a label.
+- **Honest odds.** `triage` tells you up front when recovery is unlikely: internal SSDs with TRIM, encrypted volumes, cards that were fully erased.
+- **It looks everywhere else too.** When the bytes are gone, `hunt` searches the other places a copy can survive (see below).
+
+## When an AI agent (or `rm -rf`) deleted your files
+
+```bash
+recover-anything hunt --project ~/code/myapp               # everything that lived in that folder
+recover-anything hunt "thesis.docx" --save ~/Desktop/Found # copy whatever it finds
+```
+
+`hunt` is read-only and checks:
+- **Claude Code transcripts**, which contain every file the agent wrote, edited or fully read. `hunt` replays them to rebuild the latest version.
+- **Codex session logs** (files it created).
+- **Git**: commits lost to `reset --hard` or a rebase, staged-but-never-committed content, and stashes.
+- **Editor history**: VS Code, Cursor and Windsurf local history, and JetBrains Local History.
+- **The trash** or Recycle Bin.
+- **Snapshots**: Time Machine local snapshots, Windows shadow copies and File History, and btrfs, ZFS and Timeshift snapshots.
+- **Desktop thumbnail caches**, which keep small previews of deleted photos.
+
+It also lists the cloud places to check by hand: Google Photos trash, iCloud Recently Deleted, Google Drive, OneDrive, Dropbox, and the chats you sent the file in.
+
+## How it works
+
+```mermaid
+flowchart LR
+  A[Card, disk or image] -->|read-only| B[Partitions and filesystem]
+  B --> C[Folder tree: live and deleted entries]
+  B --> D[Lost folders that survived a format]
+  B --> E[Carve every cluster]
+  C --> F{Check every file}
+  D --> F
+  E --> F
+  F -->|broken photo| G[Rebuild from fragments]
+  G --> F
+  F -->|whole| H[Name, de-duplicate, sort by date]
+  H --> I[Recovered folder + report.html + recovery.json]
+```
+
+1. **Filesystem pass.** FAT12/16/32 and exFAT are parsed directly. Deleted entries keep their name, size, date and first cluster. On exFAT they usually also say whether the file was stored in one piece.
+2. **Lost folders.** Directory clusters still in the data area after a format are recognized by their structure and stitched back into paths. A top folder holding only `100CANON`-style folders is named `DCIM` again.
+3. **Carving.** Every cluster boundary is checked for the signatures of 25+ file types. Each hit is measured to its exact length by parsing the format, not by guessing.
+4. **Checking.** A pure-Python baseline JPEG decoder walks the image data. MP4/MOV sample tables are verified against the bytes they point to.
+5. **Reassembly.** For a broken photo, the reassembler skips clusters that belong to other verified files and tries candidate clusters in order. It decodes a few KB of each and scores how smoothly the picture continues across the seam. It keeps going until the decoder reaches the last block with exactly the right count. If the evidence is ambiguous, it refuses to guess and saves the readable top of the picture instead. For a broken video, it finds the frame index (searching free clusters for it when it sits at the end of the file), then lays the frames out cluster by cluster. Every listed frame start is a checkpoint that random data almost never passes.
+6. **Output.** Files go into `Photos/2026-07/`, `Videos/…`, `Documents/` and `Partly recovered/`. Each file is named by its original name or capture time, given its original date, and de-duplicated. You also get `report.html` and a `recovery.json` that records where every piece came from on the card.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `recover-anything devices` | List disks and cards, mark which one is your system disk |
+| `recover-anything triage SOURCE` | Identify the filesystem, sample how much data is still there, give honest odds and the don'ts |
+| `recover-anything image SOURCE card.img` | Make a read-only copy first (uses GNU ddrescue when installed, otherwise skips and logs unreadable sectors) |
+| `recover-anything recover SOURCE -o DIR` | Find, check, rebuild and save everything. `--only photos,videos`, `--include-live`, `--direct`, `--fast`, `--deep`, `--json` |
+| `recover-anything hunt [QUERY]` | Look for surviving copies elsewhere. `--project DIR`, `--save DIR`, `--json` |
+| `recover-anything selftest` | Reproduce the results table on simulated cards (needs Pillow) |
+| `recover-anything install-skill` | Teach Claude Code / Codex to drive all of this safely |
+
+Everything has `--json` for agents and scripts.
+
+## What's supported
+
+- **Filesystems with names and folders:** FAT12, FAT16, FAT32, exFAT (SD, SDHC and SDXC cards, USB sticks, most cameras and drones).
+- **Anything else** (NTFS, HFS+, ext4, a wiped or unknown card, a damaged boot sector): carving still finds the files, without names. A damaged FAT boot sector is read from its backup copy.
+- **File types:** JPEG, HEIC/HEIF, MP4, MOV, M4V, 3GP, AVIF, CR3, TIFF-based RAW (CR2, NEF, ARW, DNG, ORF, RW2, PEF), PNG, GIF, WebP, AVI, WAV, PDF, DOCX, XLSX, PPTX, ZIP and EPUB. Files the filesystem still names are recovered whatever their type.
+- **Fragment reassembly:** baseline JPEG (what cameras and phones write), and MP4/MOV/M4V/3GP video with H.264 or HEVC, guided by the video's own frame index.
+- **Platforms:** Linux and macOS (tested in CI), Windows (in CI as experimental; device listing via PowerShell). Reading a raw device needs admin rights.
+
+## Honest limits
+
+- Data that has been physically overwritten is gone. No software brings it back.
+- Deleted files on internal SSDs with TRIM, on modern phones and on encrypted volumes are usually erased or unreadable. `triage` says so and `hunt` is the realistic path.
+- Video reassembly covers MP4/MOV/M4V/3GP with H.264 or HEVC video (what cameras, phones and drones record). Clusters that fall entirely inside one large frame can't be checked on their own. When the evidence for one of them is ambiguous, the video is saved but labeled *not fully confirmed* instead of being called recovered.
+- Progressive JPEGs (rare from cameras) are recovered when stored in one piece, but not reassembled.
+- NTFS/APFS/ext4 file names aren't recovered yet (their files are still carved).
+- It's pure Python. Full block-by-block checking runs at roughly 1.5 MB/s per CPU core, spread across your cores. Above 8 GB of photos it checks structure plus a random sample by default, and goes full depth if the sample finds anything. `--deep` forces a full check; `--fast` skips it.
+
+## Roadmap
+
+- HEIC and RAW reassembly; reassembly for videos without a surviving index
+- AVCHD (.MTS) camcorder files
+- NTFS undelete with names
+- Phone backups (iPhone/Android) and chat apps
+- An MCP server, and a small desktop app for people who will never open a terminal
+
+## Contributing
+
+Bug reports from real cards are the most valuable thing you can send. If something didn't come back, run `recover-anything triage` on the card and include the output (it contains no file contents). To add a disaster scenario, write a builder in `src/recover_anything/simcard/scenarios.py` and it becomes part of `selftest`.
+
+```bash
+git clone https://github.com/RuikunWang506/recover-anything && cd recover-anything
+pip install -e ".[dev]"
+pytest -q
+recover-anything selftest --quick
+```
+
+## License
+
+MIT. Recover Anything reads disks; it does not bypass encryption or access devices you don't own. Use it on your own cards and drives.

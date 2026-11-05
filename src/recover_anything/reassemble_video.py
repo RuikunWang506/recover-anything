@@ -1,0 +1,393 @@
+"""Put fragmented MP4/MOV videos back together.
+
+A video file carries its own map: the 'moov' index lists the exact byte offset
+and size of every frame. Each frame of H.264/HEVC video starts with a 4-byte
+length followed by a header byte with strict rules, so every listed frame start
+is a checkpoint: random data passes it about once in several thousand tries.
+
+  1. Walk the boxes at the start of the file to find the media data ('mdat')
+     and therefore where the index ('moov') must begin.
+  2. If the index sits at the end (what cameras and phones write), search the
+     free clusters for a 'moov' box at exactly that offset within a cluster.
+  3. Lay the frames out cluster by cluster, skipping clusters that belong to
+     other verified files. Whenever a checkpoint fails, try the free clusters
+     that could start the next piece and keep the one that satisfies this
+     checkpoint and the next few.
+  4. Only a file whose every frame start checks out is marked recovered.
+"""
+from __future__ import annotations
+
+import struct
+
+from .formats import others
+
+MAX_MOOV = 64 << 20
+CANDIDATES = 4000
+LOOKAHEAD = 3
+
+
+def _nal_ok(h: bytes, size: int, hevc: bool) -> bool:
+    if len(h) < 5:
+        return False
+    ln = struct.unpack(">I", h[:4])[0]
+    hdr = h[4]
+    if ln == 0 or ln + 4 > size or hdr & 0x80:
+        return False
+    if hevc:
+        return ((hdr >> 1) & 0x3F) <= 40
+    return (hdr & 0x1F) not in (0, 24, 25, 26, 27, 28, 29, 30, 31)
+
+
+def _samples(moov: bytes, base: int):
+    """[(file offset, size, hevc)] for every H.264/HEVC sample in a moov box."""
+    read = lambda o, n: moov[o - base:o - base + n]  # noqa: E731
+    out = []
+    end = base + len(moov)
+    for typ, b, e in others._boxes(read, base + 8, end):
+        if typ != b"trak":
+            continue
+        stbl = others._find(read, b, e, [b"mdia", b"minf", b"stbl"])
+        if not stbl:
+            continue
+        codec, offsets, sizes, stsc = None, [], [], []
+        for t2, b2, e2 in others._boxes(read, *stbl):
+            body = read(b2, e2 - b2)
+            try:
+                if t2 == b"stsd" and len(body) >= 16:
+                    codec = body[12:16]
+                elif t2 == b"stco":
+                    n = struct.unpack(">I", body[4:8])[0]
+                    offsets = list(struct.unpack(">%dI" % n, body[8:8 + 4 * n]))
+                elif t2 == b"co64":
+                    n = struct.unpack(">I", body[4:8])[0]
+                    offsets = list(struct.unpack(">%dQ" % n, body[8:8 + 8 * n]))
+                elif t2 == b"stsz":
+                    fixed, n = struct.unpack(">II", body[4:12])
+                    sizes = [fixed] * n if fixed else list(struct.unpack(">%dI" % n, body[12:12 + 4 * n]))
+                elif t2 == b"stsc":
+                    n = struct.unpack(">I", body[4:8])[0]
+                    stsc = [struct.unpack(">III", body[8 + 12 * i:20 + 12 * i]) for i in range(n)]
+            except struct.error:
+                return None
+        if codec not in (b"avc1", b"avc3", b"hvc1", b"hev1") or not offsets or not sizes:
+            continue
+        hevc = codec in (b"hvc1", b"hev1")
+        si = 0
+        for ci, coff in enumerate(offsets, start=1):
+            per = 1
+            for first, spc, _ in stsc:
+                if ci >= first:
+                    per = spc
+            pos = coff
+            for _ in range(per):
+                if si >= len(sizes):
+                    break
+                out.append((pos, sizes[si], hevc))
+                pos += sizes[si]
+                si += 1
+    out.sort()
+    return out
+
+
+class _Video:
+    def __init__(self, src, geom, blocked: bytearray, start: int):
+        self.src, self.g, self.blocked, self.start = src, geom, blocked, start
+        self.cs = geom.cluster_size
+        self.last = geom.last_cluster
+        self._plaus: dict[int, bool] = {}
+        self.ambiguous = False
+
+    def next_free(self, c, skip):
+        while True:
+            n = self.blocked.find(0, c + 1, self.last + 1)
+            if n < 0:
+                return None
+            if n not in skip and self.plausible(n):
+                return n
+            c = n
+
+    def plausible(self, c) -> bool:
+        """Could this cluster be part of a video? Empty clusters can't, and
+        neither can JPEG image data (every 0xFF in it is followed by 0x00 or a
+        restart marker), which is what most leftover data on a camera card is."""
+        v = self._plaus.get(c)
+        if v is None:
+            data = self.src.read(self.g.offset(c), self.cs)
+            if data.count(0) == len(data):
+                v = False
+            else:
+                ffs = data.count(b"\xff")
+                ok_pairs = data.count(b"\xff\x00") + sum(data.count(bytes([0xFF, m])) for m in range(0xD0, 0xD8))
+                v = not (ffs >= 6 and ok_pairs >= ffs - 1)
+            self._plaus[c] = v
+        return v
+
+    def extend(self, path, upto, skip):
+        while len(path) <= upto:
+            c = self.next_free(path[-1], skip | set(path))
+            if c is None:
+                return False
+            path.append(c)
+        return True
+
+    def vread(self, path, off, n):
+        cs, out = self.cs, []
+        while n > 0:
+            i = off // cs
+            if i >= len(path):
+                break
+            o = off % cs
+            take = min(n, cs - o)
+            out.append(self.src.read(self.g.offset(path[i]) + o, take))
+            off += take
+            n -= take
+        return b"".join(out)
+
+    def run(self, expected_size=None):
+        cs = self.cs
+        path = [self.start]
+        off, mdat, moov_box = 0, None, None
+        for _ in range(64):
+            if not self.extend(path, (off + 16) // cs, set()):
+                return None
+            h = self.vread(path, off, 16)
+            if len(h) < 8 or h[4:8] not in others.TOP_LEVEL:
+                break
+            size = struct.unpack(">I", h[:4])[0]
+            if size == 1:
+                size = struct.unpack(">Q", h[8:16])[0]
+            if size < 8:
+                return None
+            if h[4:8] == b"moov":
+                moov_box = (off, size)
+            if h[4:8] == b"mdat":
+                mdat = (off, size)
+                break
+            off += size
+        if mdat is None:
+            return None
+        v_end = mdat[0] + mdat[1]
+        fixed: dict[int, int] = {}
+        if moov_box:
+            if moov_box[1] > MAX_MOOV or not self.extend(path, (moov_box[0] + moov_box[1]) // cs, set()):
+                return None
+            moov = self.vread(path, *moov_box)
+            samples = _samples(moov, moov_box[0])
+            tail_start = v_end
+        else:
+            found = self._find_moov(path, v_end)
+            if not found:
+                return None
+            moov_path, moov, samples = found
+            pv = v_end // cs
+            for k, c in enumerate(moov_path):
+                fixed[pv + k] = c
+            moov_box = (v_end, len(moov))
+            tail_start = v_end + len(moov)
+        if not samples:
+            return None
+        checks = [s for s in samples if s[0] < v_end]
+        path = self._lay_out(path, checks, fixed)
+        if path is None:
+            return None
+        total = tail_start
+        # trailing boxes after the index ('free', 'udta', ...), if any
+        full = self._materialize(path, fixed, (total + 16) // cs)
+        if full is None:
+            return None
+        for _ in range(8):
+            h = self.vread(full, total, 8)
+            if len(h) < 8 or h[4:8] not in others.TOP_LEVEL or h[4:8] in (b"mdat", b"ftyp"):
+                break
+            size = struct.unpack(">I", h[:4])[0]
+            if size < 8 or size > MAX_MOOV:
+                break
+            total += size
+            full = self._materialize(path, fixed, (total + 16) // cs)
+            if full is None:
+                return None
+        n = (total + cs - 1) // cs
+        full = full[:n]
+        st, why, _ = others.validate_isobmff(lambda o, k: self.vread(full, o, k), total)
+        if st != "ok":
+            return None
+        return full, total, self.ambiguous
+
+    def _materialize(self, path, fixed, upto):
+        full = list(path)
+        while len(full) <= upto:
+            i = len(full)
+            if i in fixed:
+                full.append(fixed[i])
+                continue
+            c = self.next_free(full[-1], set(full) | set(fixed.values()))
+            if c is None:
+                return None
+            full.append(c)
+        return full
+
+    def _find_moov(self, path, v_end):
+        cs = self.cs
+        inoff = v_end % cs
+        tried = set()
+        cands = []
+        probe = list(path)
+        if self.extend(probe, v_end // cs, set()):
+            cands.append(probe[v_end // cs])
+        c, n = self.start, 0
+        while n < 200000:
+            c = self.next_free(c, set())
+            if c is None:
+                break
+            n += 1
+            h = self.src.read(self.g.offset(c) + inoff, 8)
+            if h[4:8] == b"moov":
+                cands.append(c)
+        for c in cands:
+            if c in tried:
+                continue
+            tried.add(c)
+            h = self.src.read(self.g.offset(c) + inoff, 8)
+            if h[4:8] != b"moov":
+                continue
+            size = struct.unpack(">I", h[:4])[0]
+            if not 8 < size <= MAX_MOOV:
+                continue
+            mp = [c]
+            need = (inoff + size - 1) // cs
+            ok = True
+            while len(mp) <= need:
+                nxt = self.next_free(mp[-1], set(mp) | {self.start})
+                if nxt is None:
+                    ok = False
+                    break
+                mp.append(nxt)
+            if not ok:
+                continue
+            data = b"".join(self.src.read(self.g.offset(x), cs) for x in mp)[inoff:inoff + size]
+            samples = _samples(data, v_end)
+            if samples and all(o + s <= v_end for o, s, _ in samples) and samples[0][0] < cs * 4 + v_end:
+                return mp, data, samples
+        return None
+
+    def _check(self, path, fixed, sample):
+        o, size, hevc = sample
+        cs = self.cs
+        need = (o + 5) // cs
+        full = path
+        if len(path) <= need:
+            full = list(path)
+            while len(full) <= need:
+                i = len(full)
+                if i in fixed:
+                    full.append(fixed[i])
+                else:
+                    c = self.next_free(full[-1], set(full) | set(fixed.values()))
+                    if c is None:
+                        return False
+                    full.append(c)
+        return _nal_ok(self.vread(full, o, 5), size, hevc)
+
+    def _lay_out(self, path, checks, fixed):
+        cs = self.cs
+        fixed_set = set(fixed.values())
+        last_ok = 0
+        i = 0
+        while i < len(checks):
+            o = checks[i][0]
+            pos = o // cs
+            if pos in fixed:
+                path = self._materialize(path, fixed, pos)
+                if path is None:
+                    return None
+                path = path[:min(len(path), min(fixed))]
+            if self._check(path, fixed, checks[i]):
+                last_ok = max(last_ok, pos)
+                i += 1
+                continue
+            fixed_path = self._repair(path, fixed, fixed_set, checks, i, last_ok)
+            if fixed_path is None:
+                return None
+            path = fixed_path
+        return path
+
+    def _repair(self, path, fixed, fixed_set, checks, i, last_ok):
+        """The checkpoint checks[i] failed: the next piece starts somewhere in
+        positions (last_ok, pos]. Search break positions latest-first and
+        earliest-first; if the two explanations disagree, the clusters between
+        checkpoints can't be confirmed and the video is flagged."""
+        cs = self.cs
+        pos = (checks[i][0] + 4) // cs
+        lo = max(1, last_ok + 1) if last_ok else 1
+        late = self._search(path, fixed, fixed_set, checks, i, range(pos, lo - 1, -1))
+        early = self._search(path, fixed, fixed_set, checks, i, range(lo, pos + 1))
+        if late is None:
+            return early
+        if early is not None:
+            a = self._materialize(late, fixed, pos)
+            b = self._materialize(early, fixed, pos)
+            if a is None or b is None or a[:pos + 1] != b[:pos + 1]:
+                self.ambiguous = True
+        return late
+
+    def _search(self, path, fixed, fixed_set, checks, i, order):
+        cs = self.cs
+        for j in order:
+            if j in fixed or j == 0:
+                continue
+            base = path[:j]
+            if len(base) < j:
+                base = list(path)
+                if not self.extend(base, j - 1, fixed_set):
+                    continue
+                base = base[:j]
+            skip = set(base) | fixed_set
+            c, tried = base[-1], 0
+            while tried < CANDIDATES:
+                c = self.next_free(c, skip)
+                if c is None:
+                    break
+                tried += 1
+                trial = base + [c]
+                good = True
+                for k in range(i, min(len(checks), i + 1 + LOOKAHEAD)):
+                    if checks[k][0] // cs in fixed and checks[k][0] // cs > j:
+                        break
+                    if not self._check(trial, fixed, checks[k]):
+                        good = False
+                        break
+                if good:
+                    return trial
+        return None
+
+
+def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None) -> int:
+    done = 0
+    for r in records:
+        start = geom.cluster_at(r.start)
+        blocked[start] = 0
+        try:
+            out = _Video(src, geom, blocked, start).run(r.expected_size)
+        except Exception:
+            out = None
+        blocked[start] = 1
+        if not out:
+            continue
+        clusters, length, ambiguous = out
+        from .reassemble import _Assembler, _extents
+        r.extents = _extents(geom, clusters, length)
+        if ambiguous:
+            r.status = "unverified"
+            r.note = "rebuilt, but some pieces could not be confirmed; check that it plays"
+        else:
+            r.status = "ok"
+            r.note = "every frame position checked"
+        pieces = _Assembler._pieces(clusters)
+        if pieces > 1:
+            r.meta["reassembled_from"] = pieces
+            if r.origin == "carved":
+                r.origin = "reassembled"
+        if r.status == "ok":
+            own(r)
+        done += 1
+    return done

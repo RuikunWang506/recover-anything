@@ -1,0 +1,413 @@
+"""Exact-length measurement and validation for non-JPEG formats.
+
+Each measure_* takes read(off, n) and an absolute start, and returns a Result:
+end (bytes from start), complete (looked whole), ext, and a reason.
+"""
+from __future__ import annotations
+
+import struct
+import zlib
+
+
+class Result:
+    __slots__ = ("end", "complete", "ext", "reason", "kind", "break_pos")
+
+    def __init__(self, end, complete, ext, reason="ok", kind=None, break_pos=None):
+        self.end, self.complete, self.ext, self.reason, self.kind, self.break_pos = end, complete, ext, reason, kind, break_pos
+
+
+# ------------------------------------------------------------------ ISO BMFF
+TOP_LEVEL = {b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"uuid", b"meta", b"pnot", b"moof", b"mfra",
+             b"sidx", b"styp", b"emsg", b"prft", b"udta", b"PICT", b"junk", b"pdin", b"jp2h", b"ssix", b"mvex",
+             b"Xtra", b"beam", b"CNOP", b"PANA", b"LEIC", b"thum"}
+BRAND_EXT = {b"qt  ": ".mov", b"heic": ".heic", b"heix": ".heic", b"hevc": ".heic", b"heim": ".heic",
+             b"heis": ".heic", b"mif1": ".heic", b"msf1": ".heic", b"avif": ".avif", b"avis": ".avif",
+             b"crx ": ".cr3", b"M4A ": ".m4a", b"M4V ": ".m4v", b"3gp4": ".3gp", b"3gp5": ".3gp", b"3gp6": ".3gp",
+             b"3g2a": ".3g2", b"XAVC": ".mp4", b"MSNV": ".mp4"}
+
+
+def probe_isobmff(head: bytes) -> bool:
+    if len(head) < 12 or head[4:8] != b"ftyp":
+        return False
+    size = struct.unpack(">I", head[:4])[0]
+    return 12 <= size <= 512 and all(32 <= b < 127 for b in head[8:12])
+
+
+def isobmff_ext(head: bytes) -> str:
+    brand = head[8:12]
+    if brand in BRAND_EXT:
+        return BRAND_EXT[brand]
+    if brand.startswith(b"3gp"):
+        return ".3gp"
+    return ".mp4"
+
+
+def measure_isobmff(read, start: int, limit: int) -> Result:
+    head = read(start, 32)
+    ext = isobmff_ext(head)
+    pos, seen = 0, []
+    while pos < limit:
+        h = read(start + pos, 16)
+        if len(h) < 8:
+            break
+        size = struct.unpack(">I", h[:4])[0]
+        typ = h[4:8]
+        if typ not in TOP_LEVEL:
+            break
+        if size == 1:
+            if len(h) < 16:
+                break
+            size = struct.unpack(">Q", h[8:16])[0]
+        elif size == 0:
+            return Result(pos, False, ext, "box runs to end of disk")
+        if size < 8 or pos + size > limit:
+            break
+        seen.append(typ)
+        pos += size
+    s = set(seen)
+    if ext in (".heic", ".avif", ".cr3"):
+        complete = b"meta" in s or b"moov" in s
+    else:
+        complete = b"moov" in s and (b"mdat" in s or b"moof" in s)
+    return Result(pos, complete, ext, "ok" if complete else "missing %s" % ("moov" if b"moov" not in s else "mdat"))
+
+
+def _boxes(read, off: int, end: int):
+    while off + 8 <= end:
+        h = read(off, 16)
+        if len(h) < 8:
+            return
+        size = struct.unpack(">I", h[:4])[0]
+        typ = h[4:8]
+        hdr = 8
+        if size == 1:
+            size = struct.unpack(">Q", h[8:16])[0]
+            hdr = 16
+        elif size == 0:
+            size = end - off
+        if size < hdr or off + size > end:
+            return
+        yield typ, off + hdr, off + size
+        off += size
+
+
+def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
+    """('ok'|'corrupt'|'unverified', why, bad_offset). Checks every video
+    sample's position and its NAL length prefix, which catches clusters that
+    belong to other files."""
+    moov = None
+    for typ, b, e in _boxes(read, 0, length):
+        if typ == b"moov":
+            moov = (b, e)
+    if not moov:
+        return "unverified", "no moov box", None
+    checked = 0
+    for typ, b, e in _boxes(read, *moov):
+        if typ != b"trak":
+            continue
+        stbl = _find(read, b, e, [b"mdia", b"minf", b"stbl"])
+        if not stbl:
+            continue
+        codec = None
+        offsets, sizes, stsc = [], [], []
+        for t2, b2, e2 in _boxes(read, *stbl):
+            body = read(b2, min(e2 - b2, 64 << 20))
+            if t2 == b"stsd" and len(body) >= 16:
+                codec = body[12:16]
+            elif t2 == b"stco":
+                n = struct.unpack(">I", body[4:8])[0]
+                offsets = list(struct.unpack(">%dI" % n, body[8:8 + 4 * n]))
+            elif t2 == b"co64":
+                n = struct.unpack(">I", body[4:8])[0]
+                offsets = list(struct.unpack(">%dQ" % n, body[8:8 + 8 * n]))
+            elif t2 == b"stsz":
+                fixed, n = struct.unpack(">II", body[4:12])
+                sizes = [fixed] * n if fixed else list(struct.unpack(">%dI" % n, body[12:12 + 4 * n]))
+            elif t2 == b"stsc":
+                n = struct.unpack(">I", body[4:8])[0]
+                stsc = [struct.unpack(">III", body[8 + 12 * i:20 + 12 * i]) for i in range(n)]
+        if not offsets or not sizes:
+            continue
+        nal = codec in (b"avc1", b"avc3", b"hvc1", b"hev1")
+        hevc = codec in (b"hvc1", b"hev1")
+        si = 0
+        for ci, coff in enumerate(offsets, start=1):
+            per = 1
+            for first, spc, _ in stsc:
+                if ci >= first:
+                    per = spc
+            pos = coff
+            for _ in range(per):
+                if si >= len(sizes):
+                    break
+                sz = sizes[si]
+                if pos + sz > length:
+                    return "corrupt", "sample %d lies past the end of the file" % si, pos
+                if nal and sz >= 5:
+                    h = read(pos, 5)
+                    ln = struct.unpack(">I", h[:4])[0]
+                    hdr = h[4]
+                    if ln == 0 or ln + 4 > sz or hdr & 0x80:
+                        return "corrupt", "video frame %d (byte %d) is not where the index says" % (si, pos), pos
+                    t = (hdr >> 1) & 0x3F if hevc else hdr & 0x1F
+                    if (hevc and t > 40) or (not hevc and t in (0, 24, 25, 26, 27, 28, 29, 30, 31)):
+                        return "corrupt", "video frame %d (byte %d) has an impossible unit type" % (si, pos), pos
+                pos += sz
+                si += 1
+                checked += 1
+    if checked == 0:
+        return "unverified", "no sample tables", None
+    return "ok", "%d frames checked" % checked, None
+
+
+def _find(read, b, e, path):
+    for name in path:
+        for typ, b2, e2 in _boxes(read, b, e):
+            if typ == name:
+                b, e = b2, e2
+                break
+        else:
+            return None
+    return b, e
+
+
+# ---------------------------------------------------------------------- PNG
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+
+def probe_png(head: bytes) -> bool:
+    return head[:8] == PNG_SIG
+
+
+def measure_png(read, start: int, limit: int) -> Result:
+    pos = 8
+    while pos < limit:
+        h = read(start + pos, 8)
+        if len(h) < 8:
+            return Result(pos, False, ".png", "truncated", break_pos=pos)
+        ln = struct.unpack(">I", h[:4])[0]
+        typ = h[4:8]
+        if ln > 0x7FFFFFFF or not typ.isalpha():
+            return Result(pos, False, ".png", "bad chunk", break_pos=pos)
+        body = read(start + pos + 4, 4 + ln + 4)
+        if len(body) < 8 + ln:
+            return Result(pos, False, ".png", "truncated", break_pos=pos)
+        crc = struct.unpack(">I", body[4 + ln:8 + ln])[0]
+        if zlib.crc32(body[:4 + ln]) & 0xFFFFFFFF != crc:
+            return Result(pos, False, ".png", "checksum mismatch", break_pos=pos)
+        pos += 12 + ln
+        if typ == b"IEND":
+            return Result(pos, True, ".png")
+    return Result(pos, False, ".png", "too long")
+
+
+# ---------------------------------------------------------------------- GIF
+def probe_gif(head: bytes) -> bool:
+    return head[:6] in (b"GIF87a", b"GIF89a")
+
+
+def measure_gif(read, start: int, limit: int) -> Result:
+    data = read(start, min(limit, 64 * 1024 * 1024))
+    if len(data) < 13:
+        return Result(0, False, ".gif", "truncated")
+    flags = data[10]
+    pos = 13 + (3 * (2 << (flags & 7)) if flags & 0x80 else 0)
+    while pos < len(data):
+        b = data[pos]
+        if b == 0x3B:
+            return Result(pos + 1, True, ".gif")
+        if b == 0x21:
+            pos += 2
+        elif b == 0x2C:
+            if pos + 10 > len(data):
+                break
+            lf = data[pos + 9]
+            pos += 10 + (3 * (2 << (lf & 7)) if lf & 0x80 else 0) + 1
+        else:
+            return Result(pos, False, ".gif", "bad block", break_pos=pos)
+        while pos < len(data):
+            n = data[pos]
+            pos += 1 + n
+            if n == 0:
+                break
+    return Result(pos, False, ".gif", "truncated", break_pos=pos)
+
+
+# --------------------------------------------------------------------- RIFF
+RIFF_EXT = {b"AVI ": ".avi", b"WAVE": ".wav", b"WEBP": ".webp"}
+
+
+def probe_riff(head: bytes) -> bool:
+    return head[:4] == b"RIFF" and head[8:12] in RIFF_EXT
+
+
+def measure_riff(read, start: int, limit: int) -> Result:
+    h = read(start, 12)
+    size = struct.unpack("<I", h[4:8])[0] + 8
+    size += size & 1
+    ext = RIFF_EXT.get(h[8:12], ".riff")
+    if size > limit:
+        return Result(0, False, ext, "too long")
+    # walk top-level chunks to make sure the size is believable
+    pos = 12
+    while pos + 8 <= size:
+        c = read(start + pos, 8)
+        if len(c) < 8 or not all(32 <= x < 127 for x in c[:4]):
+            return Result(size, False, ext, "chunk structure broken at %d" % pos, break_pos=pos)
+        n = struct.unpack("<I", c[4:8])[0]
+        pos += 8 + n + (n & 1)
+    return Result(size, pos == size or pos == size - 1, ext)
+
+
+# --------------------------------------------------------------------- TIFF
+def probe_tiff(head: bytes) -> bool:
+    return head[:4] in (b"II*\x00", b"MM\x00*", b"IIRO", b"IIRS", b"IIU\x00")
+
+
+_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
+
+
+def measure_tiff(read, start: int, limit: int) -> Result:
+    """RAW files (CR2, NEF, ARW, DNG, ORF, RW2...) are TIFF containers. The file
+    ends where the last thing any IFD points to ends."""
+    head = read(start, 16)
+    bo = "<" if head[:2] == b"II" else ">"
+    ext = ".tif"
+    if head[8:10] == b"CR":
+        ext = ".cr2"
+    elif head[:4] in (b"IIRO", b"IIRS"):
+        ext = ".orf"
+    elif head[:4] == b"IIU\x00":
+        ext = ".rw2"
+    end = 8
+    make = b""
+    seen = set()
+    todo = [struct.unpack(bo + "I", head[4:8])[0]]
+    strip_pairs = {(0x0111, 0x0117), (0x0144, 0x0145), (0x0201, 0x0202)}
+    while todo and len(seen) < 64:
+        ifd = todo.pop()
+        if ifd in seen or ifd < 8 or ifd > limit:
+            continue
+        seen.add(ifd)
+        cnt_b = read(start + ifd, 2)
+        if len(cnt_b) < 2:
+            continue
+        n = struct.unpack(bo + "H", cnt_b)[0]
+        if n == 0 or n > 1000:
+            continue
+        raw = read(start + ifd + 2, 12 * n + 4)
+        if len(raw) < 12 * n + 4:
+            continue
+        tags = {}
+        for i in range(n):
+            tag, typ, count, val = struct.unpack(bo + "HHII", raw[12 * i:12 * i + 12])
+            ts = _TYPE_SIZE.get(typ, 1)
+            tags[tag] = (typ, count, val)
+            if ts * count > 4 and val + ts * count <= limit:
+                end = max(end, val + ts * count)
+            if tag in (0x8769, 0x014A, 0x8825, 0xA005) and typ in (4, 13):
+                if count == 1:
+                    todo.append(val)
+                elif val + 4 * count <= limit:
+                    todo.extend(struct.unpack(bo + "%dI" % count, read(start + val, 4 * count)))
+            if tag == 0x010F:
+                make = read(start + val, min(count, 32)) if count > 4 else raw[12 * i + 8:12 * i + 12]
+            if tag == 0xC612:
+                ext = ".dng"
+        end = max(end, ifd + 2 + 12 * n + 4)
+        nxt = struct.unpack(bo + "I", raw[12 * n:12 * n + 4])[0]
+        if nxt:
+            todo.append(nxt)
+        for off_tag, len_tag in strip_pairs:
+            if off_tag in tags and len_tag in tags:
+                (to, co, vo), (tl, cl, vl) = tags[off_tag], tags[len_tag]
+                offs = [vo] if co == 1 else list(_vals(read, start, bo, to, co, vo))
+                lens = [vl] if cl == 1 else list(_vals(read, start, bo, tl, cl, vl))
+                for o, ln in zip(offs, lens):
+                    if o + ln <= limit:
+                        end = max(end, o + ln)
+    if ext == ".tif":
+        m = make.upper()
+        if m.startswith(b"NIKON"):
+            ext = ".nef"
+        elif m.startswith(b"SONY"):
+            ext = ".arw"
+        elif m.startswith(b"PENTAX") or m.startswith(b"RICOH"):
+            ext = ".pef"
+        elif m.startswith(b"CANON"):
+            ext = ".cr2"
+    return Result(end, end > 1024, ext, "ok" if end > 1024 else "too small")
+
+
+def _vals(read, start, bo, typ, count, off):
+    fmt = {3: "H", 4: "I", 13: "I"}.get(typ)
+    if not fmt or count > 100000:
+        return []
+    raw = read(start + off, struct.calcsize(fmt) * count)
+    return struct.unpack(bo + fmt * (len(raw) // struct.calcsize(fmt)), raw)
+
+
+# ---------------------------------------------------------------------- PDF
+def probe_pdf(head: bytes) -> bool:
+    return head[:5] == b"%PDF-"
+
+
+def measure_pdf(read, start: int, limit: int, stop_at=None) -> Result:
+    pos, last_eof, chunk = 0, -1, 1 << 20
+    tail = b""
+    while pos < limit:
+        data = read(start + pos, chunk)
+        if not data:
+            break
+        buf = tail + data
+        base = pos - len(tail)
+        i = buf.rfind(b"%%EOF")
+        if i >= 0:
+            last_eof = base + i + 5
+        if stop_at and last_eof > 0 and stop_at(pos + len(data)):
+            break
+        tail = buf[-5:]
+        pos += len(data)
+        if last_eof > 0 and data.count(0) == len(data):
+            break
+    if last_eof < 0:
+        return Result(0, False, ".pdf", "no end marker")
+    nl = read(start + last_eof, 2)
+    if nl[:2] == b"\r\n":
+        last_eof += 2
+    elif nl[:1] in (b"\n", b"\r"):
+        last_eof += 1
+    return Result(last_eof, True, ".pdf")
+
+
+# ---------------------------------------------------------------------- ZIP
+def probe_zip(head: bytes) -> bool:
+    return head[:4] == b"PK\x03\x04" and 10 <= struct.unpack("<H", head[4:6])[0] <= 63
+
+
+def measure_zip(read, start: int, limit: int) -> Result:
+    pos, chunk = 0, 1 << 20
+    while pos < limit:
+        data = read(start + pos, chunk + 22)
+        if not data:
+            break
+        i = data.find(b"PK\x05\x06")
+        while i >= 0:
+            rec = data[i:i + 22]
+            if len(rec) < 22:
+                rec = read(start + pos + i, 22)
+            _, _, _, _, total, cd_size, cd_off, clen = struct.unpack("<IHHHHIIH", rec[:22])
+            eocd = pos + i
+            if cd_off + cd_size == eocd:
+                cd = read(start + cd_off, min(cd_size, 1 << 16))
+                ext = ".zip"
+                if b"[Content_Types].xml" in cd or b"word/" in cd or b"xl/" in cd or b"ppt/" in cd:
+                    ext = ".docx" if b"word/" in cd else ".xlsx" if b"xl/" in cd else ".pptx" if b"ppt/" in cd else ".zip"
+                elif b"META-INF/container.xml" in cd:
+                    ext = ".epub"
+                elif b"AndroidManifest.xml" in cd:
+                    ext = ".apk"
+                return Result(eocd + 22 + clen, True, ext)
+            i = data.find(b"PK\x05\x06", i + 1)
+        pos += chunk
+    return Result(0, False, ".zip", "no central directory")
