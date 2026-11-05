@@ -93,10 +93,11 @@ def _boxes(read, off: int, end: int):
         off += size
 
 
-def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
+def validate_isobmff(read, length: int, refs: set | None = None) -> tuple[str, str, int | None]:
     """('ok'|'corrupt'|'unverified', why, bad_offset). Checks every video
     sample's position and its NAL length prefix, which catches clusters that
-    belong to other files."""
+    belong to other files. If `refs` is given, the offsets of Motion-JPEG
+    frames are added to it (those frames are part of this file)."""
     moov = None
     for typ, b, e in _boxes(read, 0, length):
         if typ == b"moov":
@@ -110,10 +111,14 @@ def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
         stbl = _find(read, b, e, [b"mdia", b"minf", b"stbl"])
         if not stbl:
             continue
+        codec = track_codec(read, stbl)
+        nal = codec in NAL_CODECS
         try:
             tables = sample_tables(read, stbl)
         except TooManySamples:
-            return "unverified", "too many frames to check one by one", None
+            if nal:
+                return "unverified", "too many frames to check one by one", None
+            continue  # e.g. hours of uncompressed audio: nothing worth checking per sample
         if tables is None:
             return "corrupt", "the video's index is damaged", None
         codec, offsets, sizes, stsc = tables
@@ -121,12 +126,17 @@ def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
             continue
         total += len(sizes)
         if total > MAX_SAMPLES:
-            return "unverified", "too many frames to check one by one", None
-        nal = codec in (b"avc1", b"avc3", b"hvc1", b"hev1")
+            if nal:
+                return "unverified", "too many frames to check one by one", None
+            total -= len(sizes)
+            continue
         hevc = codec in (b"hvc1", b"hev1")
+        collect = refs is not None and codec in MJPEG_CODECS
         for si, (pos, sz) in enumerate(iter_samples(offsets, sizes, stsc)):
             if pos + sz > length:
                 return "corrupt", "sample %d lies past the end of the file" % si, pos
+            if collect:
+                refs.add(pos)
             if nal and sz >= 5:
                 h = read(pos, 5)
                 if len(h) < 5:
@@ -145,6 +155,8 @@ def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
 
 
 MAX_SAMPLES = 2_000_000  # frames per file: a 9-hour 60 fps video
+NAL_CODECS = (b"avc1", b"avc3", b"hvc1", b"hev1")
+MJPEG_CODECS = (b"jpeg", b"mjpa", b"mjpb", b"AVDJ", b"dmb1")
 
 
 class TooManySamples(Exception):
@@ -188,6 +200,15 @@ class _Fixed:
         return self.size
 
 
+def track_codec(read, stbl):
+    """The four-letter codec of a track ('avc1', 'hvc1', 'mp4a', 'sowt'...)."""
+    for t2, b2, e2 in _boxes(read, *stbl):
+        if t2 == b"stsd":
+            body = read(b2, min(e2 - b2, 64))
+            return body[12:16] if len(body) >= 16 else None
+    return None
+
+
 def sample_tables(read, stbl):
     """(codec, chunk offsets, sample sizes, sample-to-chunk table) for one
     track, or None if the tables are inconsistent (TooManySamples if they are
@@ -211,11 +232,11 @@ def sample_tables(read, stbl):
             if len(body) < 12:
                 return None
             fixed, n = struct.unpack(">II", body[4:12])
-            if n > MAX_SAMPLES:
-                raise TooManySamples(n)
             if fixed:
-                sizes = _Fixed(fixed, n)
+                sizes = _Fixed(fixed, n)  # no list: the count alone costs nothing
             else:
+                if n > MAX_SAMPLES:
+                    raise TooManySamples(n)
                 if len(body) < 12 + 4 * n:
                     return None
                 sizes = _be_array("I", body[12:12 + 4 * n])
@@ -231,7 +252,7 @@ def sample_tables(read, stbl):
             firsts = stsc[0::3]
             if any(x > y for x, y in zip(firsts, firsts[1:])):
                 return None  # runs must be listed in order
-    if isinstance(sizes, _Fixed) and codec not in (b"avc1", b"avc3", b"hvc1", b"hev1"):
+    if isinstance(sizes, _Fixed) and codec not in NAL_CODECS + MJPEG_CODECS:
         return codec, (), (), stsc  # e.g. PCM audio: nothing to check per sample
     return codec, offsets, sizes, stsc
 
@@ -446,8 +467,10 @@ def _vals(read, start, bo, typ, count, off):
     fmt = {3: "H", 4: "I", 13: "I"}.get(typ)
     if not fmt or count > 100000:
         return []
-    raw = read(start + off, struct.calcsize(fmt) * count)
-    return struct.unpack(bo + fmt * (len(raw) // struct.calcsize(fmt)), raw)
+    size = struct.calcsize(fmt)
+    raw = read(start + off, size * count)
+    raw = raw[:len(raw) // size * size]  # a cut-off read: keep the whole values
+    return struct.unpack(bo + "%d%s" % (len(raw) // size, fmt), raw)
 
 
 # ---------------------------------------------------------------------- PDF
