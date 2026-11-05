@@ -61,6 +61,7 @@ def run(quick: bool = False, keep: str | None = None, as_json: bool = False) -> 
             t0 = time.time()
             res = scan(sc.image)
             write_all(res, out)
+            res._src.close()  # Windows can't delete a file that is still open
             secs = time.time() - t0
             got = _hash_tree(out)
             hits = {h for h in sc.truth if h in got}
