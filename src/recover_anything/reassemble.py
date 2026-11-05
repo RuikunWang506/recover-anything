@@ -315,19 +315,50 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
             if 0 <= c < len(blocked):
                 blocked[c] = 1
         fsr = getattr(vr, "fs_reader", None)
+        # The first piece of every broken photo is that photo's: the clusters
+        # from its header up to where its picture stops decoding. Claiming them
+        # up front keeps other photos from wandering into them (the camera's
+        # next free cluster is often just past another photo's first piece).
+        heads: dict[int, list[int]] = {}
+        for r in broken:
+            start = g.cluster_at(r.start)
+            bad = r.meta.get("bad_at")
+            n = max(1, int(bad) // cs) if bad else 1
+            head = []
+            for c in range(start, min(start + n, g.last_cluster + 1)):
+                if c != start and blocked[c]:
+                    break  # ran into a file that checked out: the first piece ended there
+                head.append(c)
+            heads[id(r)] = [c for c in head if not blocked[c] or c == start]
+        owned = bytearray(blocked)  # clusters of files that checked out, and header clusters
+        claimed: dict[int, int] = {}  # first-piece clusters (not the header cluster) -> whose
+        for r in broken:
+            for c in heads[id(r)][1:]:
+                claimed[c] = id(r)
         asm = _Assembler(src, g, blocked)
         todo = sorted(broken, key=lambda r: r.start)
         done = 0
-        for _ in range(passes):
+        idle = 0
+        # Alternate between respecting those claims and ignoring them: a claim
+        # can be wrong (another photo's data can decode as the end of a first
+        # piece), and a finished photo is checked to the last block, so trying
+        # both ways only adds correct rebuilds.
+        for p in range(max(passes, 4)):
+            strict = p % 2 == 0
+            for c in claimed:
+                blocked[c] = 1 if strict else 0
             progress_made = False
             for r in list(todo):
-                start = g.cluster_at(r.start)
-                blocked[start] = 0
+                head = heads[id(r)]
+                for c in head:
+                    if c == head[0] or not owned[c]:
+                        blocked[c] = 0  # its own first piece, minus what other photos have since proved theirs
                 try:
-                    out = asm.run(start, r.expected_size)
+                    out = asm.run(head[0], r.expected_size)
                 except Exception:
                     out = None  # never let one file stop the run
-                blocked[start] = 1
+                for c in head:
+                    blocked[c] = 1 if owned[c] or (strict and c in claimed) else 0
                 if out is None:
                     continue
                 clusters, length, status, note = out
@@ -340,14 +371,25 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
                             r.meta["reassembled_from"] = _Assembler._pieces(clusters)
                             if r.origin == "carved":
                                 r.origin = "reassembled"
+                        used = set(clusters)
+                        for c in head[1:] + list(clusters):
+                            claimed.pop(c, None)  # settled: this photo's, or not a first piece at all
+                        for c in head[1:]:
+                            if c not in used and not owned[c]:
+                                blocked[c] = 0  # claimed by this photo, but it turned out not to be its
                         own(r)
+                        for c in clusters:
+                            owned[c] = 1
                         todo.remove(r)
                         progress_made = True
                         done += 1
                         if progress:
                             progress(done, len(broken))
-            if not progress_made or not todo:
+            idle = 0 if progress_made else idle + 1
+            if not todo or idle >= 2:
                 break
+        for c in claimed:
+            blocked[c] = 1  # leftovers of photos that couldn't be finished: not video data
         _ = fsr
         if videos:
             from .reassemble_video import reassemble_videos

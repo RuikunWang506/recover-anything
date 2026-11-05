@@ -76,37 +76,47 @@ class _Video:
         self.src, self.g, self.blocked, self.start = src, geom, blocked, start
         self.cs = geom.cluster_size
         self.last = geom.last_cluster
-        self._plaus: dict[int, bool] = {}
+        self._plaus: dict = {}
+        self.file_len = 0  # set once the index says how long the file is
         self.ambiguous = False
 
-    def next_free(self, c, skip):
+    def next_free(self, c, skip, index=None, used=None):
+        """The next unclaimed cluster after c that could hold this video's
+        bytes at file cluster `index` (only the part the file uses there is
+        judged: a last cluster is mostly leftover data from older files)."""
+        if used is None and index is not None and self.file_len:
+            used = self.file_len - index * self.cs
         while True:
             n = self.blocked.find(0, c + 1, self.last + 1)
             if n < 0:
                 return None
-            if n not in skip and self.plausible(n):
+            if n not in skip and self.plausible(n, used):
                 return n
             c = n
 
-    def plausible(self, c) -> bool:
+    def plausible(self, c, used=None) -> bool:
         """Could this cluster be part of a video? Empty clusters can't, and
         neither can JPEG image data (every 0xFF in it is followed by 0x00 or a
         restart marker), which is what most leftover data on a camera card is."""
-        v = self._plaus.get(c)
+        used = self.cs if used is None or used >= self.cs else max(0, used)
+        key = (c, used)
+        v = self._plaus.get(key)
         if v is None:
-            data = self.src.read(self.g.offset(c), self.cs)
+            data = self.src.read(self.g.offset(c), used)
             if data.count(0) == len(data):
-                v = False
+                v = used < self.cs  # a file's last few bytes may well be zeros
+            elif used < 1024:
+                v = True  # too little to judge
             else:
                 ffs = data.count(b"\xff")
                 ok_pairs = data.count(b"\xff\x00") + sum(data.count(bytes([0xFF, m])) for m in range(0xD0, 0xD8))
                 v = not (ffs >= 6 and ok_pairs >= ffs - 1)
-            self._plaus[c] = v
+            self._plaus[key] = v
         return v
 
     def extend(self, path, upto, skip):
         while len(path) <= upto:
-            c = self.next_free(path[-1], skip | set(path))
+            c = self.next_free(path[-1], skip | set(path), index=len(path))
             if c is None:
                 return False
             path.append(c)
@@ -156,6 +166,7 @@ class _Video:
             moov = self.vread(path, *moov_box)
             samples = _samples(moov, moov_box[0])
             tail_start = v_end
+            self.file_len = v_end
         else:
             found = self._find_moov(path, v_end)
             if not found:
@@ -166,6 +177,7 @@ class _Video:
                 fixed[pv + k] = c
             moov_box = (v_end, len(moov))
             tail_start = v_end + len(moov)
+            self.file_len = tail_start
         if not samples:
             return None
         checks = [s for s in samples if s[0] < v_end]
@@ -173,21 +185,27 @@ class _Video:
         if path is None:
             return None
         total = tail_start
-        # trailing boxes after the index ('free', 'udta', ...), if any
-        full = self._materialize(path, fixed, (total + 16) // cs)
+        full = self._materialize(path, fixed, (total - 1) // cs)
         if full is None:
             return None
+        # trailing boxes after the index ('free', 'udta', ...), if any
         for _ in range(8):
-            h = self.vread(full, total, 8)
+            self.file_len = 0  # whatever follows is judged as a whole cluster
+            probe = self._materialize(full, fixed, (total + 7) // cs)
+            if probe is None:
+                break
+            h = self.vread(probe, total, 8)
             if len(h) < 8 or h[4:8] not in others.TOP_LEVEL or h[4:8] in (b"mdat", b"ftyp"):
                 break
             size = struct.unpack(">I", h[:4])[0]
             if size < 8 or size > MAX_MOOV:
                 break
+            self.file_len = total + size
+            nxt = self._materialize(probe, fixed, (total + size - 1) // cs)
+            if nxt is None:
+                break
             total += size
-            full = self._materialize(path, fixed, (total + 16) // cs)
-            if full is None:
-                return None
+            full = nxt
         n = (total + cs - 1) // cs
         full = full[:n]
         st, why, _ = others.validate_isobmff(lambda o, k: self.vread(full, o, k), total)
@@ -202,7 +220,7 @@ class _Video:
             if i in fixed:
                 full.append(fixed[i])
                 continue
-            c = self.next_free(full[-1], set(full) | set(fixed.values()))
+            c = self.next_free(full[-1], set(full) | set(fixed.values()), index=i)
             if c is None:
                 return None
             full.append(c)
@@ -239,7 +257,7 @@ class _Video:
             need = (inoff + size - 1) // cs
             ok = True
             while len(mp) <= need:
-                nxt = self.next_free(mp[-1], set(mp) | {self.start})
+                nxt = self.next_free(mp[-1], set(mp) | {self.start}, used=inoff + size - len(mp) * cs)
                 if nxt is None:
                     ok = False
                     break
@@ -264,7 +282,7 @@ class _Video:
                 if i in fixed:
                     full.append(fixed[i])
                 else:
-                    c = self.next_free(full[-1], set(full) | set(fixed.values()))
+                    c = self.next_free(full[-1], set(full) | set(fixed.values()), index=i)
                     if c is None:
                         return False
                     full.append(c)
@@ -336,7 +354,7 @@ class _Video:
             skip = set(base) | fixed_set
             c, tried = base[-1], 0
             while tried < CANDIDATES:
-                c = self.next_free(c, skip)
+                c = self.next_free(c, skip, index=j)
                 if c is None:
                     break
                 tried += 1
