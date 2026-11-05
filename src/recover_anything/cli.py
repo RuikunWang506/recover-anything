@@ -289,9 +289,12 @@ def main(argv=None) -> int:
         return 1
     try:
         return a.fn(a)
-    except PermissionError:
-        print("Permission denied. Reading a disk directly needs administrator rights: use sudo on macOS/Linux, or "
-              "an Administrator terminal on Windows.", file=sys.stderr)
+    except PermissionError as e:
+        print("Permission denied: %s" % e, file=sys.stderr)
+        src = getattr(a, "source", "") or ""
+        if src and (src.startswith("\\\\.\\") or src.startswith("/dev/")):
+            print("Reading a disk directly needs administrator rights: use sudo on macOS/Linux, or an "
+                  "Administrator terminal on Windows.", file=sys.stderr)
         return 13
     except KeyboardInterrupt:
         print("\nStopped. Nothing was written to the source.", file=sys.stderr)
