@@ -112,7 +112,11 @@ def _finish(im, rng, taken, quality, make, model, restart_blocks, optimize, thum
     from PIL import Image, ImageChops
     width, height = im.size
     if noise:
-        n = Image.effect_noise((width, height), noise).convert("RGB")
+        # Seeded sensor noise (Pillow's effect_noise ignores Python's seed, which
+        # would make every simulated card, and so every result, different).
+        raw = Image.frombytes("L", (width, height), rng.randbytes(width * height))
+        scale = noise / 73.9  # std of uniform 0..255 is ~73.9
+        n = raw.point([max(0, min(255, int(round(128 + (v - 127.5) * scale)))) for v in range(256)]).convert("RGB")
         im = ImageChops.add(im, n, 1.0, -128)
     thumb = None
     if thumbnail:
