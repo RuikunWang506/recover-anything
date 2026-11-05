@@ -40,7 +40,7 @@ def _nal_ok(h: bytes, size: int, hevc: bool) -> bool:
 
 def _samples(moov: bytes, base: int):
     """[(file offset, size, hevc)] for every H.264/HEVC sample in a moov box."""
-    read = lambda o, n: moov[o - base:o - base + n]  # noqa: E731
+    read = lambda o, n: moov[max(0, o - base):max(0, o - base + n)]  # noqa: E731
     out = []
     end = base + len(moov)
     for typ, b, e in others._boxes(read, base + 8, end):
@@ -49,26 +49,10 @@ def _samples(moov: bytes, base: int):
         stbl = others._find(read, b, e, [b"mdia", b"minf", b"stbl"])
         if not stbl:
             continue
-        codec, offsets, sizes, stsc = None, [], [], []
-        for t2, b2, e2 in others._boxes(read, *stbl):
-            body = read(b2, e2 - b2)
-            try:
-                if t2 == b"stsd" and len(body) >= 16:
-                    codec = body[12:16]
-                elif t2 == b"stco":
-                    n = struct.unpack(">I", body[4:8])[0]
-                    offsets = list(struct.unpack(">%dI" % n, body[8:8 + 4 * n]))
-                elif t2 == b"co64":
-                    n = struct.unpack(">I", body[4:8])[0]
-                    offsets = list(struct.unpack(">%dQ" % n, body[8:8 + 8 * n]))
-                elif t2 == b"stsz":
-                    fixed, n = struct.unpack(">II", body[4:12])
-                    sizes = [fixed] * n if fixed else list(struct.unpack(">%dI" % n, body[12:12 + 4 * n]))
-                elif t2 == b"stsc":
-                    n = struct.unpack(">I", body[4:8])[0]
-                    stsc = [struct.unpack(">III", body[8 + 12 * i:20 + 12 * i]) for i in range(n)]
-            except struct.error:
-                return None
+        tables = others.sample_tables(read, stbl)
+        if tables is None:
+            return None
+        codec, offsets, sizes, stsc = tables
         if codec not in (b"avc1", b"avc3", b"hvc1", b"hev1") or not offsets or not sizes:
             continue
         hevc = codec in (b"hvc1", b"hev1")
@@ -293,7 +277,12 @@ class _Video:
         fixed_set = set(fixed.values())
         last_ok = 0
         i = 0
+        repairs: dict[int, int] = {}
+        budget = 20 * len(checks) + 100
         while i < len(checks):
+            budget -= 1
+            if budget < 0:
+                return None  # not converging: give up rather than spin
             o = checks[i][0]
             pos = o // cs
             if pos in fixed:
@@ -305,8 +294,13 @@ class _Video:
                 last_ok = max(last_ok, pos)
                 i += 1
                 continue
+            repairs[i] = repairs.get(i, 0) + 1
+            if repairs[i] > 3:
+                return None  # the same checkpoint keeps failing: the evidence isn't there
             fixed_path = self._repair(path, fixed, fixed_set, checks, i, last_ok)
             if fixed_path is None:
+                return None
+            if fixed_path == path:
                 return None
             path = fixed_path
         return path

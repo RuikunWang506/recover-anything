@@ -46,12 +46,13 @@ class _Dir:
 
 class ExfatCard:
     def __init__(self, path: str, size: int = 4 * 1024**3, cluster_size: int = 32768, partitioned: bool = True,
-                 allocator: str = "first_free", seed: int = 1, **_):
+                 allocator: str = "first_free", seed: int = 1, existing: bool = False, **_):
         self.path, self.size, self.cluster_size = path, size, cluster_size
         self.rng = random.Random(seed)
         self.part_offset = 4 * 1024 * 1024 if partitioned else 0
-        with open(path, "wb") as f:
-            f.truncate(size)
+        if not existing:
+            with open(path, "wb") as f:
+                f.truncate(size)
         self.f = open(path, "r+b")
         self.spc_shift = (cluster_size // SECTOR).bit_length() - 1
         vol_sectors = (size - self.part_offset) // SECTOR

@@ -87,6 +87,7 @@ class Fat32Card:
         label: str = "NO NAME",
         seed: int = 1,
         strict: bool = True,
+        existing: bool = False,
     ):
         self.path = path
         self.size = size
@@ -95,8 +96,9 @@ class Fat32Card:
         self.label = label
         self.rng = random.Random(seed)
         self.part_offset = 4 * 1024 * 1024 if partitioned else 0
-        with open(path, "wb") as f:
-            f.truncate(size)
+        if not existing:  # existing=True reformats an image in place, keeping old data
+            with open(path, "wb") as f:
+                f.truncate(size)
         self.f = open(path, "r+b")
         self._layout(strict)
         if partitioned:

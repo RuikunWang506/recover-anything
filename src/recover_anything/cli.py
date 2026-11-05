@@ -76,9 +76,67 @@ def cmd_devices(a):
     return 0
 
 
+def _refuse(msg: str) -> int:
+    print("Refusing: " + msg, file=sys.stderr)
+    return 2
+
+
+def _source_problem(src: str):
+    from .devices import is_device_path
+    if os.path.isdir(src):
+        return ("%s is a folder. Point me at the device itself (run `recover-anything devices`) or at a disk image "
+                "file." % src)
+    if not is_device_path(src) and not os.path.isfile(src):
+        return "not found: %s" % src
+    return None
+
+
+def _output_ok(a, src: str, out: str) -> bool:
+    from .devices import check_output
+    ok, why = check_output(src, out)
+    if ok:
+        return True
+    if getattr(a, "trust_output_location", False) and "same disk" not in why and "folder" not in why:
+        print("Warning: %s Continuing because you passed --trust-output-location." % why, file=sys.stderr)
+        return True
+    print("Refusing to save to %s: %s Saving onto the card or drive you're recovering from would overwrite the very "
+          "files you want back. Choose a folder on a different drive%s." % (
+              out, why, "" if "same disk" in why or "folder" in why else
+              " (or, if you are certain it is a different drive, add --trust-output-location)"), file=sys.stderr)
+    return False
+
+
+def _give_back_to_user(path: str) -> None:
+    """Under sudo, hand the output back to the person who ran the command."""
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if not uid or not hasattr(os, "chown"):
+        return
+    try:
+        uid, gid = int(uid), int(gid or uid)
+        if os.path.isfile(path):
+            try:
+                os.chown(path, uid, gid)
+            except OSError:
+                pass
+            return
+        for root, dirs, files in os.walk(path):
+            for n in [root] + [os.path.join(root, x) for x in dirs + files]:
+                try:
+                    os.chown(n, uid, gid)
+                except OSError:
+                    pass
+    except ValueError:
+        pass
+
+
 def cmd_triage(a):
+    from .devices import normalize_source
     from .triage import format_triage, triage
-    t = triage(a.source)
+    src = normalize_source(a.source)
+    problem = _source_problem(src)
+    if problem:
+        return _refuse(problem)
+    t = triage(src)
     if a.json:
         print(json.dumps(t, indent=1, default=str))
     else:
@@ -87,13 +145,21 @@ def cmd_triage(a):
 
 
 def cmd_image(a):
-    from .devices import output_is_on_source
-    from .imaging import make_image
-    if output_is_on_source(a.source, os.path.dirname(os.path.abspath(a.dest)) or "."):
-        print("Refusing: the image would be saved on the card you're recovering from.", file=sys.stderr)
+    from .devices import normalize_source
+    from .imaging import ImageError, make_image
+    src = normalize_source(a.source)
+    problem = _source_problem(src)
+    if problem:
+        return _refuse(problem)
+    if not _output_ok(a, src, os.path.dirname(os.path.abspath(a.dest)) or "."):
         return 2
     bar = Bar(a.json)
-    res = make_image(a.source, a.dest, progress=lambda d, t, s: bar("Copying the card", d, t))
+    try:
+        res = make_image(src, a.dest, progress=lambda d, t, s: bar("Copying the card", d, t))
+    except ImageError as e:
+        return _refuse(str(e))
+    for p in (a.dest, a.dest + ".map.json"):
+        _give_back_to_user(p)
     if a.json:
         print(json.dumps(res))
     else:
@@ -105,41 +171,48 @@ def cmd_image(a):
 
 
 def cmd_recover(a):
-    from .devices import describe, output_is_on_source
-    from .imaging import make_image
+    from .devices import is_device_path, is_system_disk, normalize_source
+    from .imaging import ImageError, identity, make_image, short_id
     from .organize import free_space, plan_size, write_all
     from .pipeline import scan
     from .report import text_summary, write_html
-    from .source import Source, is_block_device
+    from .source import Source
 
-    src_path = a.source
+    src_path = normalize_source(a.source)
     out = os.path.abspath(a.output)
-    if not os.path.exists(src_path) and not src_path.startswith("\\\\"):
-        print("Not found: %s" % src_path, file=sys.stderr)
+    problem = _source_problem(src_path)
+    if problem:
+        return _refuse(problem)
+    if not _output_ok(a, src_path, out):
         return 2
-    if output_is_on_source(src_path, out):
-        print("Refusing: %s is on the card/drive you're recovering from. Saving there would overwrite the very "
-              "files you want back. Pick a folder on a different drive." % out, file=sys.stderr)
+    is_dev = is_device_path(src_path)
+    if is_dev and is_system_disk(src_path) and not a.i_understand_system_disk:
+        print("This is the disk your computer runs from. Recovering from a running system disk is unreliable "
+              "and every minute writes over deleted data. Shut down and image it from another computer, or "
+              "rerun with --i-understand-system-disk.", file=sys.stderr)
         return 2
     os.makedirs(out, exist_ok=True)
     bar = Bar(a.json)
-    is_dev = is_block_device(src_path)
-    if is_dev:
-        d = describe(src_path) or {}
-        if d.get("system_disk") and not a.i_understand_system_disk:
-            print("This is the disk your computer runs from. Recovering from a running system disk is unreliable "
-                  "and every minute writes over deleted data. Shut down and image it from another computer, or "
-                  "rerun with --i-understand-system-disk.", file=sys.stderr)
-            return 2
     work = src_path
     if is_dev and not a.direct:
         with Source(src_path) as s:
             size = s.size
+            ident = identity(s) if size else None
+        if not size:
+            return _refuse("couldn't read the size of %s (is it connected and readable?)" % src_path)
         if free_space(out) > size * 1.05 + (256 << 20):
-            img = os.path.join(out, "card-image.img")
+            base = os.path.join(out, "card-%s" % short_id(ident))
+            img, k = base + ".img", 2
             print("Making a safe copy of the card first (%s). Later steps read the copy, not the card." % _human(size),
                   file=sys.stderr)
-            make_image(src_path, img, progress=lambda dd, t, s2: bar("Copying the card", dd, t))
+            while True:
+                try:
+                    make_image(src_path, img, progress=lambda dd, t, s2: bar("Copying the card", dd, t))
+                    break
+                except ImageError as e:
+                    if "already exists" not in str(e) or k > 9:
+                        return _refuse(str(e))
+                    img, k = "%s-%d.img" % (base, k), k + 1  # a different card that looks alike: new copy
             work = img
         else:
             print("Not enough free space to copy the whole card first, so I'll read it directly (still read-only).",
@@ -149,6 +222,8 @@ def cmd_recover(a):
         kinds = {{"photos": "photo", "videos": "video", "documents": "document"}.get(k, k) for k in kinds}
     res = scan(work, kinds=kinds, include_live=a.include_live, reassemble=not a.no_reassemble,
                workers=a.workers, progress=bar, fast=a.fast, deep=a.deep)
+    res.source = src_path
+    res.image = work if work != src_path else None
     need = plan_size(res.found)
     if need > free_space(out):
         print("Not enough space in %s: need about %s. Free some space or choose another drive." % (out, _human(need)),
@@ -157,17 +232,21 @@ def cmd_recover(a):
     bar("Saving files")
     w = write_all(res, out, progress=lambda dd, t: bar("write", dd, t))
     report = write_html(res, w["written"], out)
+    _give_back_to_user(out)
     if a.json:
         print(json.dumps({"output": out, "report": report, "manifest": os.path.join(out, "recovery.json"),
-                          "files": len(w["written"]), "seconds": round(res.seconds, 1),
+                          "files": len(w["written"]), "failed_to_save": len(w.get("failed", [])),
+                          "seconds": round(res.seconds, 1), "image": res.image,
                           "visible_files_not_copied": getattr(res, "live_count", 0) if not a.include_live else 0,
                           "warnings": res.warnings}, indent=1))
     else:
         print()
         print(text_summary(res, w["written"], out))
-        if work != src_path:
+        for path, why in w.get("failed", []):
+            print("Could not save %s: %s" % (path, why))
+        if res.image:
             print("A full copy of the card is in %s. Keep it until you've checked your files; it lets you try "
-                  "again without touching the card." % work)
+                  "again without touching the card." % res.image)
         live = getattr(res, "live_count", 0)
         if live and not a.include_live:
             print("(%d files are still visible on the card and were not copied; add --include-live to copy them too.)"
@@ -198,13 +277,20 @@ def cmd_hunt(a):
         for name, url, why in CLOUD:
             print("  - %s: %s%s" % (name, why, (" " + url) if url else ""))
     if a.save and leads:
-        files = save(leads, a.save)
+        from .hunt import SaveError
+        try:
+            files = save(leads, a.save, a.project)
+        except SaveError as e:
+            return _refuse(str(e))
+        _give_back_to_user(a.save)
         print("\nSaved %d copies to %s (originals untouched)." % (len(files), a.save), file=sys.stderr)
     return 0
 
 
 def cmd_selftest(a):
-    from .selftest import run
+    from .selftest import run, stress
+    if a.stress:
+        return stress(a.stress, keep=a.keep, as_json=a.json)
     return run(quick=a.quick, keep=a.keep, as_json=a.json)
 
 
@@ -248,6 +334,7 @@ def main(argv=None) -> int:
     s.add_argument("source")
     s.add_argument("dest")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--trust-output-location", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_image)
 
     s = sub.add_parser("recover", help="find and save everything recoverable")
@@ -263,6 +350,8 @@ def main(argv=None) -> int:
     s.add_argument("--workers", type=int, default=None)
     s.add_argument("--json", action="store_true")
     s.add_argument("--i-understand-system-disk", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--trust-output-location", action="store_true",
+                   help="only if the safety check can't identify the output drive and you are SURE it is not the card")
     s.set_defaults(fn=cmd_recover)
 
     s = sub.add_parser("hunt", help="look for other copies: trash, git, editor history, agent logs, snapshots")
@@ -274,6 +363,7 @@ def main(argv=None) -> int:
 
     s = sub.add_parser("selftest", help="build simulated SD cards, wreck them, and measure recovery")
     s.add_argument("--quick", action="store_true")
+    s.add_argument("--stress", type=int, metavar="N", help="run N randomized multi-round cards instead (the README's stress numbers)")
     s.add_argument("--keep", help="keep the simulated cards in this folder")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_selftest)

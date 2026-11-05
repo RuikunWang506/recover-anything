@@ -29,23 +29,105 @@ class ExtentReader:
         return b"".join(out)
 
 
+def _check_jpeg_bytes(data: bytes, deep: bool, expected: int | None):
+    st, note, pos = jpeg.check(data) if deep else jpeg.check_fast(data)
+    actual = None
+    if expected and st == "ok":
+        m = jpeg.measure(lambda o, n: data[o:o + n], 0, len(data) + 1)
+        if m.complete:
+            actual = m.end
+    strength = "full" if (st == "ok" and deep and note == "every block decoded") else "structure"
+    return st, note, pos, actual, strength
+
+
 def _jpeg_job(args):
-    path, extents, deep = args
+    path, extents, deep, expected = args
     from .source import Source
-    with Source(path) as src:
-        data = b"".join(src.read(o, n) for o, n in extents)
-    return jpeg.check(data) if deep else jpeg.check_fast(data)
+    try:
+        with Source(path) as src:
+            total = sum(n for _, n in extents)
+            if total > jpeg.MAX_JPEG:
+                return "unverified", "too large to check", None, None, "none"
+            data = b"".join(src.read(o, n) for o, n in extents)
+        return _check_jpeg_bytes(data, deep, expected)
+    except Exception as e:  # never let one file stop the run
+        return "unverified", "could not be checked (%s)" % type(e).__name__, None, None, "none"
+
+
+def _apply_jpeg(rec: Found, res) -> None:
+    rec.status, rec.note, rec.meta["bad_at"], actual, rec.meta["check"] = res
+    if actual is not None and rec.expected_size:
+        rec.meta["actual_len"] = actual
+        if actual + 65536 < rec.expected_size:
+            # The folder entry says the file is bigger than the photo stored
+            # there: another (shorter) photo reused this space.
+            rec.meta["size_mismatch"] = True
+
+
+def validate_zip(read, length: int) -> tuple[str, str]:
+    """Check every member's CRC (stored and deflated members)."""
+    import struct
+    import zlib
+    tail = read(max(0, length - 65558), min(length, 65558))
+    i = tail.rfind(b"PK\x05\x06")
+    if i < 0 or i + 22 > len(tail):
+        return "corrupt", "no end-of-archive record"
+    _, _, _, _, total, cd_size, cd_off, _ = struct.unpack("<IHHHHIIH", tail[i:i + 22])
+    if cd_off == 0xFFFFFFFF or cd_size == 0xFFFFFFFF:
+        return "ok", "structure checked (ZIP64)"
+    cd = read(cd_off, min(cd_size, 64 << 20))
+    pos, checked, budget = 0, 0, 512 << 20
+    for _ in range(min(total, 100000)):
+        if cd[pos:pos + 4] != b"PK\x01\x02" or pos + 46 > len(cd):
+            return "corrupt", "archive directory damaged"
+        (method, crc, csize, usize, nlen, xlen, clen, lho) = struct.unpack("<10xH4xIIIHHH8xI", cd[pos:pos + 46])
+        pos += 46 + nlen + xlen + clen
+        lh = read(lho, 30)
+        if len(lh) < 30 or lh[:4] != b"PK\x03\x04":
+            return "corrupt", "a member is missing (byte %d)" % lho
+        ln, lx = struct.unpack("<HH", lh[26:30])
+        if method not in (0, 8) or csize == 0xFFFFFFFF or csize > budget:
+            continue
+        budget -= csize
+        data_at, run, got = lho + 30 + ln + lx, 0, 0
+        dec = zlib.decompressobj(-15) if method == 8 else None
+        try:
+            while got < csize:
+                piece = read(data_at + got, min(1 << 20, csize - got))
+                if not piece:
+                    return "corrupt", "a member is cut short"
+                got += len(piece)
+                run = zlib.crc32(dec.decompress(piece) if dec else piece, run)
+            if dec:
+                run = zlib.crc32(dec.flush(), run)
+        except zlib.error:
+            return "corrupt", "a member's data is damaged (byte %d)" % data_at
+        if run & 0xFFFFFFFF != crc:
+            return "corrupt", "a member's checksum doesn't match (byte %d)" % data_at
+        checked += 1
+    return "ok", "%d members checksum-verified" % checked
 
 
 def validate_one(src, rec: Found, deep: bool = True) -> None:
+    try:
+        _validate_one(src, rec, deep)
+    except Exception as e:  # never let one file stop the run
+        rec.status = "unverified"
+        rec.note = "could not be checked (%s)" % type(e).__name__
+        rec.meta["check"] = "none"
+
+
+def _validate_one(src, rec: Found, deep: bool = True) -> None:
     if rec.kind == "jpeg":
-        data = rec.read(src)
-        rec.status, rec.note, pos = jpeg.check(data) if deep else jpeg.check_fast(data)
-        rec.meta["bad_at"] = pos
+        if rec.size > jpeg.MAX_JPEG:
+            rec.status, rec.note, rec.meta["check"] = "unverified", "too large to check", "none"
+            return
+        _apply_jpeg(rec, _check_jpeg_bytes(rec.read(src), deep, rec.expected_size))
         return
     r = ExtentReader(src, rec.extents)
     if rec.kind == "isobmff":
         st, why, pos = others.validate_isobmff(r.read, r.length)
+        rec.meta["check"] = "full" if st == "ok" else "structure"
         if st == "unverified":
             m = others.measure_isobmff(r.read, 0, r.length)
             st = "ok" if m.complete else "partial"
@@ -53,17 +135,25 @@ def validate_one(src, rec: Found, deep: bool = True) -> None:
         rec.status, rec.note = st, why
         rec.meta["bad_at"] = pos
         return
+    if rec.kind == "zip":
+        st, why = validate_zip(r.read, r.length)
+        rec.status, rec.note = st, why
+        rec.meta["check"] = "full" if "verified" in why else "structure"
+        return
     fn = {"png": others.measure_png, "gif": others.measure_gif, "riff": others.measure_riff,
-          "tiff": others.measure_tiff, "pdf": others.measure_pdf, "zip": others.measure_zip}.get(rec.kind)
+          "tiff": others.measure_tiff, "pdf": others.measure_pdf}.get(rec.kind)
     if fn is None:
         rec.status = "unverified"
         rec.note = rec.note or "no check exists for this file type"
+        rec.meta["check"] = "none"
         return
     m = fn(r.read, 0, r.length)
     if m.complete and m.end <= r.length:
-        rec.status, rec.note = "ok", "structure checked"
+        rec.status, rec.note = "ok", "checksums verified" if rec.kind == "png" else "structure checked"
+        rec.meta["check"] = "full" if rec.kind == "png" else "structure"
     else:
         rec.status, rec.note = "partial", m.reason
+        rec.meta["check"] = "structure"
 
 
 DEEP_LIMIT = 8 << 30  # above this much JPEG data, 'auto' checks a sample first
@@ -75,9 +165,9 @@ def _check_jpegs(src, jpegs, workers, progress, deep, done0=0, total=None):
     path = getattr(src, "path", None)
     if workers > 1 and path and len(jpegs) > 4:
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            for i, (r, res) in enumerate(zip(jpegs, ex.map(_jpeg_job, [(path, r.extents, deep) for r in jpegs],
-                                                               chunksize=2))):
-                r.status, r.note, r.meta["bad_at"] = res
+            jobs = [(path, r.extents, deep, r.expected_size) for r in jpegs]
+            for i, (r, res) in enumerate(zip(jpegs, ex.map(_jpeg_job, jobs, chunksize=2))):
+                _apply_jpeg(r, res)
                 if progress:
                     progress(done0 + i + 1, total)
     else:

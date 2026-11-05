@@ -52,7 +52,7 @@ def summarize(res, written) -> dict:
     named = 0
     unconfirmed = 0
     for r in written:
-        if r.status == "partial":
+        if r.status in ("partial", "corrupt"):
             partial += 1
             continue
         if r.status == "unverified" and r.kind != "other":
@@ -62,7 +62,7 @@ def summarize(res, written) -> dict:
             reassembled += 1
         if r.name:
             named += 1
-    lost = [r for r in res.found if r.status in ("lost", "corrupt") and r.name]
+    lost = [r for r in res.found if r.status == "lost" and r.name]
     return {"counts": counts, "partial": partial, "reassembled": reassembled, "named": named, "lost": lost,
             "total": sum(counts.values()), "unconfirmed": unconfirmed}
 
@@ -103,7 +103,7 @@ figure img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover;background
 .ph{display:flex;align-items:center;justify-content:center;aspect-ratio:4/3;background:var(--line);color:var(--muted);font-size:13px}
 figcaption{padding:8px 10px;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chip{display:inline-block;font-size:11px;font-weight:600;padding:2px 7px;border-radius:99px;margin-right:4px}
-.ok{color:var(--ok);background:var(--okbg)}.warn{color:var(--warn);background:var(--warnbg)}.bad{color:var(--bad);background:var(--badbg)}
+.chip{color:var(--muted);background:var(--line)}.ok{color:var(--ok);background:var(--okbg)}.warn{color:var(--warn);background:var(--warnbg)}.bad{color:var(--bad);background:var(--badbg)}
 table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:14px}
 th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:600}
 .note{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:10px;padding:14px 16px;margin:12px 0}
@@ -143,40 +143,49 @@ def write_html(res, written, out_dir: str) -> str:
     shown = 0
     media_title = "Photos and videos" if c["photo"] and c["video"] else ("Videos" if c["video"] else "Photos")
     order = lambda r: (r.meta.get("when") or "9999", (r.name or "").lower(), r.start)  # noqa: E731
-    for title, keep in ((media_title, lambda r: r.status != "partial" and GROUP.get(r.kind) in ("photo", "video")),
-                        ("Partly recovered", lambda r: r.status == "partial")):
+    for title, keep in ((media_title, lambda r: r.status not in ("partial", "corrupt")
+                         and GROUP.get(r.kind) in ("photo", "video")),
+                        ("Partly recovered", lambda r: r.status in ("partial", "corrupt"))):
         items = sorted((r for r in written if keep(r)), key=order)
         if not items:
             continue
         out.append("<h2>%s <span class='kicker'>(%d)</span></h2>" % (e(title), len(items)))
         if title == "Partly recovered":
-            out.append("<p class='lede'>Part of each of these was overwritten or could not be found. "
+            out.append("<p class='lede'>Part of each of these was overwritten, damaged or could not be found. "
                        "What survived is saved in the <b>Partly recovered</b> folder.</p>")
         out.append("<div class='grid'>")
         for r in items:
             rel = os.path.relpath(r.meta["written_to"], out_dir)
-            src = _thumb(r.meta["written_to"], r.kind, r.status == "partial") if shown < MAX_THUMBS else None
+            src = _thumb(r.meta["written_to"], r.kind, r.status in ("partial", "corrupt")) if shown < MAX_THUMBS else None
             shown += 1
             chip = ""
             if r.meta.get("reassembled_from"):
                 chip = "<span class='chip ok'>rebuilt from %d pieces</span>" % r.meta["reassembled_from"]
             elif r.status == "partial":
                 chip = "<span class='chip warn'>partial</span>"
+            elif r.status == "corrupt":
+                chip = "<span class='chip bad'>damaged</span>"
             elif r.status == "unverified":
                 chip = "<span class='chip warn'>not checked</span>"
+            elif r.meta.get("check") == "structure":
+                chip = "<span class='chip'>structure checked</span>"
             img = ("<img loading='lazy' alt='' src='%s'>" % src) if src else "<div class='ph'>%s</div>" % e(
                 (r.ext or "").upper().lstrip("."))
             out.append("<figure><a href='%s'>%s%s</a><figcaption>%s</figcaption></figure>" % (
                 e(rel.replace(os.sep, "/")), img, chip.replace("class='chip", "class='chip badge"),
                 e(os.path.basename(rel))))
         out.append("</div>")
-    others = [r for r in written if r.status != "partial" and GROUP.get(r.kind) not in ("photo", "video")]
+    others = [r for r in written if r.status not in ("partial", "corrupt") and GROUP.get(r.kind) not in ("photo", "video")]
     if others:
         out.append("<h2>Documents and other files <span class='kicker'>(%d)</span></h2><div class='wrap'><table>"
                    "<tr><th>File</th><th>Size</th><th>Check</th></tr>" % len(others))
         for r in others:
             rel = os.path.relpath(r.meta["written_to"], out_dir)
-            chip = "<span class='chip ok'>checked</span>" if r.status == "ok" else "<span class='chip warn'>not checked</span>"
+            if r.status == "ok":
+                chip = ("<span class='chip ok'>checksums verified</span>" if r.meta.get("check") == "full"
+                        else "<span class='chip'>structure checked</span>")
+            else:
+                chip = "<span class='chip warn'>not checked</span>"
             out.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (e(rel), _human(r.size), chip))
         out.append("</table></div>")
     if s["lost"]:

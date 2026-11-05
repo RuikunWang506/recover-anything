@@ -287,8 +287,12 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
         if g is None:
             continue
         mine = [r for r in found if getattr(r, "volume", None) is vr]
-        broken = [r for r in mine if r.kind == "jpeg" and r.status in ("corrupt", "partial") and r.extents]
-        videos = [r for r in mine if r.kind == "isobmff" and r.status in ("corrupt", "partial") and r.extents
+        cs = g.cluster_size
+
+        def aligned(r):  # files from an earlier format with another layout can't use this geometry
+            return r.extents and r.start >= g.data_offset and (r.start - g.data_offset) % cs == 0
+        broken = [r for r in mine if r.kind == "jpeg" and r.status in ("corrupt", "partial") and aligned(r)]
+        videos = [r for r in mine if r.kind == "isobmff" and r.status in ("corrupt", "partial") and aligned(r)
                   and r.ext not in (".heic", ".avif", ".cr3")]
         if not broken and not videos:
             continue
@@ -305,6 +309,8 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
             if r.status == "ok" or (r.meta.get("live") and r.meta.get("chain") == "fat"):
                 own(r)
         for off, _kind in getattr(vr, "headers", []):
+            if off < g.data_offset or (off - g.data_offset) % cs:
+                continue  # only a header at a cluster start means "another file starts here"
             c = g.cluster_at(off)
             if 0 <= c < len(blocked):
                 blocked[c] = 1
@@ -317,7 +323,10 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
             for r in list(todo):
                 start = g.cluster_at(r.start)
                 blocked[start] = 0
-                out = asm.run(start, r.expected_size)
+                try:
+                    out = asm.run(start, r.expected_size)
+                except Exception:
+                    out = None  # never let one file stop the run
                 blocked[start] = 1
                 if out is None:
                     continue
