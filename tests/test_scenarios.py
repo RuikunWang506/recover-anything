@@ -154,6 +154,34 @@ def test_fragmented_video_is_rebuilt(workdir, moov_first):
     assert got[sha(v)].meta.get("reassembled_from", 1) > 1
 
 
+def test_fragmented_video_with_long_pcm_audio_is_rebuilt(workdir):
+    """QuickTime uncompressed audio lists every audio sample (48,000 a second).
+    A long audio table must not stop the video from being checked and rebuilt."""
+    import struct
+
+    from recover_anything.simcard.fat32 import Fat32Card
+    from recover_anything.simcard.media import _box, _full, make_photo, make_video
+    n = 48000 * 52
+    stsd = _full(b"stsd", 0, 0, struct.pack(">I", 1) + _box(b"sowt", bytes(6) + struct.pack(">H", 1) + bytes(20)))
+    stbl = _box(b"stbl", stsd + _full(b"stts", 0, 0, struct.pack(">III", 1, n, 1))
+                + _full(b"stsc", 0, 0, struct.pack(">IIII", 1, 1, n, 1))
+                + _full(b"stsz", 0, 0, struct.pack(">II", 1, n)) + _full(b"stco", 0, 0, struct.pack(">II", 1, 64)))
+    trak = _box(b"trak", _box(b"mdia", _full(b"hdlr", 0, 0, bytes(4) + b"soun" + bytes(13)) + _box(b"minf", stbl)))
+    v = make_video(41, frames=150, avg_frame=8000)
+    m = v.rfind(b"moov") - 4
+    v = v[:m] + struct.pack(">I", struct.unpack(">I", v[m:m + 4])[0] + len(trak)) + v[m + 4:] + trak
+    img = os.path.join(workdir, "pcm.img")
+    with Fat32Card(img, **SMALL) as card:
+        for i in range(3):
+            card.write_file("DCIM/100CANON/IMG_%04d.JPG" % i, make_photo(600 + i, 640, 480))
+        card.delete("DCIM/100CANON/IMG_0001.JPG")
+        cl = card.write_file("DCIM/100CANON/MVI_0041.MOV", v)
+        card.format()
+    assert any(b != a + 1 for a, b in zip(cl, cl[1:])), "test setup should fragment the video"
+    got = recovered_hashes(scan(img, workers=1))
+    assert sha(v) in got
+
+
 @pytest.mark.parametrize("fs", ["FAT32", "exFAT"])
 def test_damaged_boot_sector_uses_backup(workdir, fs):
     """'This card needs to be formatted': the boot sector is trashed, the rest is fine."""

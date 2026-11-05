@@ -50,6 +50,8 @@ def _samples(moov: bytes, base: int):
         stbl = others._find(read, b, e, [b"mdia", b"minf", b"stbl"])
         if not stbl:
             continue
+        if others.track_codec(read, stbl) not in others.NAL_CODECS:
+            continue  # audio and other tracks have no checkpoints
         try:
             tables = others.sample_tables(read, stbl)
         except others.TooManySamples:
@@ -57,7 +59,7 @@ def _samples(moov: bytes, base: int):
         if tables is None:
             return None
         codec, offsets, sizes, stsc = tables
-        if codec not in (b"avc1", b"avc3", b"hvc1", b"hev1") or not offsets or not sizes:
+        if not offsets or not sizes:
             continue
         if len(out) + len(sizes) > others.MAX_SAMPLES:
             return None

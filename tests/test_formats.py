@@ -127,3 +127,16 @@ def test_tiny_index_claiming_millions_of_frames_is_refused():
     data = box(b"ftyp", b"isom" + bytes(4)) + moov + box(b"mdat", bytes(1000))
     st, why, _ = others.validate_isobmff(lambda o, n: data[o:o + n], len(data))
     assert (st, why) == ("unverified", "too many frames to check one by one")
+
+
+def test_cut_off_raw_header_is_measured_not_skipped():
+    import struct
+    # TIFF with StripOffsets (3 LONGs) stored at an offset where the data ends 2 bytes in
+    ifd = struct.pack("<H", 2)
+    ifd += struct.pack("<HHII", 0x0111, 4, 3, 64)      # StripOffsets -> 3 values at 64
+    ifd += struct.pack("<HHII", 0x0117, 4, 3, 76)      # StripByteCounts -> at 76
+    ifd += struct.pack("<I", 0)
+    data = b"II*\x00" + struct.pack("<I", 8) + ifd
+    data = data.ljust(64, b"\x00") + struct.pack("<III", 2000, 6000, 9000) + b"\x01\x02"  # counts cut off
+    m = others.measure_tiff(lambda o, n: data[o:o + n], 0, 1 << 20)
+    assert m.end >= len(data) - 2
