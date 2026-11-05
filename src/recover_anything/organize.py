@@ -31,6 +31,20 @@ def _safe(name: str, max_bytes: int = 200) -> str:
     return (stem or "file") + ext
 
 
+def makedirs_tracked(path: str, created: list | None) -> None:
+    """os.makedirs, noting every folder it actually created."""
+    missing, p = [], os.path.abspath(path)
+    while not os.path.isdir(p):
+        missing.append(p)
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    os.makedirs(path, exist_ok=True)
+    if created is not None:
+        created.extend(reversed(missing))
+
+
 def _unique(path: str) -> str:
     if not os.path.exists(path):
         return path
@@ -76,9 +90,12 @@ def plan_size(found) -> int:
     return sum(r.size for r in found if r.status in ("ok", "partial", "unverified", "corrupt"))
 
 
-def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> dict:
+def write_all(res, out_dir: str, progress=None, keep_partial: bool = True, created: list | None = None) -> dict:
+    """Save every recovered file. Paths this creates (folders and files) are
+    appended to `created`, so ownership can be handed back for exactly those."""
     src = res._src
-    os.makedirs(out_dir, exist_ok=True)
+    created = [] if created is None else created
+    makedirs_tracked(out_dir, created)
     seen: dict[str, str] = {}
     written = []
     rank = {"ok": 0, "unverified": 1, "partial": 2, "corrupt": 3}
@@ -112,7 +129,7 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
         dest = digest = None
         for attempt, nm in enumerate((name, fallback)):
             try:
-                os.makedirs(folder, exist_ok=True)
+                makedirs_tracked(folder, created)
                 dest, digest = _write_one(reader, r, folder, nm, seen)
                 break
             except OSError as e:
@@ -128,6 +145,7 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
             r.meta["duplicate_of"] = digest
             continue
         seen[digest] = dest
+        created.append(dest)
         if when:
             try:
                 ts = when.timestamp()
@@ -173,7 +191,8 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True) -> di
     manifest["could_not_save"] = [{"file": f, "reason": why} for f, why in failed]
     with open(os.path.join(out_dir, "recovery.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
-    return {"written": written, "manifest": manifest, "failed": failed}
+    created.append(os.path.join(out_dir, "recovery.json"))
+    return {"written": written, "manifest": manifest, "failed": failed, "created": created}
 
 
 def free_space(path: str) -> int:

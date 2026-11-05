@@ -106,27 +106,28 @@ def _output_ok(a, src: str, out: str) -> bool:
     return False
 
 
-def _give_back_to_user(path: str) -> None:
-    """Under sudo, hand the output back to the person who ran the command."""
+def _give_back_to_user(paths, trees=()) -> None:
+    """Under sudo, hand what this run created back to the person who ran it.
+    Only the given paths are touched (never files that were already there),
+    and symlinks are never followed. `trees` are folders this run created
+    whole (copied folders), handed back with everything inside."""
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
-    if not uid or not hasattr(os, "chown"):
+    if not uid or not hasattr(os, "chown") or not hasattr(os, "geteuid") or os.geteuid() != 0:
         return
     try:
         uid, gid = int(uid), int(gid or uid)
-        if os.path.isfile(path):
-            try:
-                os.chown(path, uid, gid)
-            except OSError:
-                pass
-            return
-        for root, dirs, files in os.walk(path):
-            for n in [root] + [os.path.join(root, x) for x in dirs + files]:
-                try:
-                    os.chown(n, uid, gid)
-                except OSError:
-                    pass
     except ValueError:
-        pass
+        return
+    todo = [paths] if isinstance(paths, str) else list(paths)
+    for t in trees:
+        if os.path.isdir(t) and not os.path.islink(t):
+            for root, dirs, files in os.walk(t):
+                todo += [os.path.join(root, x) for x in dirs + files]
+    for p in todo:
+        try:
+            os.chown(p, uid, gid, follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
 
 
 def cmd_triage(a):
@@ -158,8 +159,7 @@ def cmd_image(a):
         res = make_image(src, a.dest, progress=lambda d, t, s: bar("Copying the card", d, t))
     except ImageError as e:
         return _refuse(str(e))
-    for p in (a.dest, a.dest + ".map.json"):
-        _give_back_to_user(p)
+    _give_back_to_user(p for p in (a.dest, a.dest + ".map.json", a.dest + ".ddrescue-map") if os.path.exists(p))
     if a.json:
         print(json.dumps(res))
     else:
@@ -173,7 +173,7 @@ def cmd_image(a):
 def cmd_recover(a):
     from .devices import is_device_path, is_system_disk, normalize_source
     from .imaging import ImageError, identity, make_image, short_id
-    from .organize import free_space, plan_size, write_all
+    from .organize import free_space, makedirs_tracked, plan_size, write_all
     from .pipeline import scan
     from .report import text_summary, write_html
     from .source import Source
@@ -191,7 +191,8 @@ def cmd_recover(a):
               "and every minute writes over deleted data. Shut down and image it from another computer, or "
               "rerun with --i-understand-system-disk.", file=sys.stderr)
         return 2
-    os.makedirs(out, exist_ok=True)
+    created: list = []
+    makedirs_tracked(out, created)
     bar = Bar(a.json)
     work = src_path
     if is_dev and not a.direct:
@@ -208,6 +209,7 @@ def cmd_recover(a):
             while True:
                 try:
                     make_image(src_path, img, progress=lambda dd, t, s2: bar("Copying the card", dd, t))
+                    created += [p for p in (img, img + ".map.json", img + ".ddrescue-map") if os.path.exists(p)]
                     break
                 except ImageError as e:
                     if "already exists" not in str(e) or k > 9:
@@ -230,9 +232,10 @@ def cmd_recover(a):
               file=sys.stderr)
         return 3
     bar("Saving files")
-    w = write_all(res, out, progress=lambda dd, t: bar("write", dd, t))
+    w = write_all(res, out, progress=lambda dd, t: bar("write", dd, t), created=created)
     report = write_html(res, w["written"], out)
-    _give_back_to_user(out)
+    created.append(report)
+    _give_back_to_user(created)
     if a.json:
         print(json.dumps({"output": out, "report": report, "manifest": os.path.join(out, "recovery.json"),
                           "files": len(w["written"]), "failed_to_save": len(w.get("failed", [])),
@@ -278,11 +281,13 @@ def cmd_hunt(a):
             print("  - %s: %s%s" % (name, why, (" " + url) if url else ""))
     if a.save and leads:
         from .hunt import SaveError
+        made: list = []
         try:
-            files = save(leads, a.save, a.project)
+            files = save(leads, a.save, a.project, created=made)
         except SaveError as e:
             return _refuse(str(e))
-        _give_back_to_user(a.save)
+        # copied folders were created whole by this run, so everything in them is handed back
+        _give_back_to_user(made + files, trees=[f for f in files if os.path.isdir(f)])
         print("\nSaved %d copies to %s (originals untouched)." % (len(files), a.save), file=sys.stderr)
     return 0
 
