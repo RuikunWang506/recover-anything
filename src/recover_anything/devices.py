@@ -64,40 +64,66 @@ def _existing_ancestor(path: str) -> str:
     return p
 
 
-# ------------------------------------------------------------------ Linux
-def _linux_disks_of_sysdir(real: str, depth: int = 0) -> set[str]:
-    """Physical whole disks behind a /sys/devices/... block node (follows
-    partitions up and device-mapper / RAID / LUKS 'slaves' down)."""
-    if depth > 10 or not os.path.isdir(real):
-        return set()
-    slaves = os.path.join(real, "slaves")
+# ------------------------------------------------------------------ where
+class Where:
+    """Everything that writes into a folder (or reads of a source) can land on."""
+
+    def __init__(self):
+        self.disks: set = set()   # physical whole disks
+        self.files: set = set()   # (st_dev, st_ino) of image files that back it
+        self.remote = False       # a network share or a RAM disk is part of it
+        self.unknown = None       # why some layer could not be worked out
+
+
+def _file_key(path: str):
     try:
-        sl = os.listdir(slaves) if os.path.isdir(slaves) else []
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino)
     except OSError:
-        sl = []
-    if sl:
-        out = set()
-        for s in sl:
-            out |= _linux_disks_of_sysdir(os.path.realpath(os.path.join(slaves, s)), depth + 1)
-        return out
-    if os.path.exists(os.path.join(real, "partition")):
-        return _linux_disks_of_sysdir(os.path.dirname(real), depth + 1)
-    return {os.path.basename(real)}
+        return None
 
 
-def _linux_disks_of_devnum(major: int, minor: int) -> set[str]:
-    node = "/sys/dev/block/%d:%d" % (major, minor)
-    if not os.path.exists(node):
-        return set()
-    return _linux_disks_of_sysdir(os.path.realpath(node))
+# Filesystems that store nothing on a local disk.
+NET_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "ceph", "glusterfs", "lustre", "gpfs", "davfs",
+          "9p", "virtiofs", "vboxsf", "vmhgfs", "fuse.sshfs", "fuse.rclone", "fuse.s3fs", "fuse.gcsfuse",
+          "fuse.vmhgfs-fuse", "fuse.davfs2", "fuse.smbnetfs", "fuse.curlftpfs", "fuse.goofys", "fuse.juicefs"}
+RAM_FS = {"tmpfs", "ramfs"}
+_LOOPBACK = re.compile(r"^(localhost(\.localdomain)?|127(\.\d+){3}|::1|0\.0\.0\.0|::ffff:127(\.\d+){3})$", re.I)
 
 
+def _net_host(fstype: str, source: str) -> str:
+    if fstype.startswith("nfs") or fstype == "fuse.sshfs":
+        return source.split(":", 1)[0].split("@")[-1] if ":" in source else ""
+    m = re.match(r"^[\\/]{2}([^\\/]+)", source)  # //host/share
+    return m.group(1) if m else ""
+
+
+def _is_this_machine(host: str) -> bool:
+    """A 'network' share served by this very computer may be the card itself."""
+    h = host.strip("[]").lower()
+    if not h:
+        return False
+    if _LOOPBACK.match(h):
+        return True
+    import socket
+    try:
+        names = {socket.gethostname().lower(), socket.getfqdn().lower()}
+        names |= {n.split(".")[0] for n in names}
+        if h in names or h.split(".")[0] in names:
+            return True
+        mine = {a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None)}
+    except OSError:
+        return False
+    return h in mine
+
+
+# ------------------------------------------------------------------ Linux
 def _unescape_mount(s: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
 
 
 def _linux_mounts() -> list[tuple[str, str, str, str]]:
-    """(mount point, major:minor, fstype, source) from /proc/self/mountinfo."""
+    """(mount point, fstype, source, super options) from /proc/self/mountinfo, in mount order."""
     out = []
     try:
         with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as f:
@@ -108,45 +134,186 @@ def _linux_mounts() -> list[tuple[str, str, str, str]]:
                 sep = parts.index("-")
                 if sep < 5 or sep + 2 >= len(parts):
                     continue
-                out.append((_unescape_mount(parts[4]), parts[2], parts[sep + 1], _unescape_mount(parts[sep + 2])))
+                out.append((_unescape_mount(parts[4]), parts[sep + 1], _unescape_mount(parts[sep + 2]),
+                            parts[sep + 3] if sep + 3 < len(parts) else ""))
     except OSError:
         pass
     return out
 
 
-def _linux_path_disks(path: str):
-    """(set of physical disks, backed_by_block_device) for the filesystem holding path."""
-    p = os.path.realpath(_existing_ancestor(path))
-    disks: set[str] = set()
-    backed = False
-    try:
-        st = os.stat(p)
-        if os.major(st.st_dev):
-            backed = True
-            disks |= _linux_disks_of_devnum(os.major(st.st_dev), os.minor(st.st_dev))
-    except OSError:
-        return None, True
+def _linux_mount_of(p: str):
     best = None
-    for mp, _devnum, fstype, src in _linux_mounts():
+    for m in _linux_mounts():
+        mp = m[0]
         if p == mp or p.startswith(mp.rstrip("/") + "/") or mp == "/":
             if best is None or len(mp) >= len(best[0]):  # later entries win (stacked mounts)
-                best = (mp, fstype, src)
-    if best and best[2].startswith("/dev/"):
-        backed = True
+                best = m
+    return best
+
+
+def _linux_sys_walk(real: str, where: Where, depth: int, follow_files: bool = True) -> None:
+    """Walk a /sys/devices block node: partitions up to their disk, device-mapper
+    / RAID / LUKS 'slaves' down to theirs, and loop devices to the file behind
+    them (and, if follow_files, to the disk that file is on)."""
+    if depth > 12 or not os.path.isdir(real):
+        where.unknown = where.unknown or "a storage layer could not be followed"
+        return
+    slaves = os.path.join(real, "slaves")
+    try:
+        sl = os.listdir(slaves) if os.path.isdir(slaves) else []
+    except OSError:
+        sl = []
+    if sl:
+        for x in sl:
+            _linux_sys_walk(os.path.realpath(os.path.join(slaves, x)), where, depth + 1, follow_files)
+        return
+    if os.path.exists(os.path.join(real, "partition")):
+        _linux_sys_walk(os.path.dirname(real), where, depth + 1, follow_files)
+        return
+    name = os.path.basename(real)
+    where.disks.add(name)
+    backing = os.path.join(real, "loop", "backing_file")
+    if os.path.exists(backing):
         try:
-            rs = os.stat(best[2]).st_rdev
-            disks |= _linux_disks_of_devnum(os.major(rs), os.minor(rs))
+            with open(backing, encoding="utf-8", errors="replace") as f:
+                fpath = f.read().rstrip("\n")
         except OSError:
-            pass
-    return disks, backed
+            fpath = ""
+        key = _file_key(fpath)
+        if key is None:
+            where.unknown = where.unknown or "the image file behind %s could not be found" % name
+            return
+        where.files.add(key)
+        if follow_files:
+            _linux_where(fpath, where, depth + 1)
 
 
-def _linux_source_disks(source: str) -> set[str]:
+def _linux_add_devnum(major: int, minor: int, where: Where, depth: int, follow_files: bool = True) -> None:
+    node = "/sys/dev/block/%d:%d" % (major, minor)
+    if not os.path.exists(node):
+        where.unknown = where.unknown or "device %d:%d is not in /sys" % (major, minor)
+        return
+    _linux_sys_walk(os.path.realpath(node), where, depth, follow_files)
+
+
+def _linux_add_dev(dev: str, where: Where, depth: int) -> None:
+    try:
+        rs = os.stat(dev).st_rdev
+    except OSError:
+        where.unknown = where.unknown or "%s could not be found" % dev
+        return
+    _linux_add_devnum(os.major(rs), os.minor(rs), where, depth)
+
+
+def _linux_btrfs_members(where: Where, depth: int) -> None:
+    """A btrfs filesystem can span several disks; mountinfo names only one."""
+    for fsdir in glob.glob("/sys/fs/btrfs/*/devices"):
+        try:
+            members = os.listdir(fsdir)
+        except OSError:
+            continue
+        found = Where()
+        for x in members:
+            _linux_sys_walk(os.path.realpath(os.path.join(fsdir, x)), found, depth + 1)
+        if found.disks & where.disks:
+            where.disks |= found.disks
+            where.files |= found.files
+
+
+def _overlay_dirs(options: str) -> list[str]:
+    out = []
+    for opt in re.split(r"(?<!\\),", options):
+        k, _, v = opt.partition("=")
+        if k in ("upperdir", "workdir") and v:
+            out.append(v.replace("\\,", ","))
+    return out
+
+
+def _linux_zfs(source: str, where: Where, depth: int) -> None:
+    pool = source.split("/")[0]
+    out = _run(["zpool", "status", "-P", "-L", pool]) if pool else ""
+    devs = re.findall(r"(/dev/\S+)", out)
+    if not devs:
+        where.unknown = where.unknown or "I couldn't list the disks of ZFS pool %s" % pool
+        return
+    for d in devs:
+        _linux_add_dev(d, where, depth + 1)
+
+
+def _linux_where(path: str, where: Where | None = None, depth: int = 0) -> Where:
+    """Which disks (and image files) writes into `path` end up on."""
+    where = where if where is not None else Where()
+    if depth > 8:
+        where.unknown = where.unknown or "too many layers of storage to follow"
+        return where
+    p = os.path.realpath(_existing_ancestor(path))
+    try:
+        st = os.stat(p)
+    except OSError as e:
+        where.unknown = where.unknown or "%s could not be checked (%s)" % (p, e.strerror or e)
+        return where
+    m = _linux_mount_of(p)
+    mp, fstype, source, sopts = m if m else ("", "", "", "")
+    if os.major(st.st_dev):
+        _linux_add_devnum(os.major(st.st_dev), os.minor(st.st_dev), where, depth)
+        if source.startswith("/dev/"):
+            _linux_add_dev(source, where, depth)
+        if fstype == "btrfs":
+            _linux_btrfs_members(where, depth)
+        return where
+    return _linux_where_mount(mp or p, fstype, source, sopts, where, depth)
+
+
+def _linux_where_mount(mp: str, fstype: str, source: str, sopts: str, where: Where, depth: int) -> Where:
+    """A filesystem with an anonymous device number (btrfs, overlay, FUSE,
+    network and RAM filesystems, ZFS...): work out what it stores files on
+    from its type and mount source."""
+    if fstype in RAM_FS:
+        where.remote = True
+    elif fstype in NET_FS:
+        if _is_this_machine(_net_host(fstype, source)):
+            where.unknown = where.unknown or "%s is a network share served by this computer" % mp
+        else:
+            where.remote = True
+    elif fstype == "overlay":
+        dirs = _overlay_dirs(sopts)
+        if not dirs:
+            where.unknown = where.unknown or "I couldn't tell where overlay %s stores its files" % mp
+        for d in dirs:
+            _linux_where(d, where, depth + 1)
+    elif fstype == "zfs":
+        _linux_zfs(source, where, depth)
+    elif source.startswith("/dev/"):
+        _linux_add_dev(source, where, depth)  # btrfs, fuseblk (ntfs-3g, exfat-fuse) and others
+        if fstype == "btrfs":
+            _linux_btrfs_members(where, depth)
+    elif fstype.startswith("fuse") or fstype == "ecryptfs":
+        # bindfs, mergerfs, gocryptfs, encfs, ecryptfs, fuse2fs: the source names
+        # the folder(s) or image file the files really go to
+        parts = [source] if os.path.isabs(source) else [x for x in source.split(":") if x]
+        if parts and all(os.path.isabs(x) and os.path.exists(x) for x in parts):
+            for x in parts:
+                if os.path.isfile(x):
+                    where.files.add(_file_key(x))
+                _linux_where(x, where, depth + 1)
+        else:
+            where.unknown = where.unknown or "%s (%s) doesn't say which disk it keeps its files on" % (mp, fstype)
+    else:
+        where.unknown = where.unknown or "I couldn't tell which disk %s (%s) is on" % (mp, fstype or "?")
+    return where
+
+
+def _linux_source(source: str) -> Where:
+    w = Where()
     try:
         rs = os.stat(source).st_rdev
     except OSError:
-        return set()
-    return _linux_disks_of_devnum(os.major(rs), os.minor(rs))
+        return w
+    # For a source, the file behind a loop device matters (another loop device
+    # on the same file would write into it), but the disk that file sits on
+    # does not: other writes to that disk can't change the file.
+    _linux_add_devnum(os.major(rs), os.minor(rs), w, 0, follow_files=False)
+    return w
 
 
 # ------------------------------------------------------------------ macOS
@@ -289,22 +456,54 @@ def _win_source_disks(source: str) -> set[int]:
 
 
 # -------------------------------------------------------------- the guard
-def source_disks(source: str) -> set:
+def _pair_to_where(disks, backed) -> Where:
+    w = Where()
+    if disks is None:
+        w.unknown = "I couldn't work out which disk it is on"
+    elif not disks and not backed:
+        w.remote = True
+    else:
+        w.disks |= set(disks)
+    return w
+
+
+def where(path: str) -> Where:
+    """Which disks (and image files) writes into folder `path` end up on."""
     if sys.platform == "win32":
-        return _win_source_disks(source)
+        return _pair_to_where(*_win_path_disks(path))
     if sys.platform == "darwin":
-        return _mac_source_disks(source)
-    return _linux_source_disks(source)
+        return _pair_to_where(*_mac_path_disks(path))
+    return _linux_where(path)
+
+
+def source_where(source: str) -> Where:
+    if sys.platform == "win32":
+        w = Where()
+        w.disks |= _win_source_disks(source)
+        return w
+    if sys.platform == "darwin":
+        w = Where()
+        w.disks |= _mac_source_disks(source)
+        return w
+    return _linux_source(source)
+
+
+def source_disks(source: str) -> set:
+    return source_where(source).disks
 
 
 def path_disks(path: str):
     """(disks, backed): which physical disks hold this folder, and whether it
-    is on a block device at all (a network share or RAM disk is not)."""
-    if sys.platform == "win32":
-        return _win_path_disks(path)
-    if sys.platform == "darwin":
-        return _mac_path_disks(path)
-    return _linux_path_disks(path)
+    is on a local disk at all (a network share or RAM disk is not). disks is
+    None when that can't be worked out."""
+    w = where(path)
+    if w.unknown:
+        return None, True
+    return w.disks, bool(w.disks) or not w.remote
+
+
+# Words in check_output's reasons that no override flag can wave through.
+DEFINITE = ("same disk", "folder", "itself")
 
 
 def check_output(source: str, out_dir: str) -> tuple[bool, str]:
@@ -315,24 +514,28 @@ def check_output(source: str, out_dir: str) -> tuple[bool, str]:
         return False, ("%s is a folder. Point me at the device itself (see `recover-anything devices`) or a disk "
                        "image file." % source)
     if not is_device_path(src):
-        # an image file: only refuse writing over the image itself
+        # An image file: refuse writing over it, or into a copy of it that is
+        # mounted (a loop device or FUSE mount backed by this very file).
         out = os.path.realpath(os.path.abspath(out_dir))
         try:
             if os.path.exists(out) and os.path.samefile(out, src):
                 return False, "the output is the image file itself"
         except OSError:
             pass
+        key = _file_key(src)
+        if key and key in where(out_dir).files:
+            return False, "%s is inside %s itself (it is mounted from that image)" % (out_dir, source)
         return True, ""
-    sdisks = source_disks(src)
-    if not sdisks:
+    s = source_where(src)
+    if not s.disks:
         return False, ("I couldn't work out which physical disk %s is, so I can't prove that %s is on a different "
                        "one." % (source, out_dir))
-    odisks, backed = path_disks(out_dir)
-    if odisks is None:
-        return False, "I couldn't work out which disk %s is on." % out_dir
-    if odisks & sdisks:
+    w = where(out_dir)
+    if w.disks & s.disks or w.files & s.files:
         return False, "%s is on the same disk as %s." % (out_dir, source)
-    if backed and not odisks:
+    if w.unknown:
+        return False, "%s: %s." % (out_dir, w.unknown)
+    if not w.disks and not w.remote:
         return False, "I couldn't work out which disk %s is on." % out_dir
     return True, ""
 

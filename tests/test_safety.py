@@ -77,6 +77,106 @@ def test_guard_sees_through_bind_mounts(tmp_path):
         subprocess.run(["losetup", "-d", loop])
 
 
+linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux mount table")
+
+
+@linux_only
+def test_guard_classifies_stacked_and_network_filesystems(tmp_path):
+    W, M = devices.Where, devices._linux_where_mount
+    here = devices.where(str(tmp_path))
+    assert M("/m", "tmpfs", "tmpfs", "", W(), 0).remote
+    assert M("/m", "nfs4", "nas.example:/photos", "", W(), 0).remote
+    assert M("/m", "cifs", "//nas/photos", "", W(), 0).remote
+    for loopback in (("nfs", "localhost:/media/card"), ("nfs4", "127.0.0.1:/x"), ("cifs", "//localhost/card")):
+        w = M("/m", loopback[0], loopback[1], "", W(), 0)
+        assert w.unknown and not w.remote, loopback
+    # FUSE and ecryptfs: follow the folder they store files in, or refuse
+    w = M("/m", "fuse.gocryptfs", str(tmp_path), "", W(), 0)
+    assert not w.unknown and here.disks <= w.disks
+    for fstype, source in (("fuse.mergerfs", "mergerfs"), ("fuse", "/does/not/exist"), ("ecryptfs", "none"),
+                           ("zfs", "pool-that-does-not-exist/data"), ("weirdfs", "x")):
+        assert M("/m", fstype, source, "", W(), 0).unknown, fstype
+    # overlay: writes go to upperdir and workdir
+    (tmp_path / "u").mkdir()
+    (tmp_path / "w").mkdir()
+    w = M("/m", "overlay", "overlay", "rw,lowerdir=/usr,upperdir=%s/u,workdir=%s/w" % (tmp_path, tmp_path), W(), 0)
+    assert not w.unknown and here.disks <= w.disks
+    assert M("/m", "overlay", "overlay", "ro,lowerdir=/usr:/opt", W(), 0).unknown
+
+
+needs_loop = pytest.mark.skipif(not sys.platform.startswith("linux") or os.geteuid() != 0 or not shutil.which("losetup")
+                                or not shutil.which("mkfs.ext4"), reason="needs root, losetup and mkfs.ext4")
+
+
+def _sh(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+
+
+class _Card:
+    """A small ext4 'card' on a loop device, mounted."""
+
+    def __init__(self, tmp_path, name, size="64M"):
+        self.img = str(tmp_path / (name + ".img"))
+        _sh("truncate", "-s", size, self.img)
+        _sh("mkfs.ext4", "-q", "-F", self.img)
+        self.loop = _sh("losetup", "--find", "--show", self.img)
+        self.mnt = tmp_path / (name + "-mnt")
+        self.mnt.mkdir()
+        _sh("mount", self.loop, str(self.mnt))
+        self.undo = [["umount", str(self.mnt)], ["losetup", "-d", self.loop]]
+
+    def close(self):
+        for cmd in reversed(self.undo):
+            subprocess.run(cmd, capture_output=True)
+
+
+@needs_loop
+def test_guard_follows_overlays_and_images_stored_on_the_card(tmp_path):
+    card = _Card(tmp_path, "card")
+    try:
+        # an overlay whose upper folder is on the card
+        for d in ("lower", "merged"):
+            (tmp_path / d).mkdir()
+        (card.mnt / "upper").mkdir()
+        (card.mnt / "work").mkdir()
+        _sh("mount", "-t", "overlay", "overlay", "-o", "lowerdir=%s,upperdir=%s,workdir=%s" % (
+            tmp_path / "lower", card.mnt / "upper", card.mnt / "work"), str(tmp_path / "merged"))
+        card.undo.append(["umount", str(tmp_path / "merged")])
+        ok, why = devices.check_output(card.loop, str(tmp_path / "merged" / "Recovered"))
+        assert not ok and "same disk" in why
+        # a disk image stored on the card, mounted, used as the output
+        inner = card.mnt / "inner.img"
+        _sh("truncate", "-s", "16M", str(inner))
+        _sh("mkfs.ext4", "-q", "-F", str(inner))
+        iloop = _sh("losetup", "--find", "--show", str(inner))
+        card.undo.append(["losetup", "-d", iloop])
+        (tmp_path / "inner").mkdir()
+        _sh("mount", iloop, str(tmp_path / "inner"))
+        card.undo.append(["umount", str(tmp_path / "inner")])
+        ok, why = devices.check_output(card.loop, str(tmp_path / "inner" / "Recovered"))
+        assert not ok and "same disk" in why
+        assert main(["recover", card.loop, "-o", str(tmp_path / "inner" / "Recovered"), "--direct",
+                     "--trust-output-location"]) == 2
+        # a RAM disk is fine
+        (tmp_path / "ram").mkdir()
+        _sh("mount", "-t", "tmpfs", "-o", "size=8m", "tmpfs", str(tmp_path / "ram"))
+        card.undo.append(["umount", str(tmp_path / "ram")])
+        assert devices.check_output(card.loop, str(tmp_path / "ram" / "Recovered"))[0]
+    finally:
+        card.close()
+
+
+@needs_loop
+def test_guard_protects_an_image_that_is_mounted(tmp_path):
+    card = _Card(tmp_path, "imgsrc")
+    try:
+        ok, why = devices.check_output(card.img, str(card.mnt / "Recovered"))
+        assert not ok and "itself" in why
+        assert devices.check_output(card.img, str(tmp_path / "elsewhere"))[0]
+    finally:
+        card.close()
+
+
 def test_image_refuses_to_overwrite_its_source(tmp_path):
     src = tmp_path / "Card.img"
     src.write_bytes(os.urandom(1 << 20))

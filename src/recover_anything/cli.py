@@ -92,16 +92,17 @@ def _source_problem(src: str):
 
 
 def _output_ok(a, src: str, out: str) -> bool:
-    from .devices import check_output
+    from .devices import DEFINITE, check_output
     ok, why = check_output(src, out)
     if ok:
         return True
-    if getattr(a, "trust_output_location", False) and "same disk" not in why and "folder" not in why:
+    definite = any(k in why for k in DEFINITE)
+    if getattr(a, "trust_output_location", False) and not definite:
         print("Warning: %s Continuing because you passed --trust-output-location." % why, file=sys.stderr)
         return True
     print("Refusing to save to %s: %s Saving onto the card or drive you're recovering from would overwrite the very "
           "files you want back. Choose a folder on a different drive%s." % (
-              out, why, "" if "same disk" in why or "folder" in why else
+              out, why, "" if definite else
               " (or, if you are certain it is a different drive, add --trust-output-location)"), file=sys.stderr)
     return False
 
