@@ -15,6 +15,14 @@ def _run(*cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _diag(*parts):
+    """Details CI prints after the tests (set RA_DIAG to a file name)."""
+    print(*parts)
+    if os.environ.get("RA_DIAG"):
+        with open(os.environ["RA_DIAG"], "a", encoding="utf-8") as f:
+            print(*parts, file=f)
+
+
 # -------------------------------------------------------------------- macOS
 def _attach(dmg):
     r = _run("hdiutil", "attach", "-nobrowse", "-plist", str(dmg))
@@ -35,8 +43,8 @@ def test_mac_card_image_and_an_image_stored_on_it(tmp_path):
     attached = [whole]
     try:
         part = next(d for d in ("%ss1" % whole,) if os.path.exists(d))
-        print("\nstatfs:", devices._mac_statfs(mnt), "| st_dev of volume:", os.stat(mnt).st_dev,
-              "| st_rdev of %s:" % part, os.stat(part).st_rdev)
+        _diag("macOS statfs of the card volume:", devices._mac_statfs(mnt), "| st_dev of volume:",
+              os.stat(mnt).st_dev, "| st_rdev of %s:" % part, os.stat(part).st_rdev)
         src = whole.replace("/dev/", "/dev/r")
         ok, why = devices.check_output(src, os.path.join(mnt, "Recovered"))
         assert not ok and "same disk" in why, why
@@ -51,6 +59,7 @@ def test_mac_card_image_and_an_image_stored_on_it(tmp_path):
         attached.insert(0, iwhole)
         ok, why = devices.check_output(src, os.path.join(imnt, "Recovered"))
         assert not ok and "same disk" in why, why
+        _diag("macOS: card volume, disk image stored on the card: both refused; own disk allowed")
     finally:
         for d in attached:
             _run("hdiutil", "detach", "-force", d)
@@ -84,7 +93,7 @@ def test_windows_card_on_a_vhd_every_spelling(tmp_path):
         link = tmp_path / "CardLink"
         _run("cmd", "/c", "mklink", "/J", str(link), letter + ":\\")
         sysdisk = devices._win_where(os.environ.get("SystemDrive", "C:") + "\\")
-        print("\ncard disk:", min(disks), "bus", devices._win_bus_type(min(disks)), "| system:",
+        _diag("Windows card disk:", min(disks), "bus", devices._win_bus_type(min(disks)), "| system disk:",
               sorted(sysdisk.disks), [devices._win_bus_type(d) for d in sysdisk.disks], sysdisk.unknown)
         outs = ["%s:\\Recovered" % letter, "%s:/Recovered" % letter.lower(), "\\\\.\\%s:\\Recovered" % letter,
                 "\\\\?\\%s:\\Recovered" % letter, guid.value + "Recovered", str(link / "Recovered")]
@@ -96,7 +105,7 @@ def test_windows_card_on_a_vhd_every_spelling(tmp_path):
                 assert not ok and "same disk" in why, (src, out, why)
         ok, why = devices.check_output(card, str(tmp_path / "Recovered"))
         assert ok or not any(k in why for k in devices.DEFINITE), why
-        print("system drive as output:", ok, why)
+        _diag("Windows: system drive as output:", ok, why, "| spellings refused:", len(outs))
         # the .vhd itself as an output: its file could be anywhere, so it is refused
         ok, why = devices.check_output("\\\\.\\PhysicalDrive%d" % min(sysdisk.disks or {0}), "%s:\\Recovered" % letter)
         assert not ok and "virtual disk" in why, why
