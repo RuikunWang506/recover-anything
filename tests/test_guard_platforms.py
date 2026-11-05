@@ -96,7 +96,9 @@ def _mac(tmp_path):
     }
 
     def statfs(p):
-        best = max((m for m in mounts if p == m or p.startswith(m.rstrip("/") + "/")), key=len)
+        q = p.replace("\\", "/")
+        best = max((m for m in mounts if q == m.replace("\\", "/")
+                    or q.startswith(m.replace("\\", "/").rstrip("/") + "/")), key=len)
         return mounts[best][0], mounts[best][1], best
 
     plists = {
