@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import json
+import ntpath
 import os
 import plistlib
 import re
@@ -318,127 +319,335 @@ def _linux_source(source: str) -> Where:
 
 # ------------------------------------------------------------------ macOS
 _MAC_DISK = re.compile(r"^/dev/r?(disk\d+)(s\d+)*$")
+MAC_NET_FS = {"smbfs", "nfs", "afpfs", "webdav", "ftp", "cifs"}
+_MAC_CACHE: dict = {}
 
 
-def _mac_rdev_map() -> dict[int, str]:
-    out = {}
-    for dev in glob.glob("/dev/disk*"):
+def _mac_plist(cmd: list[str]):
+    key = tuple(cmd)
+    if key not in _MAC_CACHE:
         try:
-            out[os.stat(dev).st_rdev] = os.path.basename(dev)
-        except OSError:
-            continue
-    return out
+            _MAC_CACHE[key] = plistlib.loads(_run(cmd).encode())
+        except Exception:
+            _MAC_CACHE[key] = None
+    return _MAC_CACHE[key]
 
 
-_APFS_CACHE: dict = {}
+def _mac_statfs(path: str):
+    """(filesystem type, mounted from, mounted on) for the volume holding path,
+    straight from the kernel (statfs), or None."""
+    import ctypes
+    import ctypes.util
+
+    class StatFs(ctypes.Structure):  # struct statfs with 64-bit inodes
+        _fields_ = [("f_bsize", ctypes.c_uint32), ("f_iosize", ctypes.c_int32), ("f_blocks", ctypes.c_uint64),
+                    ("f_bfree", ctypes.c_uint64), ("f_bavail", ctypes.c_uint64), ("f_files", ctypes.c_uint64),
+                    ("f_ffree", ctypes.c_uint64), ("f_fsid", ctypes.c_int32 * 2), ("f_owner", ctypes.c_uint32),
+                    ("f_type", ctypes.c_uint32), ("f_flags", ctypes.c_uint32), ("f_fssubtype", ctypes.c_uint32),
+                    ("f_fstypename", ctypes.c_char * 16), ("f_mntonname", ctypes.c_char * 1024),
+                    ("f_mntfromname", ctypes.c_char * 1024), ("f_flags_ext", ctypes.c_uint32),
+                    ("f_reserved", ctypes.c_uint32 * 7)]
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        try:
+            fn = libc["statfs$INODE64"]  # Intel Macs: the 64-bit-inode variant has this name
+        except AttributeError:
+            fn = libc["statfs"]
+        fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(StatFs)]
+        buf = StatFs()
+        if fn(os.fsencode(path), ctypes.byref(buf)) != 0:
+            return None
+        dec = lambda b: b.decode("utf-8", "replace")  # noqa: E731
+        return dec(buf.f_fstypename), dec(buf.f_mntfromname), dec(buf.f_mntonname)
+    except Exception:
+        return None
 
 
 def _mac_apfs_map() -> dict:
     """APFS container disk (e.g. disk3) -> physical store partitions (disk0s2)."""
-    if "map" in _APFS_CACHE:
-        return _APFS_CACHE["map"]
     out: dict = {}
-    try:
-        pl = plistlib.loads(_run(["diskutil", "apfs", "list", "-plist"]).encode())
-        for c in pl.get("Containers", []):
-            ref = c.get("ContainerReference")
-            stores = [p.get("DeviceIdentifier") for p in c.get("PhysicalStores", []) if p.get("DeviceIdentifier")]
-            if c.get("DesignatedPhysicalStore"):
-                stores.append(c["DesignatedPhysicalStore"])
-            if ref and stores:
-                out[ref] = set(stores)
-    except Exception:
-        pass
-    _APFS_CACHE["map"] = out
+    pl = _mac_plist(["diskutil", "apfs", "list", "-plist"]) or {}
+    for c in pl.get("Containers", []):
+        ref = c.get("ContainerReference")
+        stores = [x.get("DeviceIdentifier") for x in c.get("PhysicalStores", []) if x.get("DeviceIdentifier")]
+        if c.get("DesignatedPhysicalStore"):
+            stores.append(c["DesignatedPhysicalStore"])
+        if ref and stores:
+            out[ref] = set(stores)
     return out
 
 
-def _mac_whole(ident: str, depth: int = 0) -> set[str]:
-    """Physical whole disks for a disk identifier, looking through APFS
-    containers (synthesized disks) to their physical stores."""
+def _mac_image_of(whole: str):
+    """The disk image file attached as /dev/<whole>, if it is one."""
+    pl = _mac_plist(["hdiutil", "info", "-plist"]) or {}
+    for img in pl.get("images", []):
+        for ent in img.get("system-entities", []):
+            m = _MAC_DISK.match(ent.get("dev-entry", ""))
+            if m and m.group(1) == whole:
+                return img.get("image-path")
+    return None
+
+
+def _mac_resolve(ident: str, where: Where, depth: int, follow_files: bool = True) -> None:
+    """Physical disks behind a disk identifier: through APFS containers to their
+    physical stores, and through attached disk images to the file (and, if
+    follow_files, the disk that file is on)."""
     m = re.match(r"^(disk\d+)", ident)
-    if not m or depth > 4:
-        return set()
+    if not m or depth > 6:
+        where.unknown = where.unknown or "I couldn't follow %s to a disk" % ident
+        return
     whole = m.group(1)
     stores = _mac_apfs_map().get(whole)
-    if not stores:
-        try:
-            info = plistlib.loads(_run(["diskutil", "info", "-plist", whole]).encode())
-        except Exception:
-            info = {}
-        stores = {s.get("APFSPhysicalStore", "") for s in info.get("APFSPhysicalStores") or []} - {""}
+    info = _mac_plist(["diskutil", "info", "-plist", whole])
+    if not stores and info:
+        stores = {x.get("APFSPhysicalStore", "") for x in info.get("APFSPhysicalStores") or []} - {""}
     if stores:
-        out = set()
         for st in stores:
-            out |= _mac_whole(st, depth + 1)
-        return out or {whole}
-    return {whole}
+            _mac_resolve(st, where, depth + 1, follow_files)
+        return
+    if not info:
+        where.unknown = where.unknown or "diskutil didn't answer for %s" % whole
+        return
+    where.disks.add(whole)
+    image = _mac_image_of(whole)
+    if image or info.get("BusProtocol") == "Disk Image":
+        key = _file_key(image) if image else None
+        if key is None:
+            where.unknown = where.unknown or "%s is a disk image whose file I couldn't find" % whole
+            return
+        where.files.add(key)
+        if follow_files:
+            _mac_where(image, where, depth + 1)
 
 
-def _mac_path_disks(path: str):
-    p = _existing_ancestor(path)
-    try:
-        dev = os.stat(p).st_dev
-    except OSError:
-        return None, True
-    ident = _mac_rdev_map().get(dev)
-    if not ident:
-        return set(), False  # not on a local disk (network share, etc.)
-    return _mac_whole(ident), True
-
-
-def _mac_source_disks(source: str) -> set[str]:
-    m = _MAC_DISK.match(source)
+def _mac_where(path: str, where: Where | None = None, depth: int = 0) -> Where:
+    where = where if where is not None else Where()
+    p = os.path.realpath(_existing_ancestor(path))
+    info = _mac_statfs(p)
+    if info is None:
+        where.unknown = where.unknown or "I couldn't check which disk %s is on" % p
+        return where
+    fstype, mfrom, mon = info
+    if fstype in MAC_NET_FS:
+        host = re.sub(r"^[a-z]+://", "", mfrom).lstrip("/").split("@")[-1]
+        host = re.split(r"[/:]", host)[0]
+        if _is_this_machine(host):
+            where.unknown = where.unknown or "%s is a network share served by this computer" % mon
+        else:
+            where.remote = True
+        return where
+    m = _MAC_DISK.match(mfrom)
     if not m:
-        return set()
-    return _mac_whole(m.group(1))
+        where.unknown = where.unknown or "%s (%s, from %s) doesn't say which disk it is on" % (mon, fstype, mfrom)
+        return where
+    _mac_resolve(m.group(1) + (m.group(2) or ""), where, depth)
+    return where
+
+
+def _mac_source(source: str) -> Where:
+    w = Where()
+    m = _MAC_DISK.match(source)
+    if m:
+        _mac_resolve(m.group(1), w, 0, follow_files=False)
+    return w
 
 
 # ---------------------------------------------------------------- Windows
-def _win_disks_of_handle_path(dev_path: str) -> set[int] | None:
+_WIN_DEVNS = re.compile(r"^[\\/]{2}[.?][\\/]([a-z]):([\\/].*)?$", re.I)   # \\.\E:\x and \\?\E:\x
+_WIN_UNC_LONG = re.compile(r"^[\\/]{2}\?[\\/]UNC[\\/](.*)$", re.I)        # \\?\UNC\server\share\x
+_WIN_DEVICE = re.compile(r"^[\\/]{2}[.?][\\/](physicaldrive\d+|harddisk\d+|cdrom\d+|tape\d+|pipe[\\/])", re.I)
+BUS_VIRTUAL = {14, 15, 16}  # BusTypeVirtual, BusTypeFileBackedVirtual (.vhd/.vhdx/.iso), BusTypeSpaces
+
+
+def _win_plain(path: str) -> str:
+    """Spell a folder without device-namespace prefixes: \\\\.\\E:\\x and
+    \\\\?\\E:\\x are E:\\x, \\\\?\\UNC\\s\\x is \\\\s\\x. Volume GUID and
+    GLOBALROOT paths are left as they are (Windows opens them directly)."""
+    m = _WIN_DEVNS.match(path)
+    if m:
+        return m.group(1).upper() + ":" + (m.group(2) or "\\")
+    m = _WIN_UNC_LONG.match(path)
+    if m:
+        return "\\\\" + m.group(1)
+    return path
+
+
+def _k32():
     import ctypes
     from ctypes import wintypes
     k32 = ctypes.windll.kernel32
     k32.CreateFileW.restype = wintypes.HANDLE
-    h = k32.CreateFileW(dev_path, 0, 3, None, 3, 0, None)
+    return k32
+
+
+def _win_open(path: str, flags: int = 0):
+    from ctypes import wintypes
+    k32 = _k32()
+    h = k32.CreateFileW(path, 0, 7, None, 3, flags, None)
     if h in (None, wintypes.HANDLE(-1).value):
+        return None
+    return h
+
+
+def _win_disks_of_handle_path(dev_path: str) -> set[int] | None:
+    import ctypes
+    import struct
+    from ctypes import wintypes
+    k32 = _k32()
+    h = _win_open(dev_path)
+    if h is None:
         return None
     try:
         buf = ctypes.create_string_buffer(8 + 24 * 64)
         ret = wintypes.DWORD(0)
         if k32.DeviceIoControl(wintypes.HANDLE(h), 0x00560000, None, 0, buf, len(buf), ctypes.byref(ret), None):
-            import struct
             n = struct.unpack_from("<I", buf.raw, 0)[0]
             return {struct.unpack_from("<I", buf.raw, 8 + 24 * i)[0] for i in range(min(n, 64))}
         # Not a volume: maybe a physical drive itself
         out = ctypes.create_string_buffer(12)
         if k32.DeviceIoControl(wintypes.HANDLE(h), 0x002D1080, None, 0, out, 12, ctypes.byref(ret), None):
-            import struct
             return {struct.unpack_from("<I", out.raw, 4)[0]}
         return None
     finally:
         k32.CloseHandle(wintypes.HANDLE(h))
 
 
-def _win_path_disks(path: str):
-    p = os.path.abspath(path)
-    if p.startswith("\\\\?\\") and not p.startswith("\\\\?\\UNC\\"):
-        p = p[4:]
-    if p.startswith("\\\\") or p.startswith("\\\\?\\UNC\\"):
-        return set(), False  # network share
+def _win_bus_type(disk: int):
+    """STORAGE_BUS_TYPE of a physical drive (15 = a mounted .vhd/.vhdx/.iso), or None."""
+    import ctypes
+    import struct
+    from ctypes import wintypes
+    k32 = _k32()
+    h = _win_open("\\\\.\\PhysicalDrive%d" % disk)
+    if h is None:
+        return None
     try:
-        import ctypes
-        k32 = ctypes.windll.kernel32
-        vol = ctypes.create_unicode_buffer(1024)
-        if not k32.GetVolumePathNameW(_existing_ancestor(p), vol, 1024):
-            return None, True
-        guid = ctypes.create_unicode_buffer(1024)
-        if not k32.GetVolumeNameForVolumeMountPointW(vol.value, guid, 1024):
-            return None, True
-        disks = _win_disks_of_handle_path(guid.value.rstrip("\\"))
-        return disks, True
+        query = ctypes.create_string_buffer(struct.pack("<II4x", 0, 0))  # StorageDeviceProperty, standard query
+        out = ctypes.create_string_buffer(1024)
+        ret = wintypes.DWORD(0)
+        if not k32.DeviceIoControl(wintypes.HANDLE(h), 0x002D1400, query, 12, out, 1024, ctypes.byref(ret), None):
+            return None
+        return struct.unpack_from("<I", out.raw, 28)[0] if ret.value >= 32 else None
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(h))
+
+
+def _win_final_paths(path: str):
+    """(volume-GUID spelling, DOS spelling) of a file or folder after every
+    symlink, junction, mounted folder and subst drive is resolved."""
+    import ctypes
+    from ctypes import wintypes
+    h = _win_open(path, 0x02000000)  # FILE_FLAG_BACKUP_SEMANTICS: lets folders be opened
+    if h is None:
+        return None
+    k32 = _k32()
+    try:
+        out = []
+        for flag in (1, 0):  # VOLUME_NAME_GUID, VOLUME_NAME_DOS
+            buf = ctypes.create_unicode_buffer(32768)
+            n = k32.GetFinalPathNameByHandleW(wintypes.HANDLE(h), buf, 32768, flag)
+            out.append(buf.value if 0 < n < 32768 else None)
+        return out[0], out[1]
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(h))
+
+
+def _win_share_path(host: str, share: str):
+    """Local folder behind a share this computer serves (E$ -> E:\\)."""
+    import ctypes
+    from ctypes import wintypes
+    m = re.match(r"^([a-z])\$$", share, re.I)
+    if m:
+        return m.group(1).upper() + ":\\"
+    try:
+        net = ctypes.windll.netapi32
+        ptr = ctypes.c_void_p()
+        if net.NetShareGetInfo(None, ctypes.c_wchar_p(share), 2, ctypes.byref(ptr)) != 0 or not ptr.value:
+            return None
+        try:
+            # SHARE_INFO_2: netname, type, remark, permissions, max_uses, current_uses, path, passwd
+            class ShareInfo2(ctypes.Structure):
+                _fields_ = [("netname", wintypes.LPWSTR), ("type", wintypes.DWORD), ("remark", wintypes.LPWSTR),
+                            ("permissions", wintypes.DWORD), ("max_uses", wintypes.DWORD),
+                            ("current_uses", wintypes.DWORD), ("path", wintypes.LPWSTR), ("passwd", wintypes.LPWSTR)]
+            return ctypes.cast(ptr, ctypes.POINTER(ShareInfo2)).contents.path
+        finally:
+            net.NetApiBufferFree(ptr)
     except Exception:
+        return None
+
+
+def _win_exists(p: str) -> bool:
+    return os.path.exists(p)
+
+
+def _win_existing_ancestor(p: str) -> str:
+    while not _win_exists(p):
+        parent = ntpath.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return p
+
+
+def _win_where(path: str, where: Where | None = None, depth: int = 0) -> Where:
+    where = where if where is not None else Where()
+    if depth > 4:
+        where.unknown = where.unknown or "too many layers of storage to follow"
+        return where
+    if _WIN_DEVICE.match(path):
+        where.unknown = where.unknown or "%s is a device, not a folder" % path
+        return where
+    p = _win_plain(path)
+    if not p.startswith(("\\\\?\\", "\\\\.\\")):
+        p = ntpath.abspath(p)
+    anc = _win_existing_ancestor(p)
+    try:
+        final = _win_final_paths(anc)
+    except Exception:
+        final = None
+    if not final:
+        where.unknown = where.unknown or "I couldn't open %s to check which disk it is on" % anc
+        return where
+    guid, dos = final
+    if guid and guid.lower().startswith("\\\\?\\volume{"):
+        vol = guid[:guid.index("}") + 1]
+        disks = _win_disks_of_handle_path(vol)
+        if not disks:
+            where.unknown = where.unknown or "I couldn't work out which disk %s is on" % path
+            return where
+        where.disks |= disks
+        if any(_win_bus_type(d) in BUS_VIRTUAL for d in disks):
+            where.unknown = where.unknown or ("%s is on a virtual disk (a .vhd or .vhdx file, or Storage Spaces), and "
+                                              "I can't tell which drive that is stored on" % path)
+        return where
+    m = re.match(r"^\\\\\?\\UNC\\([^\\]+)\\([^\\]+)(.*)$", dos or "", re.I)
+    if m:
+        host = m.group(1).split("@")[0]  # WebDAV: server@SSL@port
+        if not _is_this_machine(host):
+            where.remote = True
+            return where
+        local = _win_share_path(host, m.group(2))
+        if not local:
+            where.unknown = where.unknown or "%s is a share served by this computer, and I couldn't tell which folder" % path
+            return where
+        return _win_where(local.rstrip("\\") + "\\" + m.group(3).lstrip("\\"), where, depth + 1)
+    m = re.match(r"^\\\\\?\\([a-z]):", dos or "", re.I)
+    if m:  # a local volume without a GUID name
+        disks = _win_disks_of_handle_path("\\\\.\\%s:" % m.group(1).upper())
+        if disks:
+            where.disks |= disks
+            return where
+    where.unknown = where.unknown or "I couldn't work out which disk %s is on" % path
+    return where
+
+
+def _win_path_disks(path: str):
+    """(disks, backed) for older callers."""
+    w = _win_where(path)
+    if w.unknown:
         return None, True
+    return w.disks, not w.remote
 
 
 def _win_source_disks(source: str) -> set[int]:
@@ -456,23 +665,12 @@ def _win_source_disks(source: str) -> set[int]:
 
 
 # -------------------------------------------------------------- the guard
-def _pair_to_where(disks, backed) -> Where:
-    w = Where()
-    if disks is None:
-        w.unknown = "I couldn't work out which disk it is on"
-    elif not disks and not backed:
-        w.remote = True
-    else:
-        w.disks |= set(disks)
-    return w
-
-
 def where(path: str) -> Where:
     """Which disks (and image files) writes into folder `path` end up on."""
     if sys.platform == "win32":
-        return _pair_to_where(*_win_path_disks(path))
+        return _win_where(path)
     if sys.platform == "darwin":
-        return _pair_to_where(*_mac_path_disks(path))
+        return _mac_where(path)
     return _linux_where(path)
 
 
@@ -482,9 +680,7 @@ def source_where(source: str) -> Where:
         w.disks |= _win_source_disks(source)
         return w
     if sys.platform == "darwin":
-        w = Where()
-        w.disks |= _mac_source_disks(source)
-        return w
+        return _mac_source(source)
     return _linux_source(source)
 
 
@@ -526,6 +722,7 @@ def check_output(source: str, out_dir: str) -> tuple[bool, str]:
         if key and key in where(out_dir).files:
             return False, "%s is inside %s itself (it is mounted from that image)" % (out_dir, source)
         return True, ""
+    _MAC_CACHE.clear()
     s = source_where(src)
     if not s.disks:
         return False, ("I couldn't work out which physical disk %s is, so I can't prove that %s is on a different "
