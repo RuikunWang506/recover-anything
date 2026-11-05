@@ -70,3 +70,60 @@ def test_png_measure():
     data = b.getvalue() + b"\x00" * 1000
     m = others.measure_png(lambda o, n: data[o:o + n], 0, len(data))
     assert m.complete and m.end == len(b.getvalue())
+
+
+def _naive_samples(offsets, sizes, stsc):
+    out, si = [], 0
+    runs = [tuple(stsc[i:i + 3]) for i in range(0, len(stsc), 3)]
+    for ci, coff in enumerate(offsets, start=1):
+        per = 1
+        for first, spc, _ in runs:
+            if ci >= first:
+                per = spc
+        pos = coff
+        for _ in range(per):
+            if si >= len(sizes):
+                break
+            out.append((pos, sizes[si]))
+            pos += sizes[si]
+            si += 1
+    return out
+
+
+def test_sample_walk_matches_the_spec_and_is_linear():
+    import random
+    import time
+    rng = random.Random(3)
+    for _ in range(300):
+        chunks = rng.randrange(0, 40)
+        offsets = sorted(rng.randrange(0, 1 << 30) for _ in range(chunks))
+        sizes = [rng.randrange(0, 5000) for _ in range(rng.randrange(0, 200))]
+        firsts = sorted(rng.randrange(1, 45) for _ in range(rng.randrange(0, 6)))
+        stsc = [v for f in firsts for v in (f, rng.randrange(0, 9), 1)]
+        assert list(others.iter_samples(offsets, sizes, stsc)) == _naive_samples(offsets, sizes, stsc)
+    # 100,000 chunks and 50,000 runs: the old nested walk took minutes
+    offsets = list(range(0, 100000 * 64, 64))
+    stsc = [v for k in range(50000) for v in (2 * k + 1, 1, 1)]
+    t = time.time()
+    assert sum(1 for _ in others.iter_samples(offsets, others._Fixed(8, 100000), stsc)) == 100000
+    assert time.time() - t < 5
+
+
+def test_tiny_index_claiming_millions_of_frames_is_refused():
+    import struct
+
+    def box(t, body):
+        return struct.pack(">I", 8 + len(body)) + t + body
+
+    def full(t, body):
+        return box(t, b"\0\0\0\0" + body)
+
+    stsd = full(b"stsd", struct.pack(">I", 1) + struct.pack(">I", 16) + b"avc1" + bytes(8))
+    stsz = full(b"stsz", struct.pack(">II", 5, 50_000_000))  # 50M frames in 20 bytes
+    stsc = full(b"stsc", struct.pack(">IIII", 1, 1, 50_000_000, 1))
+    stco = full(b"stco", struct.pack(">II", 1, 64))
+    stbl = box(b"stbl", stsd + stsz + stsc + stco)
+    moov = box(b"moov", box(b"trak", box(b"mdia", box(b"minf", stbl))))
+    data = box(b"ftyp", b"isom" + bytes(4)) + moov + box(b"mdat", bytes(1000))
+    st, why, _ = others.validate_isobmff(lambda o, n: data[o:o + n], len(data))
+    assert (st, why) == ("unverified", "too many frames to check one by one")

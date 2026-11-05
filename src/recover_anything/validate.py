@@ -64,6 +64,51 @@ def _apply_jpeg(rec: Found, res) -> None:
             rec.meta["size_mismatch"] = True
 
 
+ZIP_STEP = 1 << 20
+ZIP_CHECK_BUDGET = 2 << 30  # uncompressed bytes checked per archive
+
+
+class _ZipBad(Exception):
+    pass
+
+
+def _member_crc(read, at: int, csize: int, usize: int, method: int) -> int:
+    """CRC-32 of one member, inflated in bounded steps: a tiny archive can
+    claim to expand to gigabytes, so output is never held more than 1 MB at a
+    time and never allowed past the size the archive declares."""
+    import zlib
+    dec = zlib.decompressobj(-15) if method == 8 else None
+    crc = got = out = 0
+
+    def take(chunk):
+        nonlocal crc, out
+        out += len(chunk)
+        if out > usize:
+            raise _ZipBad("a member is bigger than the archive says")
+        crc = zlib.crc32(chunk, crc)
+
+    while got < csize and not (dec and dec.eof):
+        piece = read(at + got, min(ZIP_STEP, csize - got))
+        if not piece:
+            raise _ZipBad("a member is cut short")
+        got += len(piece)
+        if dec is None:
+            take(piece)
+            continue
+        buf = piece
+        while buf and not dec.eof:
+            take(dec.decompress(buf, ZIP_STEP))
+            buf = dec.unconsumed_tail
+    while dec is not None and not dec.eof:
+        chunk = dec.decompress(b"", ZIP_STEP)
+        if not chunk:
+            break
+        take(chunk)
+    if out != usize:
+        raise _ZipBad("a member's size doesn't match the archive")
+    return crc & 0xFFFFFFFF
+
+
 def validate_zip(read, length: int) -> tuple[str, str]:
     """Check every member's CRC (stored and deflated members)."""
     import struct
@@ -76,7 +121,8 @@ def validate_zip(read, length: int) -> tuple[str, str]:
     if cd_off == 0xFFFFFFFF or cd_size == 0xFFFFFFFF:
         return "ok", "structure checked (ZIP64)"
     cd = read(cd_off, min(cd_size, 64 << 20))
-    pos, checked, budget = 0, 0, 512 << 20
+    pos, checked, skipped = 0, 0, 0
+    cbudget, ubudget = 512 << 20, ZIP_CHECK_BUDGET
     for _ in range(min(total, 100000)):
         if cd[pos:pos + 4] != b"PK\x01\x02" or pos + 46 > len(cd):
             return "corrupt", "archive directory damaged"
@@ -86,25 +132,24 @@ def validate_zip(read, length: int) -> tuple[str, str]:
         if len(lh) < 30 or lh[:4] != b"PK\x03\x04":
             return "corrupt", "a member is missing (byte %d)" % lho
         ln, lx = struct.unpack("<HH", lh[26:30])
-        if method not in (0, 8) or csize == 0xFFFFFFFF or csize > budget:
+        if (method not in (0, 8) or 0xFFFFFFFF in (csize, usize) or csize > cbudget or usize > ubudget
+                or (method == 0 and csize != usize)):
+            skipped += 1
             continue
-        budget -= csize
-        data_at, run, got = lho + 30 + ln + lx, 0, 0
-        dec = zlib.decompressobj(-15) if method == 8 else None
+        cbudget -= csize
+        ubudget -= usize
+        data_at = lho + 30 + ln + lx
         try:
-            while got < csize:
-                piece = read(data_at + got, min(1 << 20, csize - got))
-                if not piece:
-                    return "corrupt", "a member is cut short"
-                got += len(piece)
-                run = zlib.crc32(dec.decompress(piece) if dec else piece, run)
-            if dec:
-                run = zlib.crc32(dec.flush(), run)
+            got = _member_crc(read, data_at, csize, usize, method)
+        except _ZipBad as e:
+            return "corrupt", "%s (byte %d)" % (e, data_at)
         except zlib.error:
             return "corrupt", "a member's data is damaged (byte %d)" % data_at
-        if run & 0xFFFFFFFF != crc:
+        if got != crc:
             return "corrupt", "a member's checksum doesn't match (byte %d)" % data_at
         checked += 1
+    if skipped:
+        return "ok", "%d members checksum-verified; %d could not be checked" % (checked, skipped)
     return "ok", "%d members checksum-verified" % checked
 
 
@@ -138,7 +183,7 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
     if rec.kind == "zip":
         st, why = validate_zip(r.read, r.length)
         rec.status, rec.note = st, why
-        rec.meta["check"] = "full" if "verified" in why else "structure"
+        rec.meta["check"] = "full" if why.endswith(" members checksum-verified") else "structure"
         return
     fn = {"png": others.measure_png, "gif": others.measure_gif, "riff": others.measure_riff,
           "tiff": others.measure_tiff, "pdf": others.measure_pdf}.get(rec.kind)

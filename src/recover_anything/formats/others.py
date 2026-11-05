@@ -6,7 +6,9 @@ end (bytes from start), complete (looked whole), ext, and a reason.
 from __future__ import annotations
 
 import struct
+import sys
 import zlib
+from array import array
 
 
 class Result:
@@ -101,54 +103,60 @@ def validate_isobmff(read, length: int) -> tuple[str, str, int | None]:
             moov = (b, e)
     if not moov:
         return "unverified", "no moov box", None
-    checked = 0
+    checked = total = 0
     for typ, b, e in _boxes(read, *moov):
         if typ != b"trak":
             continue
         stbl = _find(read, b, e, [b"mdia", b"minf", b"stbl"])
         if not stbl:
             continue
-        codec = None
-        offsets, sizes, stsc = [], [], []
-        tables = sample_tables(read, stbl)
+        try:
+            tables = sample_tables(read, stbl)
+        except TooManySamples:
+            return "unverified", "too many frames to check one by one", None
         if tables is None:
             return "corrupt", "the video's index is damaged", None
         codec, offsets, sizes, stsc = tables
         if not offsets or not sizes:
             continue
+        total += len(sizes)
+        if total > MAX_SAMPLES:
+            return "unverified", "too many frames to check one by one", None
         nal = codec in (b"avc1", b"avc3", b"hvc1", b"hev1")
         hevc = codec in (b"hvc1", b"hev1")
-        si = 0
-        for ci, coff in enumerate(offsets, start=1):
-            per = 1
-            for first, spc, _ in stsc:
-                if ci >= first:
-                    per = spc
-            pos = coff
-            for _ in range(per):
-                if si >= len(sizes):
-                    break
-                sz = sizes[si]
-                if pos + sz > length:
-                    return "corrupt", "sample %d lies past the end of the file" % si, pos
-                if nal and sz >= 5:
-                    h = read(pos, 5)
-                    ln = struct.unpack(">I", h[:4])[0]
-                    hdr = h[4]
-                    if ln == 0 or ln + 4 > sz or hdr & 0x80:
-                        return "corrupt", "video frame %d (byte %d) is not where the index says" % (si, pos), pos
-                    t = (hdr >> 1) & 0x3F if hevc else hdr & 0x1F
-                    if (hevc and t > 40) or (not hevc and t in (0, 24, 25, 26, 27, 28, 29, 30, 31)):
-                        return "corrupt", "video frame %d (byte %d) has an impossible unit type" % (si, pos), pos
-                pos += sz
-                si += 1
-                checked += 1
+        for si, (pos, sz) in enumerate(iter_samples(offsets, sizes, stsc)):
+            if pos + sz > length:
+                return "corrupt", "sample %d lies past the end of the file" % si, pos
+            if nal and sz >= 5:
+                h = read(pos, 5)
+                if len(h) < 5:
+                    return "corrupt", "video frame %d (byte %d) is missing" % (si, pos), pos
+                ln = struct.unpack(">I", h[:4])[0]
+                hdr = h[4]
+                if ln == 0 or ln + 4 > sz or hdr & 0x80:
+                    return "corrupt", "video frame %d (byte %d) is not where the index says" % (si, pos), pos
+                t = (hdr >> 1) & 0x3F if hevc else hdr & 0x1F
+                if (hevc and t > 40) or (not hevc and t in (0, 24, 25, 26, 27, 28, 29, 30, 31)):
+                    return "corrupt", "video frame %d (byte %d) has an impossible unit type" % (si, pos), pos
+            checked += 1
     if checked == 0:
         return "unverified", "no sample tables", None
     return "ok", "%d frames checked" % checked, None
 
 
-MAX_SAMPLES = 20_000_000
+MAX_SAMPLES = 2_000_000  # frames per file: a 9-hour 60 fps video
+
+
+class TooManySamples(Exception):
+    """The index lists more frames than are worth checking one by one."""
+
+
+def _be_array(code: str, raw: bytes) -> array:
+    a = array(code)
+    a.frombytes(raw)
+    if sys.byteorder == "little":
+        a.byteswap()
+    return a
 
 
 def _counted(body: bytes, at: int, width: int):
@@ -157,53 +165,94 @@ def _counted(body: bytes, at: int, width: int):
     if len(body) < at + 4:
         return None
     n = struct.unpack(">I", body[at:at + 4])[0]
-    if n > MAX_SAMPLES or len(body) < at + 4 + width * n:
+    if n > MAX_SAMPLES:
+        raise TooManySamples(n)
+    if len(body) < at + 4 + width * n:
         return None
-    return list(struct.unpack(">%d%s" % (n, "I" if width == 4 else "Q"), body[at + 4:at + 4 + width * n]))
+    return _be_array("I" if width == 4 else "Q", body[at + 4:at + 4 + width * n])
+
+
+class _Fixed:
+    """Sample sizes when every sample has the same size (no per-sample list)."""
+    __slots__ = ("size", "n")
+
+    def __init__(self, size: int, n: int):
+        self.size, self.n = size, n
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        if not -self.n <= i < self.n:
+            raise IndexError(i)
+        return self.size
 
 
 def sample_tables(read, stbl):
-    """(codec, chunk offsets, sample sizes, stsc) for one track, or None if the
-    tables are inconsistent. Sizes are only expanded for H.264/HEVC video."""
-    codec, offsets, sizes, stsc = None, [], [], []
-    fixed_size = None
+    """(codec, chunk offsets, sample sizes, sample-to-chunk table) for one
+    track, or None if the tables are inconsistent (TooManySamples if they are
+    too big to check). The sample-to-chunk table is flat: first chunk,
+    samples per chunk, description index, repeated."""
+    codec, offsets, sizes, stsc = None, (), (), ()
     for t2, b2, e2 in _boxes(read, *stbl):
+        if t2 not in (b"stsd", b"stco", b"co64", b"stsz", b"stsc"):
+            continue
         if e2 - b2 > (256 << 20):
             return None
         body = read(b2, e2 - b2)
         if t2 == b"stsd":
             if len(body) >= 16:
                 codec = body[12:16]
-        elif t2 == b"stco":
-            offsets = _counted(body, 4, 4)
-        elif t2 == b"co64":
-            offsets = _counted(body, 4, 8)
+        elif t2 in (b"stco", b"co64"):
+            offsets = _counted(body, 4, 4 if t2 == b"stco" else 8)
+            if offsets is None:
+                return None
         elif t2 == b"stsz":
             if len(body) < 12:
                 return None
             fixed, n = struct.unpack(">II", body[4:12])
             if n > MAX_SAMPLES:
-                return None
+                raise TooManySamples(n)
             if fixed:
-                fixed_size = (fixed, n)
+                sizes = _Fixed(fixed, n)
             else:
                 if len(body) < 12 + 4 * n:
                     return None
-                sizes = list(struct.unpack(">%dI" % n, body[12:12 + 4 * n]))
+                sizes = _be_array("I", body[12:12 + 4 * n])
         elif t2 == b"stsc":
             if len(body) < 8:
                 return None
             n = struct.unpack(">I", body[4:8])[0]
-            if n > MAX_SAMPLES or len(body) < 8 + 12 * n:
+            if n > MAX_SAMPLES:
+                raise TooManySamples(n)
+            if len(body) < 8 + 12 * n:
                 return None
-            stsc = [struct.unpack(">III", body[8 + 12 * i:20 + 12 * i]) for i in range(n)]
-        if offsets is None:
-            return None
-    if fixed_size:
-        if codec not in (b"avc1", b"avc3", b"hvc1", b"hev1"):
-            return codec, [], [], stsc  # e.g. PCM audio: nothing to check per sample
-        sizes = [fixed_size[0]] * fixed_size[1]
+            stsc = _be_array("I", body[8:8 + 12 * n])
+            firsts = stsc[0::3]
+            if any(x > y for x, y in zip(firsts, firsts[1:])):
+                return None  # runs must be listed in order
+    if isinstance(sizes, _Fixed) and codec not in (b"avc1", b"avc3", b"hvc1", b"hev1"):
+        return codec, (), (), stsc  # e.g. PCM audio: nothing to check per sample
     return codec, offsets, sizes, stsc
+
+
+def iter_samples(offsets, sizes, stsc):
+    """(file offset, size) of every sample in one track. Chunks and the
+    sample-to-chunk runs are walked together, so this is linear in the size
+    of the tables."""
+    n, runs = len(sizes), len(stsc) // 3
+    si, j, per = 0, 0, 1
+    for ci, pos in enumerate(offsets, start=1):
+        while j < runs and stsc[3 * j] <= ci:
+            per = stsc[3 * j + 1]
+            j += 1
+        for _ in range(min(per, n - si)):
+            sz = sizes[si]
+            yield pos, sz
+            pos += sz
+            si += 1
+        if si >= n:
+            return
 
 
 def _find(read, b, e, path):

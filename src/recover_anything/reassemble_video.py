@@ -39,7 +39,8 @@ def _nal_ok(h: bytes, size: int, hevc: bool) -> bool:
 
 
 def _samples(moov: bytes, base: int):
-    """[(file offset, size, hevc)] for every H.264/HEVC sample in a moov box."""
+    """[(file offset, size, hevc)] for every H.264/HEVC sample in a moov box,
+    or None if the index is damaged or implausibly large."""
     read = lambda o, n: moov[max(0, o - base):max(0, o - base + n)]  # noqa: E731
     out = []
     end = base + len(moov)
@@ -49,26 +50,21 @@ def _samples(moov: bytes, base: int):
         stbl = others._find(read, b, e, [b"mdia", b"minf", b"stbl"])
         if not stbl:
             continue
-        tables = others.sample_tables(read, stbl)
+        try:
+            tables = others.sample_tables(read, stbl)
+        except others.TooManySamples:
+            return None
         if tables is None:
             return None
         codec, offsets, sizes, stsc = tables
         if codec not in (b"avc1", b"avc3", b"hvc1", b"hev1") or not offsets or not sizes:
             continue
+        if len(out) + len(sizes) > others.MAX_SAMPLES:
+            return None
         hevc = codec in (b"hvc1", b"hev1")
-        si = 0
-        for ci, coff in enumerate(offsets, start=1):
-            per = 1
-            for first, spc, _ in stsc:
-                if ci >= first:
-                    per = spc
-            pos = coff
-            for _ in range(per):
-                if si >= len(sizes):
-                    break
-                out.append((pos, sizes[si], hevc))
-                pos += sizes[si]
-                si += 1
+        # A frame smaller than a length prefix plus a header byte can't be
+        # checked, so it is no use as a checkpoint.
+        out.extend((pos, sz, hevc) for pos, sz in others.iter_samples(offsets, sizes, stsc) if sz >= 5)
     out.sort()
     return out
 
