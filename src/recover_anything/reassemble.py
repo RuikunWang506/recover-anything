@@ -1,0 +1,355 @@
+"""Put fragmented JPEGs back together.
+
+Why photos fragment: a camera deletes a photo, leaving a hole; the next photo is
+bigger than the hole, so the camera fills the hole and continues in the next
+free space. After a format the map of which clusters belong to which file is
+gone, so ordinary carvers glue the first piece to whatever follows and get a
+broken picture.
+
+How we fix it, cluster by cluster:
+  1. Skip clusters we already know belong to other verified files ("gap
+     skipping"). The camera allocated free clusters in order, so the next
+     piece is usually the next cluster nobody else owns.
+  2. Decode as we go. When the decoder hits an impossibility (bad Huffman
+     code, coefficient overflow, restart marker out of order, wrong number of
+     blocks at the end), the bytes stopped belonging to this photo.
+  3. At the suspected break, try candidate clusters in order and score each by
+     how smoothly the picture continues across the seam (block brightness
+     against the row above). The right piece continues the image; the wrong
+     piece jumps.
+  4. Repeat until the decoder reaches the end of the image with exactly the
+     right number of blocks.
+"""
+from __future__ import annotations
+
+from .formats import jpeg
+from .records import Found
+
+MAX_SCAN = 6000       # free clusters to look at after a break
+MAX_QUICK = 400       # candidates that survive the first few KB
+QUICK_BYTES = 4096
+FULL_TRIALS = 16
+ACCEPT_SCORE = 2.5     # seam roughness / normal roughness that is always fine
+LONE_SCORE = 10.0      # a lone (or clearly best) clean candidate is accepted up to this
+GOOD_ENOUGH = 1.4
+
+
+def _row_jump(dec: "jpeg.Decoder", a: int, b: int) -> float:
+    """Mean |DC - DC above| over the top luma block-row of MCUs [a, b)."""
+    bw, bh, bv, mw = dec.bw, dec.bh, dec.bv, dec.mcu_w
+    dc = dec.dc
+    tot = n = 0
+    for m in range(max(a, mw), b):
+        my, mx = divmod(m, mw)
+        base = (my * bv) * bw + mx * bh
+        for hz in range(bh):
+            i = base + hz
+            tot += abs(dc[i] - dc[i - bw])
+            n += 1
+    return tot / n if n else 0.0
+
+
+def seam_score(dec, m0: int, m1: int) -> float | None:
+    """How rough the picture is right after MCU m0 compared with just before."""
+    mw = dec.mcu_w
+    if m0 < 2 * mw:
+        return None
+    after = _row_jump(dec, m0, min(m1, m0 + mw))
+    before = _row_jump(dec, m0 - mw, m0)
+    if after == 0 and before == 0:
+        return 1.0
+    return after / max(before, 1.0)
+
+
+class _Assembler:
+    def __init__(self, src, geom, blocked: bytearray):
+        self.src, self.g, self.blocked = src, geom, blocked
+        self.cs = geom.cluster_size
+        self.last = geom.last_cluster
+
+    def cluster(self, c: int) -> bytes:
+        return self.src.read(self.g.offset(c), self.cs)
+
+    def next_free(self, c: int, skip=()) -> int | None:
+        while True:
+            n = self.blocked.find(0, c + 1, self.last + 1)
+            if n < 0:
+                return None
+            if n not in skip:
+                return n
+            c = n
+
+    def run(self, start: int, expected_size: int | None = None):
+        """Returns (clusters, length, status, note)."""
+        cs = self.cs
+        try:
+            h = jpeg.parse_header(self.src.read, self.g.offset(start))
+        except jpeg.JpegError:
+            return None
+        if not h.decodable:
+            return None
+        try:
+            dec = jpeg.Decoder(h)
+        except jpeg.JpegError:
+            return None
+        max_clusters = (expected_size + cs - 1) // cs + 2 if expected_size else (200 << 20) // cs
+        path = [start]
+        buf = bytearray(self.cluster(start))
+        dec.buf = bytes(buf)
+        states: dict[int, tuple] = {}
+        tried: dict[int, set] = {}
+        mine = {start}
+        breaks = 0
+        while True:
+            try:
+                st = dec.run()
+            except jpeg.DecodeError as e:
+                breaks += 1
+                if breaks > 64:
+                    break
+                fixed = self._fix(dec, e.pos, path, buf, states, tried, mine)
+                if fixed is None:
+                    break
+                path, buf = fixed
+                continue
+            if st == "done":
+                return path, dec.end, "ok", "%d pieces" % self._pieces(path)
+            states[len(path) - 1] = dec.save()
+            if len(path) >= max_clusters:
+                break
+            nxt = self.next_free(path[-1], skip=mine | tried.get(len(path), set()))
+            if nxt is None:
+                break
+            path.append(nxt)
+            mine.add(nxt)
+            buf += self.cluster(nxt)
+            dec.buf = bytes(buf)
+        # could not finish: keep what decodes (the top of the picture)
+        good = max((k for k in states if k < len(path)), default=None)
+        if good is None:
+            return None
+        dec.restore(states[good])
+        end = dec.pos
+        return path[:good + 1], end, "partial", "only the top part of the picture could be recovered"
+
+    @staticmethod
+    def _pieces(path):
+        return 1 + sum(1 for a, b in zip(path, path[1:]) if b != a + 1)
+
+    def _suspects(self, dec, path, states, k):
+        """Seams before k ranked by how badly the picture jumps there."""
+        scored = []
+        for j in range(1, k + 1):
+            if j - 1 not in states:
+                continue
+            m0 = states[j - 1][5]
+            m1 = states[j][5] if j in states else dec.mcu
+            s = seam_score(dec, m0, m1)
+            if s is not None:
+                scored.append((s, j))
+        scored.sort(reverse=True)
+        return [j for s, j in scored if s > ACCEPT_SCORE][:4]
+
+    def _fix(self, dec, err_pos, path, buf, states, tried, mine):
+        cs = self.cs
+        k = min(len(path) - 1, max(1, err_pos // cs))
+        order = []
+        for j in self._suspects(dec, path, states, k) + [k, k - 1, k - 2]:
+            if 1 <= j < len(path) and j not in order:
+                order.append(j)
+        for j in order:
+            if j - 1 not in states:
+                continue
+            tried.setdefault(j, set()).add(path[j])
+            got = self._search(dec, path, buf, states, j, tried[j], mine)
+            if got is not None:
+                c = got
+                for x in path[j:]:
+                    mine.discard(x)
+                new_path = path[:j] + [c]
+                mine.add(c)
+                new_buf = bytearray(buf[:j * cs])
+                new_buf += self.cluster(c)
+                for s in [s for s in states if s >= j]:
+                    del states[s]
+                for t in [t for t in tried if t > j]:
+                    del tried[t]
+                dec.restore(states[j - 1])
+                dec.buf = bytes(new_buf)
+                return new_path, new_buf
+        return None
+
+    def _trial(self, dec, base, prefix, data, m0, nbytes):
+        """Decode `nbytes` of a candidate after the prefix. Returns
+        (score, finished) or None if the candidate is impossible."""
+        dec.restore(base)
+        dec.buf = prefix + data[:nbytes]
+        try:
+            st = dec.run()
+        except jpeg.DecodeError as e:
+            if e.pos < len(prefix) + min(nbytes, len(data)) - 64:
+                return None
+            st = "more"
+        if st == "done":
+            return 0.0, True
+        if dec.mcu <= m0:
+            return 1.0, False
+        s = seam_score(dec, m0, dec.mcu)
+        return (1.0 if s is None else s), False
+
+    def _search(self, dec, path, buf, states, j, rejected, mine):
+        """Find the cluster that continues the picture after path[j-1].
+
+        Stage 1 tries a few KB of every free cluster in order (cheap: most
+        wrong clusters fail within bytes). Stage 2 fully decodes the most
+        promising ones and keeps the one with the smoothest seam."""
+        cs = self.cs
+        base = states[j - 1]
+        prefix = bytes(buf[:j * cs])
+        m0 = base[5]
+        c = path[j - 1]
+        skip = mine | rejected | set(path[:j])
+        quick = []
+        scanned = 0
+        while scanned < MAX_SCAN and len(quick) < MAX_QUICK:
+            c = self.next_free(c, skip=skip)
+            if c is None:
+                break
+            scanned += 1
+            data = self.cluster(c)
+            if data.count(0) == len(data):
+                continue
+            r = self._trial(dec, base, prefix, data, m0, QUICK_BYTES)
+            if r is None:
+                continue
+            if r[1]:
+                dec.restore(base)
+                return c
+            quick.append((r[0], c, data))
+            if r[0] <= GOOD_ENOUGH and len(quick) <= 3:
+                full = self._trial(dec, base, prefix, data, m0, cs)
+                if full is not None and (full[1] or full[0] <= GOOD_ENOUGH):
+                    dec.restore(base)
+                    return c
+        quick.sort(key=lambda t: t[0])
+        survivors = []
+        for score, c, data in quick[:FULL_TRIALS]:
+            full = self._trial(dec, base, prefix, data, m0, cs)
+            if full is None:
+                continue
+            if full[1]:
+                dec.restore(base)
+                return c  # reached the end of the image with exactly the right number of blocks
+            survivors.append((full[0], c))
+        dec.restore(base)
+        return _decide(survivors)
+
+
+def _decide(survivors):
+    """Pick a continuation, or refuse when the evidence is ambiguous.
+
+    A wrong cluster usually breaks the decoder outright. When several decode
+    cleanly (same encoder settings, so data from another photo is valid
+    JPEG data too), the seam decides: the right piece continues the picture.
+    The final end-of-image check catches any mistake that slips through.
+    """
+    if not survivors:
+        return None
+    survivors.sort()
+    best, c = survivors[0]
+    if len(survivors) == 1:
+        return c if best <= LONE_SCORE else None
+    second = survivors[1][0]
+    if best <= ACCEPT_SCORE:
+        return c
+    if best <= LONE_SCORE and second >= 2 * best:
+        return c
+    return None
+
+
+def _extents(geom, clusters, length):
+    out, rem, i = [], length, 0
+    cs = geom.cluster_size
+    while i < len(clusters) and rem > 0:
+        j = i
+        while j + 1 < len(clusters) and clusters[j + 1] == clusters[j] + 1:
+            j += 1
+        n = min(rem, (j - i + 1) * cs)
+        out.append((geom.offset(clusters[i]), n))
+        rem -= n
+        i = j + 1
+    return out
+
+
+def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3):
+    for vr in res.volumes:
+        g = getattr(vr, "geometry", None)
+        if g is None:
+            continue
+        mine = [r for r in found if getattr(r, "volume", None) is vr]
+        broken = [r for r in mine if r.kind == "jpeg" and r.status in ("corrupt", "partial") and r.extents]
+        videos = [r for r in mine if r.kind == "isobmff" and r.status in ("corrupt", "partial") and r.extents
+                  and r.ext not in (".heic", ".avif", ".cr3")]
+        if not broken and not videos:
+            continue
+        blocked = bytearray(g.last_cluster + 2)
+        blocked[0:2] = b"\x01\x01"
+
+        def own(r):
+            for o, n in r.extents:
+                c0 = g.cluster_at(o)
+                c1 = g.cluster_at(o + n - 1)
+                blocked[c0:c1 + 1] = b"\x01" * (c1 - c0 + 1)
+
+        for r in mine:
+            if r.status == "ok" or (r.meta.get("live") and r.meta.get("chain") == "fat"):
+                own(r)
+        for off, _kind in getattr(vr, "headers", []):
+            c = g.cluster_at(off)
+            if 0 <= c < len(blocked):
+                blocked[c] = 1
+        fsr = getattr(vr, "fs_reader", None)
+        asm = _Assembler(src, g, blocked)
+        todo = sorted(broken, key=lambda r: r.start)
+        done = 0
+        for _ in range(passes):
+            progress_made = False
+            for r in list(todo):
+                start = g.cluster_at(r.start)
+                blocked[start] = 0
+                out = asm.run(start, r.expected_size)
+                blocked[start] = 1
+                if out is None:
+                    continue
+                clusters, length, status, note = out
+                if status == "ok" or (status == "partial" and r.status == "partial" and length > r.size):
+                    r.extents = _extents(g, clusters, length)
+                    r.status = status
+                    r.note = note
+                    if status == "ok":
+                        if _Assembler._pieces(clusters) > 1:
+                            r.meta["reassembled_from"] = _Assembler._pieces(clusters)
+                            if r.origin == "carved":
+                                r.origin = "reassembled"
+                        own(r)
+                        todo.remove(r)
+                        progress_made = True
+                        done += 1
+                        if progress:
+                            progress(done, len(broken))
+            if not progress_made or not todo:
+                break
+        _ = fsr
+        if videos:
+            from .reassemble_video import reassemble_videos
+            reassemble_videos(src, g, blocked, sorted(videos, key=lambda r: r.start), own)
+        for r in todo:
+            if r.status == "corrupt":
+                # keep the readable top of the picture rather than nothing
+                start = g.cluster_at(r.start)
+                bad = r.meta.get("bad_at")
+                if bad:
+                    r.extents = _extents(g, list(range(start, start + bad // g.cluster_size + 1)),
+                                         (bad // g.cluster_size) * g.cluster_size or bad)
+                    r.status = "partial"
+                    r.note = "only the top part of the picture could be recovered"
