@@ -447,9 +447,11 @@ class SaveError(Exception):
     pass
 
 
-def save(leads: list[Lead], out_dir: str, project: str | None = None) -> list[str]:
+def save(leads: list[Lead], out_dir: str, project: str | None = None, created: list | None = None) -> list[str]:
     """Copy every restorable lead into out_dir, never into the folder where the
-    files were lost (writing there could overwrite what is still recoverable)."""
+    files were lost (writing there could overwrite what is still recoverable).
+    Folders this creates are appended to `created`."""
+    from .organize import makedirs_tracked
     out = os.path.realpath(os.path.abspath(out_dir))
     if project:
         proj = os.path.realpath(os.path.abspath(project))
@@ -461,22 +463,23 @@ def save(leads: list[Lead], out_dir: str, project: str | None = None) -> list[st
             d = os.path.dirname(os.path.realpath(lead.original))
             if out == d:
                 raise SaveError("choose a different folder: %s is where the lost files lived" % out_dir)
-    os.makedirs(out_dir, exist_ok=True)
+    makedirs_tracked(out_dir, created)
     written = []
     for i, lead in enumerate(leads):
         if not lead.restorable:
             continue
         try:
-            written.append(_save_one(lead, out_dir))
+            written.append(_save_one(lead, out_dir, created))
         except OSError as e:
             lead.extra["save_error"] = str(e)
     return written
 
 
-def _save_one(lead: Lead, out_dir: str) -> str:
+def _save_one(lead: Lead, out_dir: str, created: list | None = None) -> str:
+    from .organize import makedirs_tracked
     name = os.path.basename(lead.original.split(" (blob")[0].rstrip("/\\")) or "file"
     sub = os.path.join(out_dir, re.sub(r"[^\w .-]", "_", lead.where))
-    os.makedirs(sub, exist_ok=True)
+    makedirs_tracked(sub, created)
     dest = os.path.join(sub, name)
     k = 2
     while os.path.exists(dest):

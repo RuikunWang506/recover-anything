@@ -175,3 +175,33 @@ def test_long_unicode_names_are_saved(workdir):
     res = scan(img, workers=1)
     w = write_all(res, os.path.join(workdir, "out"))
     assert len(w["written"]) == 2 and not w["failed"]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to change owners")
+def test_ownership_is_handed_back_only_for_what_the_tool_created(tmp_path, monkeypatch):
+    """Under sudo, only files and folders this run created are re-owned: never
+    files that were already in the output folder, never symlink targets."""
+    pytest.importorskip("PIL")
+    from recover_anything.cli import _give_back_to_user
+    from recover_anything.organize import write_all
+    out, elsewhere = tmp_path / "Backup", tmp_path / "elsewhere"
+    (out / "existing").mkdir(parents=True)
+    elsewhere.mkdir()
+    (elsewhere / "system.conf").write_text("x")
+    theirs = out / "existing" / "someone-elses.txt"
+    theirs.write_text("keep")
+    os.chown(theirs, 4242, 4242)
+    os.symlink(elsewhere / "system.conf", out / "link")
+    sc = scenarios.deleted(str(tmp_path), 3, **SMALL)
+    res = scan(sc.image, workers=1)
+    made = []
+    w = write_all(res, str(out / "Recovered"), created=made)
+    assert w["written"] and all(p.startswith(str(out / "Recovered")) for p in made)
+    monkeypatch.setenv("SUDO_UID", "12345")
+    monkeypatch.setenv("SUDO_GID", "12345")
+    _give_back_to_user(made + [str(out / "link")])
+    assert all(os.lstat(p).st_uid == 12345 for p in made)
+    assert os.lstat(out / "link").st_uid == 12345          # the link itself...
+    assert os.stat(elsewhere / "system.conf").st_uid == 0  # ...not what it points to
+    assert os.stat(theirs).st_uid == 4242
+    assert os.stat(out).st_uid == 0                        # the folder that was already there
