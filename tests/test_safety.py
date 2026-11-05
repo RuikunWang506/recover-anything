@@ -100,6 +100,31 @@ def test_image_of_another_card_is_never_reused(tmp_path):
     assert dest.read_bytes() == a.read_bytes()
 
 
+def test_lightly_used_cards_of_the_same_size_get_different_fingerprints(tmp_path):
+    """Two 4 GB cards with a few deleted photos each look alike in sampled
+    blocks (almost everything is empty) and even share a volume serial here;
+    their filesystem listings still tell them apart."""
+    pytest.importorskip("PIL")
+    from recover_anything.imaging import identity
+    from recover_anything.simcard.media import make_photo
+    from recover_anything.source import Source
+    paths = []
+    for base in (0, 100):
+        p = str(tmp_path / ("card%d.img" % base))
+        with Fat32Card(p, size=4 << 30, cluster_size=32768) as card:
+            for i in range(3):
+                card.write_file("DCIM/100CANON/IMG_%04d.JPG" % i, make_photo(base + i, width=640, height=480))
+            for i in range(3):
+                card.delete("DCIM/100CANON/IMG_%04d.JPG" % i)
+        paths.append(p)
+    ids = []
+    for p in paths:
+        with Source(p) as s:
+            ids.append(identity(s)["sample"])
+            assert identity(s)["sample"] == ids[-1]  # stable for the same card
+    assert ids[0] != ids[1]
+
+
 def test_one_broken_file_does_not_stop_the_scan(workdir):
     pytest.importorskip("PIL")
     from recover_anything.simcard.media import make_photo
