@@ -29,8 +29,8 @@ class ExtentReader:
         return b"".join(out)
 
 
-def _check_jpeg_bytes(data: bytes, deep: bool, expected: int | None):
-    st, note, pos = jpeg.check(data) if deep else jpeg.check_fast(data)
+def _check_jpeg_bytes(data: bytes, deep: bool, expected: int | None, deleted: bool = False):
+    st, note, pos = jpeg.check(data, thumb=deleted) if deep else jpeg.check_fast(data)
     actual = None
     if expected and st == "ok":
         m = jpeg.measure(lambda o, n: data[o:o + n], 0, len(data) + 1)
@@ -41,7 +41,7 @@ def _check_jpeg_bytes(data: bytes, deep: bool, expected: int | None):
 
 
 def _jpeg_job(args):
-    path, extents, deep, expected = args
+    path, extents, deep, expected, deleted = args
     from .source import Source
     try:
         with Source(path) as src:
@@ -49,7 +49,7 @@ def _jpeg_job(args):
             if total > jpeg.MAX_JPEG:
                 return "unverified", "too large to check", None, None, "none"
             data = b"".join(src.read(o, n) for o, n in extents)
-        return _check_jpeg_bytes(data, deep, expected)
+        return _check_jpeg_bytes(data, deep, expected, deleted)
     except Exception as e:  # never let one file stop the run
         return "unverified", "could not be checked (%s)" % type(e).__name__, None, None, "none"
 
@@ -193,7 +193,7 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
         if rec.size > jpeg.MAX_JPEG:
             rec.status, rec.note, rec.meta["check"] = "unverified", "too large to check", "none"
             return
-        _apply_jpeg(rec, _check_jpeg_bytes(rec.read(src), deep, rec.expected_size))
+        _apply_jpeg(rec, _check_jpeg_bytes(rec.read(src), deep, rec.expected_size, not layout_known(rec)))
         return
     r = ExtentReader(src, rec.extents)
     if rec.kind == "isobmff":
@@ -248,7 +248,7 @@ def _check_jpegs(src, jpegs, workers, progress, deep, done0=0, total=None):
     path = getattr(src, "path", None)
     if workers > 1 and path and len(jpegs) > 4:
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            jobs = [(path, r.extents, deep, r.expected_size) for r in jpegs]
+            jobs = [(path, r.extents, deep, r.expected_size, not layout_known(r)) for r in jpegs]
             for i, (r, res) in enumerate(zip(jpegs, ex.map(_jpeg_job, jobs, chunksize=2))):
                 _apply_jpeg(r, res)
                 if progress:
