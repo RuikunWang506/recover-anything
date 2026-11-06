@@ -178,3 +178,81 @@ def stress(workdir: str, seed: int, cluster_size: int = 32768, mixed: bool = Tru
     sc.groups["videos"] = {h for h in truth if truth[h].endswith(".MP4")}
     sc.groups["fragmented videos"] = {h for h in frag if truth[h].endswith(".MP4")}
     return sc
+
+
+def _device_file(rng, n: int):
+    """One random file of the kinds a phone, recorder, dashcam or laptop leaves on a card or stick."""
+    from . import files as F
+    k = rng.choice(["photo", "photo", "mp3", "mp3", "flac", "opus", "ts", "mts", "webm", "mkv", "sqlite", "gzip",
+                    "bmp", "heic", "video"])
+    s = 10_000 + n
+    if k == "photo":
+        w = rng.choice([1200, 1600])
+        return "DCIM/IMG_%04d.JPG" % n, make_photo(s, width=w, height=w * 3 // 4, style=PHOTO_STYLE)
+    if k == "video":
+        return "DCIM/MVI_%04d.MP4" % n, make_video(s, frames=rng.randint(60, 160))
+    if k == "mp3":
+        return "Music/track%03d.mp3" % n, F.make_mp3(s, seconds=rng.uniform(8, 40), xing=rng.random() < 0.6,
+                                                     id3v1=rng.random() < 0.3, id3=rng.random() < 0.8)
+    if k == "flac":
+        return "Music/track%03d.flac" % n, F.make_flac(s, seconds=rng.uniform(2, 8))
+    if k == "opus":
+        return "Recordings/memo%03d.opus" % n, F.make_ogg(s, seconds=rng.uniform(5, 60))
+    if k == "ts":
+        return "DashCam/REC%04d.TS" % n, F.make_ts(s, packets=rng.randint(1500, 6000))
+    if k == "mts":
+        return "AVCHD/BDMV/STREAM/%05d.MTS" % n, F.make_ts(s, packets=rng.randint(1500, 6000), m2ts=True)
+    if k in ("webm", "mkv"):
+        return "Videos/clip%03d.%s" % (n, k), F.make_mkv(s, clusters=rng.randint(3, 10), webm=k == "webm")
+    if k == "sqlite":
+        return "Backup/db%03d.sqlite" % n, F.make_sqlite(s, rows=rng.randint(100, 1500))
+    if k == "gzip":
+        return "Backup/log%03d.gz" % n, F.make_gzip(s, lines=rng.randint(3000, 30000))
+    if k == "bmp":
+        return "Pictures/scan%03d.bmp" % n, F.make_bmp(s, width=rng.choice([200, 320, 480]), height=240)
+    return "DCIM/IMG_%04d.HEIC" % n, F.make_heic(s, size=rng.randint(300_000, 1_500_000))
+
+
+def mixed_device(workdir: str, seed: int, cluster_size: int = 4096, size: int = 512 * 1024**2,
+                 fs: str = "FAT32") -> Scenario:
+    """A card or stick used by several devices: photos, music, voice memos,
+    dashcam and camcorder clips, screen recordings, phone databases, logs and
+    scans. Three rounds of saving and deleting (so files fragment), then a
+    format that recreates the folders, so no names survive. Ground truth:
+    every file present at the format whose clusters weren't reused."""
+    import random as _random
+    rng = _random.Random("mixed-%d" % seed)
+    img = os.path.join(workdir, "mixed-%d-%s.img" % (seed, fs.lower()))
+    present: dict = {}
+    counter = [0]
+    ever: set = set()
+
+    def save(card, k):
+        for _ in range(k):
+            counter[0] += 1
+            path, data = _device_file(rng, counter[0])
+            cl = card.write_file(path, data, _when(counter[0]))
+            present[path] = (data, set(cl))
+            ever.add(_sha(data))
+
+    def delete(card, k):
+        for path in rng.sample(sorted(present), min(k, len(present))):
+            card.delete(path)
+            del present[path]
+
+    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+        save(card, 30)
+        delete(card, 12)
+        save(card, 16)
+        delete(card, 9)
+        save(card, 10)
+        card.format(recreate_dirs=["DCIM", "Music"])
+        used = card.allocated_clusters()
+    truth = {_sha(d): p for p, (d, cl) in present.items() if not (cl & used)}
+    frag = {_sha(d) for p, (d, cl) in present.items()
+            if len(cl) > 1 and max(cl) - min(cl) + 1 != len(cl) and _sha(d) in truth}
+    sc = Scenario("mixed", "Shared by many devices, 3 rounds of save/delete, formatted", img, truth, fs=fs)
+    sc.groups["fragmented"] = frag
+    sc.groups["in one piece"] = set(truth) - frag
+    sc.groups["ever written"] = ever  # a file deleted earlier that comes back exact is a correct find too
+    return sc

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ProcessPoolExecutor
 
-from .formats import jpeg, others
+from .formats import jpeg, more, others
 from .records import Found
 
 
@@ -165,6 +165,29 @@ def validate_one(src, rec: Found, deep: bool = True) -> None:
         rec.meta["check"] = "none"
 
 
+def layout_known(rec: Found) -> bool:
+    """True when the bytes are certainly the file's own: it was never deleted
+    and the filesystem still lists where it is. A deleted file's clusters can
+    be reused and freed again without a trace, so for a file type without
+    checksums nothing else can prove its contents."""
+    return bool(rec.meta.get("live")) and rec.meta.get("chain") in ("fat", "contiguous")
+
+
+def _grid(rec: Found):
+    """(phase, cluster size) of a file stored in one piece: how far into a
+    cluster its first byte sits. Sectors stand in when the filesystem is
+    unknown (every cluster boundary is also a sector boundary). None for a
+    file in several pieces."""
+    if len(rec.extents) != 1:
+        return None
+    vol = getattr(rec, "volume", None)
+    geo = getattr(vol, "geometry", None)
+    cs = getattr(vol, "cluster_size", 0) or 0
+    if geo is not None and cs and rec.start >= geo.data_offset:
+        return (rec.start - geo.data_offset) % cs, cs
+    return rec.start % 512, 512
+
+
 def _validate_one(src, rec: Found, deep: bool = True) -> None:
     if rec.kind == "jpeg":
         if rec.size > jpeg.MAX_JPEG:
@@ -180,6 +203,9 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
             m = others.measure_isobmff(r.read, 0, r.length)
             st = "ok" if m.complete else "partial"
             why = "structure checked" if m.complete else m.reason
+            if st == "ok" and (m.ext in (".heic", ".avif", ".cr3") or rec.ext in (".heic", ".avif", ".cr3")) \
+                    and not layout_known(rec):
+                st, why = "unverified", more.WEAK  # picture data has no checksums
         rec.status, rec.note = st, why
         rec.meta["bad_at"] = pos
         return
@@ -187,6 +213,13 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
         st, why = validate_zip(r.read, r.length)
         rec.status, rec.note = st, why
         rec.meta["check"] = "full" if why.endswith(" members checksum-verified") else "structure"
+        return
+    if rec.kind in more.KINDS:
+        sized = rec.expected_size is not None and r.length == rec.expected_size
+        o, n = rec.extents[-1]
+        rec.status, rec.note, rec.meta["check"] = more.KINDS[rec.kind][2](
+            r.read, r.length, sized, after=src.read(o + n, 1024), grid=_grid(rec),
+            layout_known=layout_known(rec))
         return
     fn = {"png": others.measure_png, "gif": others.measure_gif, "riff": others.measure_riff,
           "tiff": others.measure_tiff, "pdf": others.measure_pdf}.get(rec.kind)
