@@ -8,11 +8,13 @@ Recover Anything gets deleted and formatted photos, videos and documents back fr
 
 ```bash
 python -m pip install -e ".[dev]"        # once, inside a virtualenv
-python -m pytest -q -rs                   # about 100 tests, about 5 min
+python -m pytest -q -rs                   # about 125 tests, about 4 min
 recover-anything selftest --quick         # 4 small simulated cards, about 1 min
 recover-anything selftest                 # the README results table (7 cards), about 3 min
 recover-anything selftest --stress 9      # the README stress numbers (seeds 6-14), about 6 min
 python tools/debug_card.py 11             # rebuild one stress card and explain every miss
+python tools/eval_cards.py mixed 1-20     # randomized cards shared by many devices: what came back, what's wrong
+python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file (mp3 ts mts flac opus mp4 jpg amr mpg doc)
 ```
 
 ## Rules that must never break
@@ -25,6 +27,7 @@ python tools/debug_card.py 11             # rebuild one stress card and explain 
    - The stress test counts files "marked recovered but wrong". That count must stay 0. So must the `mixed_device` scenarios (`tests/test_more_formats.py`).
    - A type with no checksums (BMP, HEIC/AVIF/CR3 pictures, VP8/VP9/AV1 video) is `ok` only for a file that was never deleted (`validate.layout_known`): a deleted file's clusters can be reused and freed again without a trace.
    - A stream without an end marker (MP3, MPEG-TS) is `ok` only when its end is proven: a length in the file or the folder entry, a tag, or frames that stop inside the cluster holding the last checked header (`more.same_cluster`). A carved one must also mark its start (an ID3 tag or Xing header; transport-stream counters at 0), or it may be the second half of a recording.
+   - Files of one kind fragment into each other's holes, and another recording's data passes checks that junk fails: MP3 frames, transport-stream counters, AMR and MPEG-PS frames all look alike from file to file. So a rebuilt MP3 or transport stream is `ok` only when the recording's own clock (`more.TsClock`: the PCR, and an `.MTS` file's per-packet time stamps) checked out after every join. AMR and MPEG-PS are `ok` only for a file that was never deleted. `tools/eval_cards.py one KIND` must report 0 wrong for every kind.
 4. **One bad file never stops a run.** Parsers and rebuilders run inside a try/except per file. Work on hostile or huge input is bounded (`MAX_SAMPLES`, `ZIP_CHECK_BUDGET`, `MAX_JPEG`, `MAX_MOOV`, chain limits).
 5. **README numbers come from real runs.**
    - Change the results table only from `recover-anything selftest` output.
@@ -41,19 +44,20 @@ python tools/debug_card.py 11             # rebuild one stress card and explain 
 | `source.py` | Read-only, aligned, cached reads; unreadable sectors become zeros and are logged |
 | `imaging.py` | Card-to-image copy (GNU ddrescue when installed), card fingerprint (`identity`), safe resume and reuse |
 | `volume.py` | MBR/GPT, filesystem detection, backup boot sectors |
-| `fs/fat.py`, `fs/exfat.py` | Folder walk including deleted entries, and folders that survived a format |
-| `carve.py` | Signature scan of every 512-byte sector, exact length of each hit |
+| `fs/fat.py`, `fs/exfat.py` | Folder walk including deleted entries, and folders that survived a format; `dir_clusters` and `allocated_map()` tell the rebuilders which clusters can't hold deleted data |
+| `carve.py` | Signature scan of every 512-byte sector, exact length of each hit. Blank blocks (all zeros or all 0xFF) are skipped, and headers that begin with zero bytes are checked only at sector starts (`AT_SECTOR`): never add a zero-led signature to the regex |
 | `formats/jpeg.py` | JPEG header parser, length measurement, resumable pure-Python baseline decoder |
 | `formats/others.py` | MP4/MOV/HEIC sample tables, PNG, GIF, RIFF/AVI, TIFF/RAW, PDF, ZIP |
-| `formats/more.py` | MP3/MP2, FLAC, Ogg, MPEG-TS/MTS, MKV/WebM, SQLite, gzip, BMP: probe, exact length, honest check |
+| `formats/more.py` | MP3/MP2, FLAC, Ogg, MPEG-TS/MTS, MKV/WebM, SQLite, gzip, BMP: probe, exact length, honest check. Holds the registry (`KINDS`) for these and `extra.py` |
+| `formats/extra.py` | Old Office and other OLE2 files, MPEG program streams, RAR, 7z, Photoshop, AMR |
 | `validate.py` | Per-file checks; deep, fast and sampled modes; process pool; ZIP checksums |
 | `pipeline.py` | `scan()`: filesystem pass, carve, check, de-duplicate, rebuild, drop files that are part of other files |
-| `reassemble.py` | Rebuilds fragmented JPEGs: gap skipping, first-piece claims, seam scores |
-| `reassemble_video.py` | Rebuilds fragmented MP4/MOV from the video's own frame index |
-| `reassemble_stream.py` | Rebuilds fragmented MP3, MPEG-TS, Ogg, FLAC and gzip with resumable unit-by-unit walkers |
+| `reassemble.py` | Rebuilds fragmented JPEGs: gap skipping, first-piece claims, seam scores. `reassemble_all` runs every rebuilder in rounds (each file that checks out takes its clusters out of the others' way) and builds the maps they share: clusters in use or holding folders (blocked), and clusters of files saved but not proven (`soft_map`, tried last) |
+| `reassemble_video.py` | Rebuilds fragmented MP4/MOV from the video's own frame index; an unconfirmable stretch is filled with the fewest jumps (`_fewest_jumps`) and stays "check that it plays" |
+| `reassemble_stream.py` | Rebuilds fragmented MP3, MPEG-TS, Ogg, FLAC and gzip with resumable unit-by-unit walkers; a join counts only when a checksum or the recording's clock confirms it |
 | `organize.py`, `report.py` | Output folders, names, dates, `recovery.json`, self-contained `report.html` |
 | `triage.py`, `hunt.py` | Honest odds and don'ts; other places copies survive (Claude Code transcripts, git, editors, trash, snapshots) |
-| `selftest.py`, `simcard/` | Simulated FAT32/exFAT cards, test photos and videos, disaster scenarios; `simcard/files.py` builds real music, voice memo, dashcam, MKV, SQLite, gzip and BMP files from fixed seeds; `scenarios.mixed_device` is a randomized card shared by many devices |
+| `selftest.py`, `simcard/` | Simulated FAT32/exFAT cards, test photos and videos, disaster scenarios; `simcard/files.py` builds real music, voice memo, dashcam, camcorder, MKV, SQLite, gzip, BMP, Office 97, RAR, 7z and Photoshop files from fixed seeds; `scenarios.mixed_device` is a randomized card shared by many devices, `scenarios.single_kind` one holding a single kind |
 
 ## Conventions
 

@@ -64,6 +64,20 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
   - BMP, HEIC and WebM from deleted files are saved but labeled "not proven". HEIC's HEVC tiles and WebM's VP9 frames have no internal checks.
   - Not yet: NTFS/ext4/APFS names, 7z/RAR, OLE2 (old .doc/.xls), PSD, MPEG-PS (.MPG/.VOB).
 
+## Added on 6 November 2026 (second round, local session)
+
+- **Rebuilders use more evidence** (`reassemble.py`): clusters the filesystem marks in use or that hold folders (`dir_clusters`, `allocated_map()`) are nobody's deleted data; every rebuilder runs in rounds, so each file that checks out takes its clusters out of the others' way; clusters of files saved but not proven are tried last (`soft_map`). An MP4 stretch that no frame start can confirm is filled with the fewest jumps and stays "check that it plays".
+- **Files of one kind are told apart.** `scenarios.single_kind` (a dashcam, camcorder, music stick, voice recorder) showed rebuilds stitching in other recordings' pieces: on 4 cards each, 13 wrong `.MTS`, 30 wrong `.TS`, 9 wrong MP3. Now transport streams are checked against their own clocks (`more.TsClock`), a rebuilt MP3 or `.TS` is only called recovered when a clock confirmed every join, and AMR/MPEG-PS are only `ok` if never deleted. Same cards now: 0 wrong.
+- **More file types** (`formats/extra.py`): old Office (.doc/.xls/.ppt), Outlook .msg, Thumbs.db, MPEG program streams (.MPG/.VOB/.MOD), RAR 4 and 5, 7z, Photoshop, AMR.
+- `tools/eval_cards.py` runs the randomized cards (`mixed` and `one KIND`) and prints what came back and what's wrong.
+- **The scan skips blank space** (`carve._busy`, `carve._at_sectors`). The MPEG program-stream signature begins with zero bytes, and adding it to the signature regex made the regex try a match at nearly every byte of a card's free space: the self-test went from about 20 s to about 240 s a card. Headers that begin with zero bytes are now checked only at sector starts, and blocks of one repeated byte (zeros, or 0xFF, which some cards return for erased space) are never handed to the regex. A 0xFF-filled card was already slow before this round (4 s per 64 MB): now 64 MB of either takes 0.02 s. `tests/test_scan_speed.py` checks the time and that every header next to blank space is still found.
+- **AMR memos end where their sound ends.** A zero byte is a valid AMR frame header, so the blank rest of the last cluster was counted as silent frames and no carved memo came back byte for byte.
+- Still open from this round:
+  - A rebuilt MP3 can't prove its pieces (no clock, frames look alike), so it is saved as "check that it plays". Checking the bit reservoir (`main_data_begin` against the previous frame's data) could tie frames together.
+  - Fragmented SQLite and MKV/WebM aren't rebuilt. SQLite pages describe themselves (b-tree page types, child page numbers), so a page-by-page rebuild is feasible.
+  - The README's numbers still come only from the camera-photo self-test. The mixed and single-kind cards have no published numbers yet.
+  - One rebuilt photo is wrong on the photos-only cards (`tools/eval_cards.py one jpg 3`). It was already wrong before this round (same at `04ceddf`): a run of another photo's clusters decodes cleanly in its place. The photo's EXIF thumbnail shows the difference (its bottom rows come out 20 to 65 levels darker).
+
 ## Known limitations and open problems
 
 1. **Only simulated hardware so far.** Everything has run on card images, loop devices and CI disk images. Raw device reads on a real Mac and a real Windows PC are untested. So are permission prompts, failing cards and USB readers.
@@ -100,7 +114,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
   - The FAT32 driver process (`com.apple.fskit.msdos`) for the inner image is frozen. That image file sits on the outer disk, so neither can detach.
   - The old test ignored the detach result, so it still passed.
 - **Fixed in the test:** `_detach()` in `tests/test_guard_real.py` now retries once, then fails with a message naming every disk still attached. Two stubbed tests cover it.
-- [ ] Restart the Mac to clear the stuck `RACARD` and `RAINNER` disks. They can't be ejected.
+- [x] Clear the stuck `RACARD` and `RAINNER` disks (they were gone by 6 November). Until the test is fixed, running it on macOS 26 jams every disk-image operation on the Mac (`hdiutil`, `diskutil`, even app installs); deselect it locally.
 - [ ] After the restart, rerun `python -m pytest -q -rs tests/test_guard_real.py`.
   - If it fails on the detach every time, the nested FAT32 image hangs under FSKit. Consider an inner image with another filesystem (for example HFS+), still stored on the card.
 - [ ] Check whether CI's macOS job shows the same hang.

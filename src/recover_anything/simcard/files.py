@@ -150,24 +150,42 @@ def _psi(pid: int, table: bytes, cc: int) -> bytes:
 
 def make_ts(seed: int, packets: int = 4000, m2ts: bool = False) -> bytes:
     """A dashcam-style transport stream (or an AVCHD .MTS with 192-byte packets):
-    PAT and PMT up front and every 500 packets, video on PID 0x100."""
+    PAT and PMT up front and every 500 packets, video on PID 0x100 carrying the
+    programme clock (PCR) every 30 packets, audio on PID 0x101 mixed in
+    irregularly. Each recording's clocks start at a random point, as a
+    camera's free-running clock would."""
     rng = _rng("ts", seed)
     pat = bytes([0x00, 0xB0, 13, 0, 1, 0xC1, 0, 0]) + bytes([0, 1, 0xE1, 0x00])
-    pmt = bytes([0x02, 0xB0, 18, 0, 1, 0xC1, 0, 0, 0xE1, 0x00, 0xF0, 0]) + bytes([0x1B, 0xE1, 0x00, 0xF0, 0])
-    out, ccs, clock = [], {0: 0, 0x100: 0, 0x1000: 0}, rng.getrandbits(30)
+    pmt = bytes([0x02, 0xB0, 23, 0, 1, 0xC1, 0, 0, 0xE1, 0x00, 0xF0, 0]) + bytes([0x1B, 0xE1, 0x00, 0xF0, 0]) \
+        + bytes([0x0F, 0xE1, 0x01, 0xF0, 0])
+    out, ccs = [], {0: 0, 0x100: 0, 0x101: 0, 0x1000: 0}
+    ats = rng.getrandbits(30)
+    pcr = rng.getrandbits(33) * 300  # 27 MHz
+    per_packet = 5076  # 188 bytes at 8 Mbit/s, in 27 MHz ticks
+    video = 0
     for i in range(packets):
         if i % 500 == 0:
             pk = [_psi(0, pat, ccs[0]), _psi(0x1000, pmt, ccs[0x1000])]
             ccs[0] = (ccs[0] + 1) & 15
             ccs[0x1000] = (ccs[0x1000] + 1) & 15
+        elif rng.random() < 0.12:
+            pk = [bytes([0x47, 0x41 if rng.random() < 0.1 else 0x01, 0x01, 0x10 | ccs[0x101]]) + _noise(rng, 184)]
+            ccs[0x101] = (ccs[0x101] + 1) & 15
         else:
-            pusi = 0x40 if i % 50 == 1 else 0
-            pk = [bytes([0x47, pusi | 0x01, 0x00, 0x10 | ccs[0x100]]) + _noise(rng, 184)]
+            pusi = 0x40 if video % 50 == 0 else 0
+            if video % 30 == 0:  # adaptation field with the programme clock
+                base, ext = (pcr // 300) & ((1 << 33) - 1), pcr % 300
+                af = bytes([7, 0x10]) + ((base << 15) | (0x3F << 9) | ext).to_bytes(6, "big")
+                pk = [bytes([0x47, pusi | 0x01, 0x00, 0x30 | ccs[0x100]]) + af + _noise(rng, 184 - len(af))]
+            else:
+                pk = [bytes([0x47, pusi | 0x01, 0x00, 0x10 | ccs[0x100]]) + _noise(rng, 184)]
             ccs[0x100] = (ccs[0x100] + 1) & 15
+            video += 1
         for p in pk:
+            pcr += per_packet + rng.randint(-200, 200)
             if m2ts:
-                clock = (clock + 1500) & 0x3FFFFFFF
-                out.append(struct.pack(">I", clock) + p)
+                ats = (ats + 1728 + rng.randint(0, 200)) & 0x3FFFFFFF  # 192 bytes at about 24 Mbit/s
+                out.append(struct.pack(">I", ats) + p)
             else:
                 out.append(p)
     return b"".join(out)
