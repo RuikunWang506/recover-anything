@@ -12,11 +12,12 @@ from array import array
 
 
 class Result:
-    __slots__ = ("end", "complete", "ext", "reason", "kind", "break_pos", "refs")
+    __slots__ = ("end", "complete", "ext", "reason", "kind", "break_pos", "refs", "last")
 
-    def __init__(self, end, complete, ext, reason="ok", kind=None, break_pos=None, refs=()):
+    def __init__(self, end, complete, ext, reason="ok", kind=None, break_pos=None, refs=(), last=None):
         self.end, self.complete, self.ext, self.reason, self.kind, self.break_pos = end, complete, ext, reason, kind, break_pos
         self.refs = refs  # offsets (from the start) of files this one contains, e.g. a RAW's previews
+        self.last = last  # for streams: where the last checked frame or packet header is
 
 
 # ------------------------------------------------------------------ ISO BMFF

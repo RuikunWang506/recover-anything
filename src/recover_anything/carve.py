@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_right
 
-from .formats import jpeg, others
+from .formats import jpeg, more, others
 from .records import Found
 
 # kind, probe, max size, media group
@@ -22,12 +22,12 @@ FORMATS = [
     ("riff", others.probe_riff, 1 << 32, "video"),
     ("pdf", others.probe_pdf, 512 << 20, "document"),
     ("zip", others.probe_zip, 2 << 30, "document"),
-]
+] + [(k, v[0], v[3], v[4]) for k, v in more.KINDS.items()]
 GROUP = {k: g for k, _, _, g in FORMATS}
 # One container holds several kinds of file: an iPhone HEIC photo and a Canon
 # CR3 RAW are ISO BMFF like an MP4, a WAV recording is RIFF like an AVI.
 EXT_GROUP = {".heic": "photo", ".heif": "photo", ".avif": "photo", ".cr3": "photo", ".webp": "photo",
-             ".wav": "audio", ".m4a": "audio"}
+             ".wav": "audio", ".m4a": "audio", ".ogv": "video"}
 
 
 def group_of(kind: str, ext: str | None = None) -> str:
@@ -35,8 +35,12 @@ def group_of(kind: str, ext: str | None = None) -> str:
     return EXT_GROUP.get((ext or "").lower()) or GROUP.get(kind, "other")
 
 
-_SIG = re.compile(rb"\xff\xd8\xff|ftyp|\x89PNG|GIF8[79]a|II\*\x00|MM\x00\*|IIR[OS]|IIU\x00|RIFF|%PDF-|PK\x03\x04",
+_SIG = re.compile(rb"\xff\xd8\xff|ftyp|\x89PNG|GIF8[79]a|II\*\x00|MM\x00\*|IIR[OS]|IIU\x00|RIFF|%PDF-|PK\x03\x04"
+                  rb"|fLaC|OggS\x00|\x1a\x45\xdf\xa3|SQLite format 3\x00|\x1f\x8b\x08|BM.{4}\x00\x00\x00\x00"
+                  rb"|ID3[\x02-\x04]\x00|\xff[\xe2-\xe5\xf2-\xf5\xfa-\xfd]"
+                  rb"|\x47(?=.{187}\x47.{187}\x47|.{191}\x47.{191}\x47)",
                   re.DOTALL)
+HEAD = 1024  # bytes a probe may look at (a transport stream needs three packets)
 
 
 def identify(head: bytes):
@@ -57,9 +61,21 @@ def measure(src, kind: str, start: int, limit: int):
         return m.end, m.complete, ext, m.reason, m.break_pos, m.header
     fn = {"isobmff": others.measure_isobmff, "png": others.measure_png, "gif": others.measure_gif,
           "tiff": others.measure_tiff, "riff": others.measure_riff, "pdf": others.measure_pdf,
-          "zip": others.measure_zip}[kind]
+          "zip": others.measure_zip}.get(kind) or more.KINDS[kind][1]
     r = fn(read, start, limit)
     return r.end, r.complete, r.ext, r.reason, r.break_pos, None
+
+
+def _weak(kind: str, head: bytes) -> bool:
+    """Headers that also turn up inside other files: a bare MP3 frame header
+    (4 bytes), or a transport stream's tables, repeated every fraction of a
+    second through a recording (only a real start has its counter at 0)."""
+    if kind == "mp3":
+        return head[:3] != b"ID3"
+    if kind == "ts":
+        lay = more._ts_layout(head)
+        return not lay or head[lay[1] + 3] & 15 != 0
+    return False
 
 
 def find_headers(src, start: int, end: int, align: int, base: int, chunk: int = 16 << 20, progress=None):
@@ -68,19 +84,22 @@ def find_headers(src, start: int, end: int, align: int, base: int, chunk: int = 
     pos = start
     while pos < end:
         n = min(chunk, end - pos)
-        blob = src.read_uncached(pos, n + 16)
-        for mo in _SIG.finditer(blob, 0, n + 8):
+        blob = src.read_uncached(pos, n + HEAD)
+        for mo in _SIG.finditer(blob):
             j = mo.start()
-            if mo.group() == b"ftyp":
-                j -= 4
-            if j < 0 or j >= n:
-                continue
-            off = pos + j
-            if (off - base) % align:
-                continue
-            kind = identify(blob[j:j + 16])
-            if kind:
-                yield off, kind
+            if j >= n:
+                break
+            g = mo.group()
+            # where the file would start: 'ftyp' sits 4 bytes in; an AVCHD
+            # transport stream has a 4-byte timestamp before each packet
+            cands = (j - 4,) if g == b"ftyp" else (j, j - 4) if g == b"\x47" else (j,)
+            for c in cands:
+                if c < 0 or (pos + c - base) % align:
+                    continue
+                kind = identify(blob[c:c + HEAD])
+                if kind:
+                    yield pos + c, kind, _weak(kind, blob[c:c + HEAD])
+                    break
         pos += n
         if progress:
             progress(pos - start, end - start)
@@ -106,13 +125,26 @@ class Claimed:
 
 
 def carve(src, region_start: int, region_end: int, align: int, base: int, known_starts: set,
-          claimed: Claimed, progress=None, kinds=None):
+          claimed: Claimed, progress=None, kinds=None, inside_known=()):
     """Carve every recognizable file in a region. Returns Found records."""
     out = []
     region_end = min(region_end, getattr(src, "size", region_end) or region_end)
-    headers = list(find_headers(src, region_start, region_end, align, base, progress=progress))
+    found = list(find_headers(src, region_start, region_end, align, base, progress=progress))
+    headers = [(off, kind) for off, kind, _weak in found]
+    # A bare MP3 frame header is only 4 bytes and turns up by chance in other
+    # files' data; it doesn't count as "a file starts here" for rebuilding.
+    sure = [(off, kind) for off, kind, weak in found if not weak]
     starts = [h[0] for h in headers]
+    inside: dict = {}  # stream kind -> end of the last one measured
+    known_spans = list(inside_known)
+    ks = [k[0] for k in known_spans]
     for idx, (off, kind) in enumerate(headers):
+        if kind in more.STREAMS and off < inside.get(kind, -1):
+            continue  # a frame or packet in the middle of a recording already found
+        if kind in more.STREAMS and known_spans:
+            i = bisect_right(ks, off) - 1
+            if i >= 0 and known_spans[i][0] < off < known_spans[i][1] and known_spans[i][2] == kind:
+                continue  # ... or one the folders name
         if kinds and kind not in ("isobmff", "riff") and GROUP[kind] not in kinds:
             continue  # quick skip; containers that hold several kinds are decided after measuring
         if off in known_starts or claimed.covering(off) is not None:
@@ -127,6 +159,8 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
             continue  # a header we can't make sense of: skip it, keep going
         if length <= 0:
             continue
+        if kind in more.STREAMS:
+            inside[kind] = off + length
         if kinds and group_of(kind, ext) not in kinds:
             continue
         if kind != "jpeg" and not complete and length < 4096:
@@ -143,4 +177,4 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
         # Not claimed yet: a file that merely *looks* complete may be
         # fragmented, and the headers inside its span may be real files.
         # Embedded copies are dropped after validation (pipeline._drop_embedded).
-    return out, headers
+    return out, sure
