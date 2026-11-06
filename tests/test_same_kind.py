@@ -44,7 +44,7 @@ def test_another_clips_cluster_is_caught_by_the_clock(m2ts):
     assert more.validate_ts(_rd(spliced), len(spliced), True, layout_known=True)[0] != "ok"
 
 
-@pytest.mark.parametrize("kind,seed", [("mts", 1), ("ts", 1), ("mp3", 1)])
+@pytest.mark.parametrize("kind,seed", [("mts", 1), ("ts", 1), ("mp3", 1), ("mp4", 2)])
 def test_a_card_of_one_kind_marks_nothing_wrong(workdir, kind, seed):
     """Regression: on cards holding only dashcam clips, camcorder clips or
     songs, rebuilds stitched in pieces of other recordings and called the

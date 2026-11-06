@@ -150,9 +150,15 @@ def validate_isobmff(read, length: int, refs: set | None = None) -> tuple[str, s
                 t = (hdr >> 1) & 0x3F if hevc else hdr & 0x1F
                 if (hevc and t > 40) or (not hevc and t in (0, 24, 25, 26, 27, 28, 29, 30, 31)):
                     return "corrupt", "video frame %d (byte %d) has an impossible unit type" % (si, pos), pos
-            checked += 1
+                checked += 1
+            elif codec in MJPEG_CODECS and sz >= 3:
+                # every Motion-JPEG frame is a JPEG: it starts with FF D8 FF
+                if read(pos, 3) != b"\xff\xd8\xff":
+                    return "corrupt", "video frame %d (byte %d) is not where the index says" % (si, pos), pos
+                checked += 1
+            # other tracks (AAC audio, timecode...): the index can't be checked against their bytes
     if checked == 0:
-        return "unverified", "no sample tables", None
+        return "unverified", "its frames can't be checked one by one", None
     return "ok", "%d frames checked" % checked, None
 
 
