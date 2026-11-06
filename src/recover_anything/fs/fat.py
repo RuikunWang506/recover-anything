@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import struct
+import sys
 
 from ..records import Found, Geometry
 
@@ -137,10 +138,27 @@ class FatVolume:
         self.geometry = Geometry(self.data_offset, self.cluster_size, 2, self.cluster_count)
         self.fat = _LazyFat(src, self.fat_offset, self.cluster_count + 2, self.kind)
         self.visited_dirs: set[int] = set()
+        self.dir_clusters: set[int] = set()  # every cluster read as a folder's entries
 
     @property
     def eoc(self) -> int:
         return {"FAT12": 0xFF8, "FAT16": 0xFFF8, "FAT32": 0x0FFFFFF8}[self.kind]
+
+    def allocated_map(self) -> bytearray:
+        """One byte per cluster number: 1 if the allocation table says it is in use."""
+        from array import array
+        n = self.cluster_count + 2
+        if self.kind == "FAT12":
+            return bytearray(1 if self.fat[c] else 0 for c in range(n))
+        raw = self.src.read(self.fat_offset, n * (4 if self.kind == "FAT32" else 2))
+        a = array("I" if self.kind == "FAT32" else "H")
+        a.frombytes(raw[:len(raw) - len(raw) % a.itemsize])
+        if sys.byteorder == "big":
+            a.byteswap()
+        mask = 0x0FFFFFFF if self.kind == "FAT32" else 0xFFFF
+        out = bytearray(1 if v & mask else 0 for v in a)
+        out[0:2] = b"\0\0"
+        return out + bytearray(max(0, n - len(out)))
 
     def is_allocated(self, c: int) -> bool:
         return 0 <= c < len(self.fat) and self.fat[c] != 0
@@ -283,6 +301,7 @@ class FatVolume:
             return self.src.read(self.root_offset, self.root_size)
         clusters = self.chain(start, limit=4096) if live else None
         if clusters:
+            self.dir_clusters.update(clusters)
             return b"".join(self.src.read(self.cluster_offset(c), self.cluster_size) for c in clusters)
         # broken or deleted chain: read clusters while they still look like a directory
         out = []
@@ -293,6 +312,8 @@ class FatVolume:
                 break
             if out and (data[:11] == b".          " or not self.looks_like_dir_cluster(data)):
                 break
+            if self.looks_like_dir_cluster(data):
+                self.dir_clusters.add(c)
             out.append(data)
             if data[-32] == 0:
                 break
@@ -390,6 +411,7 @@ class FatVolume:
         names: dict[int, str] = {}
         parsed: dict[int, list] = {}
         for c in orphans:
+            self.dir_clusters.add(c)  # its '.' entry points to itself: certainly a folder
             try:
                 ents = list(self.parse_entries(self._dir_blob(c, live=False)))
             except Exception:

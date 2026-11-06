@@ -208,10 +208,61 @@ class _Video:
             full = nxt
         n = (total + cs - 1) // cs
         full = full[:n]
+        if self.ambiguous:
+            full = self._fewest_jumps(full, checks, fixed, v_end)
         st, why, _ = others.validate_isobmff(lambda o, k: self.vread(full, o, k), total)
         if st != "ok":
             return None
         return full, total, self.ambiguous
+
+    def _fewest_jumps(self, full, checks, fixed, v_end):
+        """Clusters that hold no frame start can't be checked, so any free
+        cluster fits there. A file is stored as runs of consecutive clusters,
+        so fill each unchecked stretch the way that needs the fewest jumps:
+        as it is, or part running on from the checked cluster before it and
+        the rest running up to the checked cluster after it. The file stays
+        'check that it plays'; this only makes it far more likely to play."""
+        cs = self.cs
+        conf = {0} | set(fixed) | set(range(v_end // cs, len(full)))
+        for o, _sz, _h in checks:
+            conf.update(range(o // cs, (o + 4) // cs + 1))
+        out = list(full)
+        used = set(out)
+
+        def free(c, mine):
+            return (0 < c < len(self.blocked) and not self.blocked[c] and (c not in used or c in mine)
+                    and self.plausible(c))
+
+        def jumps(seq):
+            return sum(1 for x, y in zip(seq, seq[1:]) if y != x + 1)
+
+        i = 1
+        while i < len(out):
+            if i in conf:
+                i += 1
+                continue
+            a = i
+            while i < len(out) and i not in conf:
+                i += 1
+            k = i - a
+            mine = set(out[a:i])
+            # the first t clusters run on from the left, the rest run up to the right
+            options = [out[a:i]]
+            for t in range(k + 1):
+                left = list(range(out[a - 1] + 1, out[a - 1] + 1 + t))
+                if t < k and i >= len(out):
+                    continue
+                right = list(range(out[i] - (k - t), out[i])) if t < k else []
+                if len(set(left + right)) == k:
+                    options.append(left + right)
+            ctx_after = out[i:i + 1]
+            best = min((opt for opt in options if all(free(c, mine) for c in opt)),
+                       key=lambda opt: jumps(out[a - 1:a] + opt + ctx_after))
+            if best != out[a:i]:
+                used -= mine
+                used |= set(best)
+                out[a:i] = best
+        return out
 
     def _materialize(self, path, fixed, upto):
         full = list(path)
@@ -371,15 +422,28 @@ class _Video:
         return None
 
 
-def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None) -> int:
+def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None, soft=None) -> int:
+    """Rebuild each video, first trying the clusters of files saved but not
+    proven only after every unclaimed one (`soft`), then without that
+    preference if the first try can't finish. Returns how many are now ok."""
+    from .reassemble import _or, own_clusters
     done = 0
     for r in records:
         start = geom.cluster_at(r.start)
         blocked[start] = 0
-        try:
-            out = _Video(src, geom, blocked, start).run(r.expected_size)
-        except Exception:
-            out = None
+        out = None
+        with own_clusters(geom, soft, r):
+            maps = [_or(blocked, soft), blocked] if soft is not None else [blocked]
+            for m in maps:
+                m[start] = 0
+                try:
+                    got = _Video(src, geom, m, start).run(r.expected_size)
+                except Exception:
+                    got = None
+                if got and not got[2]:
+                    out = got
+                    break
+                out = out or got  # an ambiguous rebuild: keep the first, try for a certain one
         blocked[start] = 1
         if not out:
             continue
@@ -389,9 +453,11 @@ def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None
         if ambiguous:
             r.status = "unverified"
             r.note = "rebuilt, but some pieces could not be confirmed; check that it plays"
+            r.meta["unsure_layout"] = True  # not evidence of where other files are
         else:
             r.status = "ok"
             r.note = "every frame position checked"
+            r.meta.pop("unsure_layout", None)
         pieces = _Assembler._pieces(clusters)
         if pieces > 1:
             r.meta["reassembled_from"] = pieces
@@ -399,5 +465,5 @@ def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None
                 r.origin = "reassembled"
         if r.status == "ok":
             own(r)
-        done += 1
+            done += 1
     return done
