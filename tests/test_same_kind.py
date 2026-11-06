@@ -44,7 +44,8 @@ def test_another_clips_cluster_is_caught_by_the_clock(m2ts):
     assert more.validate_ts(_rd(spliced), len(spliced), True, layout_known=True)[0] != "ok"
 
 
-@pytest.mark.parametrize("kind,seed", [("mts", 1), ("ts", 1), ("mp3", 1), ("mp4", 2), ("jpg", 3)])
+@pytest.mark.parametrize("kind,seed", [("mts", 1), ("ts", 1), ("mp3", 1), ("mp4", 2), ("jpg", 3),
+                                       ("pdf", 2), ("wav", 2), ("raw", 2), ("gif", 1)])
 def test_a_card_of_one_kind_marks_nothing_wrong(workdir, kind, seed):
     """Regression: on cards holding only dashcam clips, camcorder clips or
     songs, rebuilds stitched in pieces of other recordings and called the
@@ -52,7 +53,9 @@ def test_a_card_of_one_kind_marks_nothing_wrong(workdir, kind, seed):
     of camera videos, a carved MP4 whose index listed nothing checkable was
     called recovered because its boxes lined up. On a card of photos, a run of
     another photo's clusters decoded cleanly inside a rebuilt photo (its
-    thumbnail shows the difference)."""
+    thumbnail shows the difference). PDFs, recordings and RAW files from a
+    document stick, a voice recorder and a DSLR were called recovered on their
+    structure alone."""
     from recover_anything.pipeline import scan
     from recover_anything.simcard import scenarios
     sc = scenarios.single_kind(workdir, kind, seed)

@@ -443,3 +443,219 @@ def make_amr(seed: int, seconds: float = 20.0) -> bytes:
     """A phone voice memo: AMR-NB at 12.2 kbit/s, 50 frames a second."""
     rng = _rng("amr", seed)
     return b"#!AMR\n" + b"".join(bytes([(7 << 3) | 0x04]) + _noise(rng, 31) for _ in range(int(seconds * 50)))
+
+
+# ------------------------------------------------------------------ PDF
+_WORDS = ("the report shows that our plan for next year needs more time and money than we "
+          "thought so we will meet again on monday to agree on what comes first").split()
+
+
+def make_pdf(seed: int, pages: int = 4, image: bool = True, xref_stream: bool = False,
+             raw_streams: bool = False) -> bytes:
+    """A PDF as a word processor writes it: zlib-compressed page contents, an
+    embedded font, a compressed picture, a cross-reference table (or, as
+    newer writers do, a compressed cross-reference stream). `raw_streams`
+    stores the page contents uncompressed."""
+    rng = _rng("pdf", seed)
+
+    def stream(meta: bytes, raw: bytes, compress: bool = True) -> bytes:
+        z = zlib.compress(raw, 6) if compress else raw
+        flt = b" /Filter /FlateDecode" if compress else b""
+        return b"<< " + meta + flt + b" /Length %d >>\nstream\n" % len(z) + z + b"\nendstream"
+
+    objs = {}
+    page_ids = [7 + 2 * i for i in range(pages)]
+    objs[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    objs[2] = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(b"%d 0 R" % p for p in page_ids), pages)
+    objs[3] = b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial /FontDescriptor 4 0 R >>"
+    objs[4] = b"<< /Type /FontDescriptor /FontName /Arial /Flags 32 /FontFile2 5 0 R >>"
+    font = _noise(rng, rng.randint(20000, 60000))
+    objs[5] = stream(b"/Length1 %d" % len(font), font)
+    w, h = 64 * rng.randint(2, 6), 48 * rng.randint(2, 6)
+    pix = bytes((x * 255 // w + rng.randint(0, 40)) & 255 for _ in range(h) for x in range(w * 3))
+    objs[6] = stream(b"/Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB "
+                     b"/BitsPerComponent 8" % (w, h), pix)
+    for i, p in enumerate(page_ids):
+        lines = []
+        for k in range(rng.randint(20, 45)):
+            text = " ".join(rng.choice(_WORDS) for _ in range(rng.randint(6, 14)))
+            lines.append(b"BT /F1 11 Tf 72 %d Td (%s) Tj ET" % (740 - 15 * k, text.encode()))
+        if image and i == 0:
+            lines.append(b"q 200 0 0 150 72 60 cm /Im1 Do Q")
+        objs[p] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> "
+                   b"/XObject << /Im1 6 0 R >> >> /Contents %d 0 R >>" % (p + 1))
+        objs[p + 1] = stream(b"", b"\n".join(lines), not raw_streams)
+    n = max(objs) + 1
+    objs[n] = b"<< /Producer (Writer %d) /CreationDate (D:2026010%d120000) >>" % (seed, seed % 9 + 1)
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offs = {}
+    for k in sorted(objs):
+        offs[k] = len(out)
+        out += b"%d 0 obj\n" % k + objs[k] + b"\nendobj\n"
+    xref = len(out)
+    if xref_stream:
+        # one row per object: type, offset, generation; each row stored as its
+        # difference from the row above (the PNG 'up' predictor), then zlib
+        rows = [bytes([0]) + bytes(4) + b"\xff\xff"] + [bytes([1]) + struct.pack(">I", offs[k]) + bytes(2)
+                                                     for k in range(1, n + 1)] + [bytes([1]) + struct.pack(">I", xref) + bytes(2)]
+        prev, enc = bytes(7), b""
+        for r in rows:
+            enc += b"\x02" + bytes((a - b) & 255 for a, b in zip(r, prev))
+            prev = r
+        z = zlib.compress(enc)
+        out += (b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Info %d 0 R /Filter /FlateDecode "
+                b"/DecodeParms << /Columns 7 /Predictor 12 >> /Length %d >>\nstream\n" % (n + 1, n + 2, n, len(z))
+                + z + b"\nendstream\nendobj\nstartxref\n%d\n%%%%EOF\n" % xref)
+        return bytes(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (n + 1)
+    for k in range(1, n + 1):
+        out += b"%010d 00000 n \n" % offs[k]
+    out += b"trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n + 1, n, xref)
+    return bytes(out)
+
+
+# ------------------------------------------------------------------ Word
+def make_docx(seed: int, paragraphs: int = 60) -> bytes:
+    import io
+    import zipfile
+    rng = _rng("docx", seed)
+    body = "".join("<w:p><w:r><w:t>%s</w:t></w:r></w:p>" % " ".join(rng.choice(_WORDS) for _ in range(rng.randint(8, 30)))
+                   for _ in range(paragraphs))
+    members = {
+        "[Content_Types].xml": '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/'
+                               'content-types"><Override PartName="/word/document.xml" ContentType="application/'
+                               'vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+        "_rels/.rels": '<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/>'
+                       '</Relationships>',
+        "word/document.xml": '<?xml version="1.0"?><w:document><w:body>%s</w:body></w:document>' % body,
+        "docProps/core.xml": '<?xml version="1.0"?><cp:coreProperties><dc:creator>user %d</dc:creator>'
+                             '</cp:coreProperties>' % seed,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, text in members.items():
+            zi = zipfile.ZipInfo(name, (2026, 1, 1 + seed % 27, 12, 0, 0))
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(zi, text)
+        zi = zipfile.ZipInfo("word/media/image1.jpeg", (2026, 1, 1, 12, 0, 0))
+        z.writestr(zi, _noise(rng, rng.randint(5000, 80000)))  # a picture: stored, like Word does
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------------ WAV
+def make_wav(seed: int, seconds: float = 10.0, rate: int = 16000, channels: int = 1) -> bytes:
+    """A voice recorder's PCM recording (16-bit)."""
+    rng = _rng("wav", seed)
+    n = int(seconds * rate) * channels
+    data = bytearray(_noise(rng, 2 * n))
+    for i in range(1, len(data), 2):
+        data[i] = (data[i] >> 3) - 16 & 255 if data[i] & 1 else data[i] >> 4  # quiet: small sample values
+    fmt = struct.pack("<HHIIHH", 1, channels, rate, rate * channels * 2, channels * 2, 16)
+    info = b"INFO" + b"ISFT" + struct.pack("<I", 8) + b"Rec %03d" % (seed % 1000) + b"\0"
+    info += bytes(len(info) & 1)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + b"LIST" + struct.pack("<I", len(info)) + info \
+        + b"data" + struct.pack("<I", len(data)) + bytes(data) + bytes(len(data) & 1)
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+# ------------------------------------------------------------------ AVI
+def make_avi(seed: int, frames: int = 30, width: int = 320, height: int = 240) -> bytes:
+    """A Motion-JPEG AVI, as trail cameras and older digital cameras write:
+    every frame is a JPEG in a '00dc' chunk, with an idx1 index at the end."""
+    from .media import make_photo
+    rng = _rng("avi", seed)
+    jpegs = [make_photo(seed * 1000 + i, width=width, height=height, thumbnail=False, noise=4.0,
+                        quality=rng.choice([70, 80, 85])) for i in range(frames)]
+    movi = bytearray(b"movi")
+    idx = bytearray()
+    for j in jpegs:
+        idx += b"00dc" + struct.pack("<III", 0x10, len(movi), len(j))
+        movi += b"00dc" + struct.pack("<I", len(j)) + j + bytes(len(j) & 1)
+    big = max(len(j) for j in jpegs)
+    avih = struct.pack("<IIIIIIIIII4I", 66666, big * 15, 0, 0x10, frames, 0, 1, big, width, height, 0, 0, 0, 0)
+    strh = b"vidsMJPG" + struct.pack("<IHHIIIIIIIIhhhh", 0, 0, 0, 0, 1, 15, 0, frames, big, 10000, 0,
+                                     0, 0, width, height)
+    strf = struct.pack("<IiiHH4sIiiII", 40, width, height, 1, 24, b"MJPG", width * height * 3, 0, 0, 0, 0)
+    strl = b"strl" + b"strh" + struct.pack("<I", len(strh)) + strh + b"strf" + struct.pack("<I", len(strf)) + strf
+    hdrl = b"hdrl" + b"avih" + struct.pack("<I", len(avih)) + avih + b"LIST" + struct.pack("<I", len(strl)) + strl
+    body = b"AVI " + b"LIST" + struct.pack("<I", len(hdrl)) + hdrl + b"LIST" + struct.pack("<I", len(movi)) \
+        + bytes(movi) + b"idx1" + struct.pack("<I", len(idx)) + bytes(idx)
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+# ------------------------------------------------------------------ RAW
+def make_raw(seed: int, width: int = 1200, height: int = 800, raw_size: int = 1_500_000) -> bytes:
+    """A Canon-style CR2: a TIFF holding a full-size JPEG preview, a small
+    thumbnail and the sensor data (losslessly compressed: here noise after a
+    lossless-JPEG header)."""
+    from .media import make_photo
+    rng = _rng("raw", seed)
+    preview = make_photo(seed, width=width, height=height, thumbnail=False)
+    thumb = make_photo(seed, width=160, height=120, thumbnail=False, quality=75)
+    sensor = (b"\xff\xd8\xff\xc4\x00\x14\x00" + bytes(16) + b"\x00\xff\xc3\x00\x0e\x0e" + b"\x00" * 12
+              + bytes(b if b != 0xFF else 0xFE for b in _noise(rng, raw_size)) + b"\xff\xd9")
+    make, model = b"Canon\0", b"Canon EOS 90D\0"
+    when = b"2026:01:%02d 12:00:00\0" % (seed % 28 + 1)
+
+    def ifd(entries, at, nxt):
+        """entries: (tag, type, count, value bytes or int); returns (ifd bytes, data bytes)."""
+        head = struct.pack("<H", len(entries))
+        data = b""
+        dpos = at + 2 + 12 * len(entries) + 4
+        for tag, typ, count, val in entries:
+            if isinstance(val, bytes) and len(val) > 4:
+                head += struct.pack("<HHII", tag, typ, count, dpos + len(data))
+                data += val + bytes(len(val) & 1)
+            elif isinstance(val, bytes):
+                head += struct.pack("<HHI", tag, typ, count) + val.ljust(4, b"\0")
+            else:
+                head += struct.pack("<HHII", tag, typ, count, val)
+        return head + struct.pack("<I", nxt) + data
+
+    # layout: header 16 | IFD0 | EXIF IFD | IFD1 | IFD3 | thumbnail | preview | sensor data
+    def build(o):
+        ifd0_at = 16
+        ifd0 = ifd([(0x100, 3, 1, width), (0x101, 3, 1, height), (0x103, 3, 1, 6), (0x10F, 2, len(make), make),
+                    (0x110, 2, len(model), model), (0x111, 4, 1, o["preview"]), (0x112, 3, 1, 1),
+                    (0x117, 4, 1, len(preview)), (0x132, 2, len(when), when), (0x8769, 4, 1, o["exif"])],
+                   ifd0_at, o["ifd1"])
+        exif = ifd([(0x829A, 5, 1, struct.pack("<II", 1, 250)), (0x9003, 2, len(when), when)], o["exif"], 0)
+        ifd1 = ifd([(0x103, 3, 1, 6), (0x201, 4, 1, o["thumb"]), (0x202, 4, 1, len(thumb))], o["ifd1"], o["ifd3"])
+        ifd3 = ifd([(0x103, 3, 1, 6), (0x111, 4, 1, o["sensor"]), (0x117, 4, 1, len(sensor))], o["ifd3"], 0)
+        return [ifd0, exif, ifd1, ifd3]
+
+    o = dict(preview=0, exif=0, ifd1=0, ifd3=0, thumb=0, sensor=0)
+    for _ in range(2):  # sizes don't depend on the offsets, so two passes settle them
+        parts = build(o)
+        pos = 16
+        for name, p in zip(("ifd0", "exif", "ifd1", "ifd3"), parts):
+            o[name] = pos
+            pos += len(p) + (len(p) & 1)
+        o["thumb"] = pos
+        o["preview"] = pos + len(thumb) + (len(thumb) & 1)
+        o["sensor"] = o["preview"] + len(preview) + (len(preview) & 1)
+    parts = build(o)
+    out = b"II*\x00" + struct.pack("<I", 16) + b"CR\x02\x00" + struct.pack("<I", o["ifd3"])
+    for p in parts:
+        out += p + bytes(len(p) & 1)
+    out += thumb + bytes(len(thumb) & 1) + preview + bytes(len(preview) & 1) + sensor
+    return out
+
+
+# ------------------------------------------------------------------ GIF
+def make_gif(seed: int, width: int = 320, height: int = 240, frames: int = 1) -> bytes:
+    import io
+    from PIL import Image, ImageDraw
+    rng = _rng("gif", seed)
+    ims = []
+    for f in range(frames):
+        im = Image.new("RGB", (width, height), tuple(rng.randint(0, 255) for _ in range(3)))
+        d = ImageDraw.Draw(im)
+        for _ in range(12):
+            x0, y0 = rng.randint(0, width), rng.randint(0, height)
+            d.ellipse((x0, y0, x0 + rng.randint(10, 120), y0 + rng.randint(10, 90)),
+                      fill=tuple(rng.randint(0, 255) for _ in range(3)))
+        ims.append(im.convert("P", palette=Image.ADAPTIVE, colors=64))
+    buf = io.BytesIO()
+    ims[0].save(buf, "GIF", save_all=frames > 1, append_images=ims[1:], duration=120, loop=0)
+    return buf.getvalue()

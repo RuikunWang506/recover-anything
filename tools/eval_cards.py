@@ -45,8 +45,22 @@ def main(argv=None) -> int:
     kind = a.args[0] if a.what == "one" else None
     run = seeds(a.args[1] if a.what == "one" else a.args[0])
     tot, got_c, loose_c = collections.Counter(), collections.Counter(), collections.Counter()
-    wrong = frag_t = frag_g = 0
+    wrong = frag_t = frag_g = parts = 0
+    from recover_anything.simcard.exfat import ExfatCard
+    from recover_anything.simcard.fat32 import Fat32Card
+    written = []  # every file the card's devices wrote: a found file may be a piece of one
+
+    def logging(cls):
+        orig = cls.write_file
+
+        def write_file(self, path, data, *args, **kw):
+            written.append(data)
+            return orig(self, path, data, *args, **kw)
+        cls.write_file = write_file
+    logging(Fat32Card)
+    logging(ExfatCard)
     for seed in run:
+        written.clear()
         with tempfile.TemporaryDirectory() as d:
             sc = (scenarios.single_kind(d, kind, seed, fs=a.fs) if kind
                   else scenarios.mixed_device(d, seed, fs=a.fs))
@@ -63,6 +77,10 @@ def main(argv=None) -> int:
                     loose.add(h)
                     continue
                 if h not in ever:
+                    data = r.read(src)
+                    if any(len(w) > len(data) and data in w for w in written):
+                        parts += 1  # a real piece of a written file: a frame of a video, a preview in a RAW
+                        continue
                     wrong += 1
                     print("  WRONG: seed %d, %s %s (%s, %d bytes): %s" % (seed, r.kind, r.ext, r.origin, r.size, r.note))
                 ok[h] = r
@@ -84,6 +102,8 @@ def main(argv=None) -> int:
     print("recovered by type:", {e: "%d/%d" % (got_c[e], tot[e]) for e in sorted(tot)})
     print("saved exact but not proven:", dict(loose_c))
     print("fragmented files recovered: %d/%d" % (frag_g, frag_t))
+    if parts:
+        print("pieces of other files found on their own (a video's frame, a RAW's preview): %d" % parts)
     print("marked recovered but wrong: %d" % wrong)
     return 1 if wrong else 0
 

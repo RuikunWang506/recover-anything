@@ -172,6 +172,21 @@ class Claimed:
         return None
 
 
+def _measure_pdf(src, off: int, sure: list, region_end: int):
+    """A PDF's end is found by searching for its end marker, so the search
+    must not run into the next file on the card. Its compressed streams can
+    look like another file's header by chance, and it may hold a picture that
+    starts a sector: with no end marker before the next header, look on past
+    it, but never past the next PDF."""
+    i = bisect_right(sure, (off, "~"))
+    for k in range(i, min(i + 8, len(sure)) + 1):
+        stop = sure[k][0] if k < len(sure) else region_end
+        got = measure(src, "pdf", off, stop - off)
+        if got[0] > 0 or k == len(sure) or sure[k][1] == "pdf":
+            return got
+    return got
+
+
 def carve(src, region_start: int, region_end: int, align: int, base: int, known_starts: set,
           claimed: Claimed, progress=None, kinds=None, inside_known=()):
     """Carve every recognizable file in a region. Returns Found records."""
@@ -198,11 +213,11 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
         if off in known_starts or claimed.covering(off) is not None:
             continue
         nxt = starts[idx + 1] if idx + 1 < len(starts) else region_end
-        # A PDF's end is found by searching for its last end marker, so don't let
-        # the search run into the next file on the card.
-        limit = (nxt - off) if kind == "pdf" else region_end - off
         try:
-            length, complete, ext, reason, brk, header = measure(src, kind, off, limit)
+            if kind == "pdf":
+                length, complete, ext, reason, brk, header = _measure_pdf(src, off, sure, region_end)
+            else:
+                length, complete, ext, reason, brk, header = measure(src, kind, off, region_end - off)
         except Exception:
             continue  # a header we can't make sense of: skip it, keep going
         if length <= 0:

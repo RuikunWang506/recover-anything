@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ProcessPoolExecutor
 
-from .formats import jpeg, more, others
+from .formats import checks, jpeg, more, others
 from .records import Found
 
 
@@ -223,8 +223,15 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
             r.read, r.length, sized, after=src.read(o + n, 1024), grid=_grid(rec),
             layout_known=layout_known(rec))
         return
-    fn = {"png": others.measure_png, "gif": others.measure_gif, "riff": others.measure_riff,
-          "tiff": others.measure_tiff, "pdf": others.measure_pdf}.get(rec.kind)
+    check = {"pdf": checks.validate_pdf, "riff": checks.validate_riff, "tiff": checks.validate_tiff,
+             "gif": checks.validate_gif}.get(rec.kind)
+    if check is not None:
+        st, why, bad = check(r.read, r.length, layout_known=layout_known(rec), deep=deep)
+        rec.status, rec.note = st, why
+        rec.meta["check"] = "full" if st == "ok" and why != "structure checked" else "structure"
+        rec.meta["bad_at"] = bad
+        return
+    fn = {"png": others.measure_png}.get(rec.kind)
     if fn is None:
         rec.status = "unverified"
         rec.note = rec.note or "no check exists for this file type"

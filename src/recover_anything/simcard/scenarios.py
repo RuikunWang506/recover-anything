@@ -258,7 +258,8 @@ def mixed_device(workdir: str, seed: int, cluster_size: int = 4096, size: int = 
     return sc
 
 
-SINGLE_KINDS = ("mp3", "ts", "mts", "flac", "opus", "mp4", "jpg", "amr", "mpg", "doc")
+SINGLE_KINDS = ("mp3", "ts", "mts", "flac", "opus", "mp4", "jpg", "amr", "mpg", "doc",
+                "pdf", "docx", "wav", "avi", "raw", "gif")
 
 
 def _one_kind_file(kind: str, rng, n: int):
@@ -286,6 +287,18 @@ def _one_kind_file(kind: str, rng, n: int):
         return "MP_ROOT/MOV%03d.MOD" % n, F.make_ps(s, packs=rng.randint(200, 700))
     if kind == "doc":
         return "Documents/report%03d.doc" % n, F.make_ole(s, size=rng.randint(8000, 120000))
+    if kind == "pdf":
+        return "Documents/report%03d.pdf" % n, F.make_pdf(s, pages=rng.randint(2, 30))
+    if kind == "docx":
+        return "Documents/letter%03d.docx" % n, F.make_docx(s, paragraphs=rng.randint(20, 400))
+    if kind == "wav":
+        return "RECORD/REC%04d.WAV" % n, F.make_wav(s, seconds=rng.uniform(10, 120))
+    if kind == "avi":
+        return "DCIM/100MEDIA/IMAG%04d.AVI" % n, F.make_avi(s, frames=rng.randint(20, 80))
+    if kind == "raw":
+        return "DCIM/100CANON/IMG_%04d.CR2" % n, F.make_raw(s, raw_size=rng.randint(1_000_000, 3_000_000))
+    if kind == "gif":
+        return "Pictures/anim%03d.gif" % n, F.make_gif(s, frames=rng.randint(1, 8))
     raise ValueError(kind)
 
 

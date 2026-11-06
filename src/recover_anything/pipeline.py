@@ -207,6 +207,13 @@ class _Owner:
         return 0, set()
 
 
+def _can_claim(r: Found) -> bool:
+    """A file that checked out claims what it holds. A container whose contents
+    couldn't all be proven (a deleted RAW: its sensor data can't be checked)
+    still claims what its own structure points to, and nothing else."""
+    return r.status == "ok" or (r.status == "unverified" and r.kind in ("tiff", "riff", "isobmff", "zip"))
+
+
 def _drop_embedded(src, recs: list[Found]) -> None:
     """A file found inside another file that checked out is either part of it
     (a preview inside a RAW, a photo stored in a ZIP, a frame of a Motion-JPEG
@@ -215,7 +222,7 @@ def _drop_embedded(src, recs: list[Found]) -> None:
     is checked by structure only, and a fragmented one "contains" whatever
     happens to follow its first piece on the card."""
     import heapq
-    spans = sorted((o, o + n, i, r) for i, r in enumerate(recs) if r.status == "ok" and r.extents
+    spans = sorted((o, o + n, i, r) for i, r in enumerate(recs) if _can_claim(r) and r.extents
                    for o, n in r.extents)
     if not spans:
         return
