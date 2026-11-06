@@ -540,14 +540,8 @@ def rb_start_marked(src, geom, clusters, length, kind) -> bool:
     return w.start_marked
 
 
-def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=None, others=()) -> int:
-    soft = bytearray(len(blocked))
-    for o in others:  # saved but unproven, or the readable start of a broken file: probably theirs
-        if o.status in ("unverified", "partial", "corrupt") and o.extents and o not in records:
-            for off, n in o.extents:
-                c0, c1 = geom.cluster_at(off), geom.cluster_at(off + n - 1)
-                if 0 <= c0 <= c1 < len(soft):
-                    soft[c0:c1 + 1] = b"\x01" * (c1 - c0 + 1)
+def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=None, soft=None) -> int:
+    from .reassemble import own_clusters
     done = 0
     for r in records:
         start = geom.cluster_at(r.start)
@@ -555,8 +549,9 @@ def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=Non
         blocked[start] = 1
         rb = None
         try:
-            rb = _Rebuild(src, geom, blocked, r.kind, start, r.expected_size, soft)
-            out = rb.run()
+            with own_clusters(geom, soft, r):
+                rb = _Rebuild(src, geom, blocked, r.kind, start, r.expected_size, soft)
+                out = rb.run()
         except Exception:
             out = None
         if not out or not out[1]:

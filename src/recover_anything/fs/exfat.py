@@ -27,6 +27,9 @@ def _ts(v: int, ten_ms: int = 0):
         return None
 
 
+_BITS = [bytes((b >> i) & 1 for i in range(8)) for b in range(256)]  # a bitmap byte, one byte per cluster
+
+
 def entry_set_checksum(entries: bytes) -> int:
     ck = 0
     for i, b in enumerate(entries):
@@ -71,6 +74,7 @@ class ExfatVolume:
         self.geometry = Geometry(self.data_offset, self.cluster_size, 2, self.cluster_count)
         self.bitmap = None
         self.visited_dirs: set[int] = set()
+        self.dir_clusters: set[int] = set()  # every cluster read as a folder's entries
 
     def _fat(self, c: int) -> int:
         b = self.src.read(self.fat_offset + 4 * c, 4)
@@ -78,6 +82,15 @@ class ExfatVolume:
 
     def cluster_offset(self, c: int) -> int:
         return self.data_offset + (c - 2) * self.cluster_size
+
+    def allocated_map(self) -> bytearray:
+        """One byte per cluster number: 1 if the allocation bitmap says it is in use."""
+        n = self.cluster_count + 2
+        if self.bitmap is None:
+            return bytearray(n)
+        bits = b"".join(_BITS[b] for b in self.bitmap)
+        out = bytearray(b"\0\0") + bytearray(bits[:n - 2])
+        return out + bytearray(max(0, n - len(out)))
 
     def is_allocated(self, c: int) -> bool:
         if self.bitmap is None:
@@ -128,10 +141,15 @@ class ExfatVolume:
         if length:
             length = min(length, 256 << 20)  # the exFAT maximum for a directory
             ext, _ = self._data(first, length, no_fat_chain, live)
+            for o, n in ext:
+                c0, c1 = self.geometry.cluster_at(o), self.geometry.cluster_at(o + max(1, n) - 1)
+                self.dir_clusters.update(range(c0, c1 + 1))
             return b"".join(self.src.read(o, n) for o, n in ext)
         ch = self.chain(first, limit=4096) if live else None
         if ch:
+            self.dir_clusters.update(ch[:4096])
             return b"".join(self.src.read(self.cluster_offset(c), self.cluster_size) for c in ch[:4096])
+        self.dir_clusters.add(first)
         return self.src.read(self.cluster_offset(first), self.cluster_size)
 
     def parse_sets(self, blob: bytes):
@@ -254,6 +272,7 @@ class ExfatVolume:
                 parsed[d] = list(self.parse_sets(self.src.read(self.cluster_offset(d), cs)))
             except Exception:
                 continue
+            self.dir_clusters.add(d)
         names, parent = {}, {}
         for d, ents in parsed.items():
             for e in ents:
