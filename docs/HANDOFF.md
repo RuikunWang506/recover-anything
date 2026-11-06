@@ -80,6 +80,18 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 
 ## Next steps
 
+### 0. Open item: macOS disk-image test leaves disks attached (found 5 November 2026)
+
+- On a Mac running macOS 26, `test_mac_card_image_and_an_image_stored_on_it` left both test disks (`RACARD` and `RAINNER`) attached.
+  - `hdiutil detach -force` fails with "timeout for DiskArbitration expired".
+  - The FAT32 driver process (`com.apple.fskit.msdos`) for the inner image is frozen. That image file sits on the outer disk, so neither can detach.
+  - The old test ignored the detach result, so it still passed.
+- **Fixed in the test:** `_detach()` in `tests/test_guard_real.py` now retries once, then fails with a message naming every disk still attached. Two stubbed tests cover it.
+- [ ] Restart the Mac to clear the stuck `RACARD` and `RAINNER` disks. They can't be ejected.
+- [ ] After the restart, rerun `python -m pytest -q -rs tests/test_guard_real.py`.
+  - If it fails on the detach every time, the nested FAT32 image hangs under FSKit. Consider an inner image with another filesystem (for example HFS+), still stored on the card.
+- [ ] Check whether CI's macOS job shows the same hang.
+
 ### 1. Test on a real card (before any launch)
 
 1. Take a spare SD card and a camera. Shoot about 50 photos and a few videos.
