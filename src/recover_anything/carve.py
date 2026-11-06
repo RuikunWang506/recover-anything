@@ -38,9 +38,44 @@ def group_of(kind: str, ext: str | None = None) -> str:
 _SIG = re.compile(rb"\xff\xd8\xff|ftyp|\x89PNG|GIF8[79]a|II\*\x00|MM\x00\*|IIR[OS]|IIU\x00|RIFF|%PDF-|PK\x03\x04"
                   rb"|fLaC|OggS\x00|\x1a\x45\xdf\xa3|SQLite format 3\x00|\x1f\x8b\x08|BM.{4}\x00\x00\x00\x00"
                   rb"|ID3[\x02-\x04]\x00|\xff[\xe2-\xe5\xf2-\xf5\xfa-\xfd]"
-                  rb"|\x47(?=.{187}\x47.{187}\x47|.{191}\x47.{191}\x47)",
+                  rb"|\x47(?=.{187}\x47.{187}\x47|.{191}\x47.{191}\x47)"
+                  + more._extra.SIGNATURES,
                   re.DOTALL)
 HEAD = 1024  # bytes a probe may look at (a transport stream needs three packets)
+# Free space reads back as all zeros or all 0xFF, and no header can start in a
+# stretch of one repeated byte, so the scan skips such blocks.
+_BLANK = 64 << 10
+_BLANKS = (bytes(_BLANK), b"\xff" * _BLANK)
+
+
+def _busy(blob: bytes, n: int) -> list:
+    """The stretches of blob[:n] that aren't blank, as [start, end) pairs."""
+    spans: list = []
+    for s in range(0, n, _BLANK):
+        e = min(n, s + _BLANK)
+        if e - s == _BLANK and (blob.startswith(_BLANKS[0], s) or blob.startswith(_BLANKS[1], s)):
+            continue
+        if spans and spans[-1][1] == s:
+            spans[-1][1] = e
+        else:
+            spans.append([s, e])
+    return spans
+
+
+def _at_sectors(blob: bytes, n: int, first: int, align: int) -> list:
+    """Offsets first, first + align, ... below n where a header that begins with
+    zero bytes starts. One byte per sector is searched, so zeros cost nothing."""
+    out = []
+    for sig in more._extra.AT_SECTOR:
+        k = len(sig) - 1
+        col = blob[first + k:n + k:align]  # byte k of every sector
+        i = col.find(sig[k])
+        while i >= 0:
+            c = first + i * align
+            if blob.startswith(sig, c):
+                out.append(c)
+            i = col.find(sig[k], i + 1)
+    return out
 
 
 def identify(head: bytes):
@@ -68,13 +103,16 @@ def measure(src, kind: str, start: int, limit: int):
 
 def _weak(kind: str, head: bytes) -> bool:
     """Headers that also turn up inside other files: a bare MP3 frame header
-    (4 bytes), or a transport stream's tables, repeated every fraction of a
-    second through a recording (only a real start has its counter at 0)."""
+    (4 bytes), a transport stream's tables, repeated every fraction of a
+    second through a recording (only a real start has its counter at 0), or a
+    program stream's packs."""
     if kind == "mp3":
         return head[:3] != b"ID3"
     if kind == "ts":
         lay = more._ts_layout(head)
         return not lay or head[lay[1] + 3] & 15 != 0
+    if kind == "ps":
+        return True  # a program stream has a pack every 2 KB: one at a cluster start is usually mid-recording
     return False
 
 
@@ -85,21 +123,31 @@ def find_headers(src, start: int, end: int, align: int, base: int, chunk: int = 
     while pos < end:
         n = min(chunk, end - pos)
         blob = src.read_uncached(pos, n + HEAD)
-        for mo in _SIG.finditer(blob):
-            j = mo.start()
-            if j >= n:
-                break
-            g = mo.group()
-            # where the file would start: 'ftyp' sits 4 bytes in; an AVCHD
-            # transport stream has a 4-byte timestamp before each packet
-            cands = (j - 4,) if g == b"ftyp" else (j, j - 4) if g == b"\x47" else (j,)
-            for c in cands:
-                if c < 0 or (pos + c - base) % align:
-                    continue
+        hits: dict = {}
+        for s, e in _busy(blob, n):
+            # (a header may begin in the blank bytes just before a busy stretch)
+            for mo in _SIG.finditer(blob, max(0, s - 16), min(len(blob), e + HEAD)):
+                j = mo.start()
+                if j >= e:
+                    break
+                g = mo.group()
+                # where the file would start: 'ftyp' sits 4 bytes in; an AVCHD
+                # transport stream has a 4-byte timestamp before each packet
+                cands = (j - 4,) if g == b"ftyp" else (j, j - 4) if g == b"\x47" else (j,)
+                for c in cands:
+                    if c < 0 or c in hits or (pos + c - base) % align:
+                        continue
+                    kind = identify(blob[c:c + HEAD])
+                    if kind:
+                        hits[c] = kind
+                        break
+        for c in _at_sectors(blob, n, (base - pos) % align, align):
+            if c not in hits:
                 kind = identify(blob[c:c + HEAD])
                 if kind:
-                    yield pos + c, kind, _weak(kind, blob[c:c + HEAD])
-                    break
+                    hits[c] = kind
+        for c in sorted(hits):
+            yield pos + c, hits[c], _weak(hits[c], blob[c:c + HEAD])
         pos += n
         if progress:
             progress(pos - start, end - start)

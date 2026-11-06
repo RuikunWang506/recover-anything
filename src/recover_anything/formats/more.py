@@ -872,3 +872,10 @@ STREAMS = {"mp3", "ts"}
 # Checked unit by unit with nothing in between, so once a file checks out
 # every byte of it is accounted for.
 DENSE = {"flac", "ogg", "gzip", "mp3", "ts"}
+
+# Old Office documents, program streams, RAR/7z, Photoshop, AMR (formats/extra.py)
+from . import extra as _extra  # noqa: E402
+
+KINDS = {**{k: v for k, v in KINDS.items() if k != "mp3"}, **_extra.KINDS, "mp3": KINDS["mp3"]}
+STREAMS |= _extra.STREAMS
+DENSE |= _extra.DENSE

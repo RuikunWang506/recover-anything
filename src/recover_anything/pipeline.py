@@ -22,6 +22,9 @@ EXT_KIND = {
     ".mp3": "mp3", ".mp2": "mp3", ".flac": "flac", ".ogg": "ogg", ".opus": "ogg", ".oga": "ogg", ".ogv": "ogg",
     ".spx": "ogg", ".mts": "ts", ".m2ts": "ts", ".m2t": "ts", ".mkv": "mkv", ".webm": "mkv", ".mka": "mkv",
     ".sqlite": "sqlite", ".sqlite3": "sqlite", ".gz": "gzip", ".tgz": "gzip", ".bmp": "bmp",
+    # not .mod/.tod (also tracker music) or .msg (also plain mail text)
+    ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".rar": "rar", ".7z": "7z", ".psd": "psd", ".psb": "psd",
+    ".amr": "amr", ".awb": "amr", ".mpg": "ps", ".mpeg": "ps", ".vob": "ps",
 }
 
 
