@@ -435,6 +435,8 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
         pass
     _mark_unreadable(all_found, bad)
     res.found = [r for r in all_found if r.status != "embedded" and (include_live or not r.meta.get("live"))]
+    if kinds:  # --only: the files the folders name are filtered too, not just carved ones
+        res.found = [r for r in res.found if carver.group_of(r.kind, r.ext) in kinds]
     res.live_count = sum(1 for r in all_found if r.meta.get("live"))
     res.bad_ranges = bad
     res.seconds = time.time() - t0

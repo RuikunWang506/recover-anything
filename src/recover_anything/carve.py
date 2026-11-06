@@ -24,6 +24,17 @@ FORMATS = [
     ("zip", others.probe_zip, 2 << 30, "document"),
 ]
 GROUP = {k: g for k, _, _, g in FORMATS}
+# One container holds several kinds of file: an iPhone HEIC photo and a Canon
+# CR3 RAW are ISO BMFF like an MP4, a WAV recording is RIFF like an AVI.
+EXT_GROUP = {".heic": "photo", ".heif": "photo", ".avif": "photo", ".cr3": "photo", ".webp": "photo",
+             ".wav": "audio", ".m4a": "audio"}
+
+
+def group_of(kind: str, ext: str | None = None) -> str:
+    """'photo', 'video', 'audio', 'document' or 'other', from the file's own type."""
+    return EXT_GROUP.get((ext or "").lower()) or GROUP.get(kind, "other")
+
+
 _SIG = re.compile(rb"\xff\xd8\xff|ftyp|\x89PNG|GIF8[79]a|II\*\x00|MM\x00\*|IIR[OS]|IIU\x00|RIFF|%PDF-|PK\x03\x04",
                   re.DOTALL)
 
@@ -102,8 +113,8 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
     headers = list(find_headers(src, region_start, region_end, align, base, progress=progress))
     starts = [h[0] for h in headers]
     for idx, (off, kind) in enumerate(headers):
-        if kinds and GROUP[kind] not in kinds:
-            continue
+        if kinds and kind not in ("isobmff", "riff") and GROUP[kind] not in kinds:
+            continue  # quick skip; containers that hold several kinds are decided after measuring
         if off in known_starts or claimed.covering(off) is not None:
             continue
         nxt = starts[idx + 1] if idx + 1 < len(starts) else region_end
@@ -115,6 +126,8 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
         except Exception:
             continue  # a header we can't make sense of: skip it, keep going
         if length <= 0:
+            continue
+        if kinds and group_of(kind, ext) not in kinds:
             continue
         if kind != "jpeg" and not complete and length < 4096:
             continue
