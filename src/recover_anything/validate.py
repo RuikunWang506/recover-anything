@@ -203,9 +203,11 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
             m = others.measure_isobmff(r.read, 0, r.length)
             st = "ok" if m.complete else "partial"
             why = "structure checked" if m.complete else m.reason
-            if st == "ok" and (m.ext in (".heic", ".avif", ".cr3") or rec.ext in (".heic", ".avif", ".cr3")) \
-                    and not layout_known(rec):
-                st, why = "unverified", more.WEAK  # picture data has no checksums
+            if st == "ok" and not layout_known(rec):
+                # Nothing in it could be checked against its bytes (a HEIC picture,
+                # AAC audio, an index that lists no checkable frames): its boxes line
+                # up, but a deleted one may hold another file's data.
+                st, why = "unverified", more.WEAK
         rec.status, rec.note = st, why
         rec.meta["bad_at"] = pos
         return
