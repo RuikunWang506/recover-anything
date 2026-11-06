@@ -38,27 +38,44 @@ def same_cluster(grid, a: int, b: int) -> bool:
 OTHER_FILE = "its space now holds a different file (the data goes on past the size its folder entry gives)"
 
 
-def _runs_on(measure, read, length: int, after: bytes, grid) -> bool:
-    """A folder entry says the file ends at `length`, mid-cluster. If valid
-    frames carry on past that point inside the same cluster, the data there
-    isn't the file the entry describes: a newer file of the same kind took
-    its place."""
-    if not grid or not after:
+def _runs_on(read, length: int, after: bytes, grid, need: int, continues) -> bool:
+    """A folder entry says the file ends at `length`, mid-cluster. If the
+    recording carries on past that point inside the same cluster (the next
+    frame or packet starts right there and fits), the data isn't the file the
+    entry describes: a newer, longer file of the same kind took its place.
+    Only the next unit's first bytes are needed, so a nearly full cluster counts."""
+    if not grid or len(after) < need:
         return False
     ph, cs = grid
     room = (cs - (ph + length) % cs) % cs
-    if room < 16:
-        return False
-    tail = after[:room]
+    return room >= need and continues(read, length, after[:room])
 
-    def joined(o, n):  # the file's bytes, then what follows it in the same cluster
-        out = read(o, min(n, length - o)) if o < length else b""
-        if o + n > length:
-            t = max(0, o - length)
-            out += tail[t:t + (o + n - max(o, length))]
-        return out
-    m = measure(joined, 0, length + len(tail))
-    return m.end > length
+
+def _mp3_continues(read, length: int, tail: bytes) -> bool:
+    f, first = mp3_frame(tail[:4]), _mp3_first(read)
+    return f is not None and first is not None and f[1] == first[1]
+
+
+def _ts_continues(read, length: int, tail: bytes) -> bool:
+    lay = _ts_layout(read(0, 1024))
+    if not lay:
+        return False
+    stride, off = lay
+    if len(tail) < off + 4 or tail[off] != 0x47 or tail[off + 1] & 0x80:
+        return False
+    if off == 4:  # .MTS: the arrival time carries on from the last packet
+        last = int.from_bytes(read(length - stride, 4), "big") & 0x3FFFFFFF
+        if (int.from_bytes(tail[:4], "big") - last) & 0x3FFFFFFF > MAX_ATS_STEP:
+            return False
+    pid, c = ((tail[off + 1] & 0x1F) << 8) | tail[off + 2], tail[off + 3] & 15
+    if not (tail[off + 3] >> 4) & 1:
+        return off == 4
+    back = read(max(0, length - 64 * stride), min(length, 64 * stride))
+    for q in range(len(back) - stride, -1, -stride):  # the same stream's last packet before the end
+        h = back[q + off:q + off + 4]
+        if len(h) == 4 and h[0] == 0x47 and ((h[1] & 0x1F) << 8 | h[2]) == pid and (h[3] >> 4) & 1:
+            return c in ((h[3] + 1) & 15, h[3] & 15)  # its counter carries on
+    return off == 4
 
 
 def _sized_verdict(m: Result, length: int, sized: bool, ok_note: str, check: str, ends_here: bool = False,
@@ -235,7 +252,7 @@ def validate_mp3(read, length: int, sized: bool, after: bytes = b"", grid=None, 
     ends_here = (m.end == length and after[:3] != b"TAG" and same_cluster(grid, a, length + 3)
                  and (nxt is None or (first is not None and nxt[1] != first[1])))
     tail_ok = layout_known or same_cluster(grid, a, max(a, audio_end - 1))
-    if sized and m.end == length and after[:3] != b"TAG" and _runs_on(measure_mp3, read, length, after, grid):
+    if sized and m.end == length and after[:3] != b"TAG" and _runs_on(read, length, after, grid, 4, _mp3_continues):
         return "lost", OTHER_FILE, "structure"
     st = _sized_verdict(m, length, sized, "every frame checked", "structure", ends_here, tail_ok)
     if st[0] == "ok" and not sized and m.kind != "start":
@@ -400,6 +417,48 @@ def validate_ogg(read, length: int, sized: bool, **_):
 
 # ------------------------------------------------------------------ MPEG transport stream
 TS_MIN_PACKETS = 32
+PCR_WRAP = (1 << 33) * 300   # the programme clock, in 27 MHz ticks
+MAX_ATS_STEP = 270_000       # 10 ms between two packets of an AVCHD clip is already a very low bit rate
+
+
+class TsClock:
+    """The clocks a recording carries, which another recording's data won't
+    continue: the programme clock (PCR), which must run forward at a pace that
+    fits the bytes in between, and in a 192-byte-packet .MTS the arrival time
+    stamp in front of every packet. The 4-bit packet counter alone matches
+    another recording's data one time in 16."""
+
+    def __init__(self):
+        self.pcr_pid = None
+        self.pcr = None   # (value, packet number)
+        self.ats = None
+        self.checked = -1  # byte position of the last clock that checked out against an earlier one
+
+    def packet(self, pkt: bytes, off: int, n: int, pos: int) -> bool:
+        """pkt: the whole packet (with the 4-byte time stamp if off == 4)."""
+        if off == 4:
+            ats = int.from_bytes(pkt[:4], "big") & 0x3FFFFFFF
+            if self.ats is not None:
+                if (ats - self.ats) & 0x3FFFFFFF > MAX_ATS_STEP:
+                    return False
+                self.checked = pos
+            self.ats = ats
+        h = pkt[off:off + 12]
+        if len(h) >= 12 and h[3] & 0x20 and h[4] >= 7 and h[5] & 0x10:
+            pid = ((h[1] & 0x1F) << 8) | h[2]
+            if self.pcr_pid is None:
+                self.pcr_pid = pid
+            if pid == self.pcr_pid:
+                v = int.from_bytes(h[6:12], "big")
+                pcr = (v >> 15) * 300 + (v & 0x1FF)
+                if self.pcr is not None and not h[5] & 0x80:  # not a marked discontinuity
+                    d = (pcr - self.pcr[0]) % PCR_WRAP
+                    k = n - self.pcr[1]
+                    if not (k * 200 <= d <= min(5_400_000, k * 81_216 + 270_000)):
+                        return False
+                    self.checked = pos
+                self.pcr = (pcr, n)
+        return True
 
 
 def _ts_layout(head: bytes):
@@ -427,6 +486,7 @@ def measure_ts(read, start: int, limit: int) -> Result:
     ext = ".ts" if stride == 188 else ".mts"
     cc: dict = {}
     firsts: list = []  # each stream's first counter: a recorder starts every one at 0
+    clock = TsClock()
     pos, n, reason = 0, 0, "packets stop here"
     while pos + stride <= limit:
         blk = read(start + pos, min(stride * 4096, (limit - pos) // stride * stride))
@@ -453,6 +513,10 @@ def measure_ts(read, start: int, limit: int) -> Result:
                     bad = True
                     break
                 cc[pid] = c
+            if not clock.packet(blk[q:q + stride], off, n, pos):
+                reason = "the recording's clock jumps (another recording's data?)"
+                bad = True
+                break
             pos += stride
             n += 1
         if bad:
@@ -470,7 +534,7 @@ def validate_ts(read, length: int, sized: bool, after: bytes = b"", grid=None, l
     a = m.last if m.last is not None else 0
     ends_here = m.end == length and after[off:off + 1] != b"\x47" and same_cluster(grid, a, length + off + 3)
     tail_ok = layout_known or same_cluster(grid, a, max(a, m.end - 1))
-    if sized and m.end == length and _runs_on(measure_ts, read, length, after, grid):
+    if sized and m.end == length and _runs_on(read, length, after, grid, off + 4, _ts_continues):
         return "lost", OTHER_FILE, "structure"
     st = _sized_verdict(m, length, sized, "every packet checked", "structure", ends_here, tail_ok)
     if st[0] == "ok" and not sized and m.kind != "start":

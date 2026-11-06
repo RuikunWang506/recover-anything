@@ -55,6 +55,7 @@ class _Walker:
 
     strong = False  # a unit that checks out is the file's own beyond reasonable doubt
     need = 1        # bytes of the next unit needed to tell it isn't there
+    checked = -1    # for a weak kind: the last position where something tied the data to what came before
 
     def __init__(self, read, expected=None):
         self.read, self.expected = read, expected
@@ -129,6 +130,23 @@ class _Ts(_Walker):
         self.need = self.off + 4
         self.pos, self.cc, self.firsts = 0, {}, []
         self.start_marked = False
+        self.clock = more.TsClock()
+        self.n = 0
+
+    def snapshot(self):
+        snap = super().snapshot()
+        snap["clock"] = dict(self.clock.__dict__)
+        return snap
+
+    def restore(self, snap):
+        clock = snap.get("clock")
+        super().restore({k: v for k, v in snap.items() if k != "clock"})
+        self.clock = more.TsClock()
+        self.clock.__dict__.update(clock)
+
+    @property
+    def checked(self):
+        return self.clock.checked
 
     def advance(self, limit):
         read, stride, off = self.read, self.stride, self.off
@@ -149,9 +167,12 @@ class _Ts(_Walker):
                     self.firsts.append(c)
                 if prev is not None and not disc and c != (prev + 1) & 15 and c != prev:
                     bad = True
+            if not bad and not self.clock.packet(read(self.pos, stride), off, self.n, self.pos):
+                bad = True
             if bad:
                 self.unit = max(0, self.pos - stride)
                 return "bad"
+            self.n += 1
             if pid != 0x1FFF and afc & 1:
                 self.cc[pid] = c
             self.start_marked = bool(self.firsts) and not any(self.firsts)
@@ -573,8 +594,15 @@ def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=Non
         w = WALKERS[r.kind]
         sized = r.expected_size is not None and length == r.expected_size
         cs = geom.cluster_size
+        seams = [i * cs for i in range(1, len(clusters)) if clusters[i] != clusters[i - 1] + 1]
         if w.strong:
             r.status, r.note = "ok", "every piece checked"
+        elif seams and rb.w.checked <= max(seams):
+            # Frames of another recording of the same kind pass these checks, so a
+            # join is only certain once the recording's own clock carries on across it.
+            r.status = "unverified"
+            r.note = ("rebuilt from %d pieces, but nothing in this file type ties every piece to it; "
+                      "check that it plays" % pieces)
         elif rb.w.unit // cs != (length - 1) // cs:
             # the last frame's body runs into a cluster nothing else confirms
             r.status = "unverified"
