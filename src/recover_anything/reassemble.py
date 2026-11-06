@@ -92,6 +92,13 @@ class _Assembler:
             dec = jpeg.Decoder(h)
         except jpeg.JpegError:
             return None
+        thumb = None
+        if h.thumb:
+            try:
+                thumb = jpeg.Thumb(h, self.src.read(self.g.offset(start) + h.thumb[0], h.thumb[1]))
+            except Exception:
+                thumb = None  # no usable thumbnail: the decoder's checks are all there is
+        cap = None  # set when the picture stops matching its thumbnail at this MCU
         max_clusters = (expected_size + cs - 1) // cs + 2 if expected_size else (200 << 20) // cs
         path = [start]
         buf = bytearray(self.cluster(start))
@@ -113,7 +120,25 @@ class _Assembler:
                 path, buf = fixed
                 continue
             if st == "done":
-                return path, dec.end, "ok", "%d pieces" % self._pieces(path)
+                bad = self._unlike_thumb(thumb, dec, path)
+                if bad is None:
+                    return path, dec.end, "ok", "%d pieces" % self._pieces(path)
+                # Every block decodes, but an area of the picture isn't what its
+                # own thumbnail shows: a piece of another photo got in, somewhere
+                # in the clusters that area was decoded from.
+                breaks += 1
+                cap = bad[0] if cap is None else min(cap, bad[0])
+                if breaks > 64:
+                    break
+                lo = next((j for j in sorted(states) if states[j][5] > bad[0]), len(path) - 1)
+                k = next((j for j in sorted(states) if states[j][5] > bad[1]), len(path) - 1)
+                seams = [j for j in range(k, 0, -1) if path[j] != path[j - 1] + 1]
+                extra = list(range(k, max(0, lo - 1), -1))[:12] + seams[:8]
+                fixed = self._fix(dec, k * cs, path, buf, states, tried, mine, extra=extra)
+                if fixed is None:
+                    break
+                path, buf = fixed
+                continue
             states[len(path) - 1] = dec.save()
             if len(path) >= max_clusters:
                 break
@@ -124,13 +149,24 @@ class _Assembler:
             mine.add(nxt)
             buf += self.cluster(nxt)
             dec.buf = bytes(buf)
-        # could not finish: keep what decodes (the top of the picture)
-        good = max((k for k in states if k < len(path)), default=None)
+        # could not finish: keep what decodes (the top of the picture), and
+        # nothing from where it stopped matching its thumbnail
+        good = max((k for k in states if k < len(path) and (cap is None or states[k][5] <= cap)), default=None)
         if good is None:
             return None
         dec.restore(states[good])
         end = dec.pos
         return path[:good + 1], end, "partial", "only the top part of the picture could be recovered"
+
+    def _unlike_thumb(self, thumb, dec, path):
+        """The MCUs of the first area where a rebuilt picture doesn't match its
+        thumbnail, or None."""
+        if thumb is None or self._pieces(path) == 1:
+            return None
+        try:
+            return thumb.unlike(dec)
+        except Exception:
+            return None
 
     @staticmethod
     def _pieces(path):
@@ -150,11 +186,11 @@ class _Assembler:
         scored.sort(reverse=True)
         return [j for s, j in scored if s > ACCEPT_SCORE][:4]
 
-    def _fix(self, dec, err_pos, path, buf, states, tried, mine):
+    def _fix(self, dec, err_pos, path, buf, states, tried, mine, extra=()):
         cs = self.cs
         k = min(len(path) - 1, max(1, err_pos // cs))
         order = []
-        for j in self._suspects(dec, path, states, k) + [k, k - 1, k - 2]:
+        for j in self._suspects(dec, path, states, k) + [k, k - 1, k - 2] + list(extra):
             if 1 <= j < len(path) and j not in order:
                 order.append(j)
         for j in order:
@@ -203,8 +239,19 @@ class _Assembler:
         Stage 1 tries a few KB of every free cluster in order (cheap: most
         wrong clusters fail within bytes). Stage 2 fully decodes the most
         promising ones and keeps the one with the smoothest seam."""
-        cs = self.cs
         base = states[j - 1]
+        # Trials decode into the shared block table; put it back afterwards so a
+        # failed search leaves no other photo's blocks behind (seam scores and
+        # the thumbnail check read it).
+        i0 = dec.block_index(base[5])
+        saved = dec.dc[i0:]
+        try:
+            return self._search_from(dec, path, buf, base, j, rejected, mine)
+        finally:
+            dec.dc[i0:] = saved
+
+    def _search_from(self, dec, path, buf, base, j, rejected, mine):
+        cs = self.cs
         prefix = bytes(buf[:j * cs])
         m0 = base[5]
         c = path[j - 1]

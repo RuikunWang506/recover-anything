@@ -22,7 +22,7 @@ python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file 
 1. **Never write to the source.** Sources are opened read-only (`source.py`). No code path may open a source device or source image for writing.
 2. **The save guard fails closed.** `devices.check_output(source, out_dir)` must prove that writes into the output can't land on the source. It follows every layer: partitions, LVM/LUKS/RAID, loop devices and the image files behind them, overlay and FUSE folders, btrfs and ZFS member disks. On Windows it also follows links, junctions, `\\?\` paths and shares served by the machine itself. On macOS it follows APFS containers and attached disk images. If it can't tell, it refuses. A reason containing a word in `devices.DEFINITE` ("same disk", "folder", "itself") can never be waved through by `--trust-output-location`.
 3. **"ok" means verified.**
-   - A file is only marked recovered when its check passed. For a JPEG, it decoded to its last block with the right block count. For a video, every frame start matched its index. For a PNG or ZIP, the checksums matched.
+   - A file is only marked recovered when its check passed. For a JPEG, it decoded to its last block with the right block count, and a deleted or rebuilt one also matches the thumbnail the camera stored in it (`jpeg.Thumb`): the decoder falls back into step after damage, so a run of another photo's data can decode cleanly. For a video, every frame start matched its index. For a PNG or ZIP, the checksums matched.
    - Everything else is `partial`, `corrupt` or `unverified`, saved under "Partly recovered" with a label.
    - The stress test counts files "marked recovered but wrong". That count must stay 0. So must the `mixed_device` scenarios (`tests/test_more_formats.py`).
    - A type with no checksums (BMP, HEIC/AVIF/CR3 pictures, VP8/VP9/AV1 video) is `ok` only for a file that was never deleted (`validate.layout_known`): a deleted file's clusters can be reused and freed again without a trace.
@@ -46,13 +46,13 @@ python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file 
 | `volume.py` | MBR/GPT, filesystem detection, backup boot sectors |
 | `fs/fat.py`, `fs/exfat.py` | Folder walk including deleted entries, and folders that survived a format; `dir_clusters` and `allocated_map()` tell the rebuilders which clusters can't hold deleted data |
 | `carve.py` | Signature scan of every 512-byte sector, exact length of each hit. Blank blocks (all zeros or all 0xFF) are skipped, and headers that begin with zero bytes are checked only at sector starts (`AT_SECTOR`): never add a zero-led signature to the regex |
-| `formats/jpeg.py` | JPEG header parser, length measurement, resumable pure-Python baseline decoder |
+| `formats/jpeg.py` | JPEG header parser, length measurement, resumable pure-Python baseline decoder, and the EXIF-thumbnail check (`Thumb`: every block's brightness against the thumbnail, over runs of MCUs in decoding order) |
 | `formats/others.py` | MP4/MOV/HEIC sample tables, PNG, GIF, RIFF/AVI, TIFF/RAW, PDF, ZIP |
 | `formats/more.py` | MP3/MP2, FLAC, Ogg, MPEG-TS/MTS, MKV/WebM, SQLite, gzip, BMP: probe, exact length, honest check. Holds the registry (`KINDS`) for these and `extra.py` |
 | `formats/extra.py` | Old Office and other OLE2 files, MPEG program streams, RAR, 7z, Photoshop, AMR |
 | `validate.py` | Per-file checks; deep, fast and sampled modes; process pool; ZIP checksums |
 | `pipeline.py` | `scan()`: filesystem pass, carve, check, de-duplicate, rebuild, drop files that are part of other files |
-| `reassemble.py` | Rebuilds fragmented JPEGs: gap skipping, first-piece claims, seam scores. `reassemble_all` runs every rebuilder in rounds (each file that checks out takes its clusters out of the others' way) and builds the maps they share: clusters in use or holding folders (blocked), and clusters of files saved but not proven (`soft_map`, tried last) |
+| `reassemble.py` | Rebuilds fragmented JPEGs: gap skipping, first-piece claims, seam scores; a finished picture that doesn't match its thumbnail sends the search back to where it stops matching. `reassemble_all` runs every rebuilder in rounds (each file that checks out takes its clusters out of the others' way) and builds the maps they share: clusters in use or holding folders (blocked), and clusters of files saved but not proven (`soft_map`, tried last) |
 | `reassemble_video.py` | Rebuilds fragmented MP4/MOV from the video's own frame index; an unconfirmable stretch is filled with the fewest jumps (`_fewest_jumps`) and stays "check that it plays" |
 | `reassemble_stream.py` | Rebuilds fragmented MP3, MPEG-TS, Ogg, FLAC and gzip with resumable unit-by-unit walkers; a join counts only when a checksum or the recording's clock confirms it |
 | `organize.py`, `report.py` | Output folders, names, dates, `recovery.json`, self-contained `report.html` |
