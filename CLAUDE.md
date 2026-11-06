@@ -50,6 +50,7 @@ python tools/debug_card.py 11             # rebuild one stress card and explain 
 | `pipeline.py` | `scan()`: filesystem pass, carve, check, de-duplicate, rebuild, drop files that are part of other files |
 | `reassemble.py` | Rebuilds fragmented JPEGs: gap skipping, first-piece claims, seam scores |
 | `reassemble_video.py` | Rebuilds fragmented MP4/MOV from the video's own frame index |
+| `reassemble_stream.py` | Rebuilds fragmented MP3, MPEG-TS, Ogg, FLAC and gzip with resumable unit-by-unit walkers |
 | `organize.py`, `report.py` | Output folders, names, dates, `recovery.json`, self-contained `report.html` |
 | `triage.py`, `hunt.py` | Honest odds and don'ts; other places copies survive (Claude Code transcripts, git, editors, trash, snapshots) |
 | `selftest.py`, `simcard/` | Simulated FAT32/exFAT cards, test photos and videos, disaster scenarios; `simcard/files.py` builds real music, voice memo, dashcam, MKV, SQLite, gzip and BMP files from fixed seeds; `scenarios.mixed_device` is a randomized card shared by many devices |
