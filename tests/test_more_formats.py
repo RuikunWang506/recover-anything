@@ -180,6 +180,49 @@ def test_a_newer_heic_in_an_old_videos_space_is_not_that_video(workdir):
     assert not [r for r in res.found if r.status == "ok" and r.kind == "isobmff" and r.ext == ".heic"]
 
 
+def test_fragmented_recordings_and_archives_are_rebuilt(workdir):
+    """Delete every other file, then save bigger ones that fill the holes (so
+    each is split), then camera-format: no names, no chains. Checksummed
+    types must come back whole from their pieces."""
+    img = os.path.join(workdir, "frag.img")
+    makers = [lambda i: F.make_flac(i, seconds=3), lambda i: F.make_gzip(i, lines=9000),
+              lambda i: F.make_ogg(i, seconds=40), lambda i: F.make_mp3(i, seconds=12)]
+    keep = {}
+    with Fat32Card(img, **SMALL) as card:
+        card.write_file("filler.bin", b"\0" * 65536)
+        for i in range(12):
+            card.write_file("A/f%02d.bin" % i, F.make_bmp(i, width=200, height=100))
+        for i in range(0, 12, 2):
+            card.delete("A/f%02d.bin" % i)
+        for i in range(8):
+            d = makers[i % 4](100 + i)
+            cl = card.write_file("B/g%02d" % i, d)
+            if any(b != a + 1 for a, b in zip(cl, cl[1:])):
+                keep[sha(d)] = i % 4
+        card.format(recreate_dirs=["A", "B"])
+    assert {0, 1, 2} <= set(keep.values()), "test setup should fragment a FLAC, a gzip and an Ogg"
+    res = scan(img, workers=1)
+    got = recovered_hashes(res)
+    for h, k in keep.items():
+        if k in (1, 3):
+            # gzip: garbage often decodes as "copy earlier text", so only the final checksum
+            # catches it and can't say where; an MP3 may honestly stay "check that it plays"
+            continue
+        assert h in got, "kind %d not rebuilt" % k
+        assert got[h].meta.get("reassembled_from", 1) > 1
+
+
+def test_a_walker_rewinds_to_exactly_where_it_was():
+    """Regression: a snapshot shared the walker's set of open Ogg streams, so
+    rewinding after a failed trial started from a later state."""
+    from recover_anything.reassemble_stream import _Ogg, _Ts
+    for d, W in ((F.make_ogg(4), _Ogg), (F.make_ts(4), _Ts)):
+        w = W(lambda o, n, d=d: d[o:o + n])
+        snap = w.snapshot()
+        w.advance(len(d) // 2)
+        w.restore(snap)
+        fresh = W(lambda o, n, d=d: d[o:o + n])
+        assert w.advance(len(d)) == fresh.advance(len(d)) and w.pos == fresh.pos
 
 
 def test_a_newer_clip_in_a_deleted_clips_space_is_not_that_clip(workdir):

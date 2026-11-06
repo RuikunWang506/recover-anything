@@ -51,6 +51,19 @@ Two independent reviews tried to break the tool on purpose. Don't reintroduce an
 
 The first review's fixes (the fail-closed guard, crash-proof parsers and honest labels) are in commit `e662cc6`. In the second review, the parsers survived 320,000 random format mutations and 5,000 randomized card scans without a crash or a hang.
 
+## Added on 5 November 2026 (local session, not yet committed)
+
+- **New file types:** MP3/MP2, FLAC, Ogg (Opus, Vorbis), MPEG-TS and AVCHD `.MTS`, MKV/WebM, SQLite, gzip, BMP (`formats/more.py`). Each one is measured to its exact length and checked: Ogg, FLAC and gzip by their checksums, SQLite with `PRAGMA integrity_check` on a temporary copy, H.264/H.265 in MKV frame by frame, MP3 and MPEG-TS frame by frame.
+- **Folders by what a file is:** HEIC/AVIF/CR3 go to Photos (they were in Videos), WAV/M4A/MP3/FLAC/Ogg to a new Audio folder. `--only` now also filters files the folders name, and accepts `audio`.
+- **Rebuilding fragmented recordings and archives** (`reassemble_stream.py`): MP3, MPEG-TS, Ogg, FLAC, gzip.
+- **Randomized mixed-device cards** (`scenarios.mixed_device`): photos, videos, music, voice memos, dashcam and camcorder clips, screen recordings, databases, logs and scans, 3 rounds of save/delete, formatted. On 20 FAT32 cards and 8 exFAT cards, nothing was marked recovered that wasn't byte for byte a real file (numbers in the commit message).
+- **Honesty rules found by those cards** (see CLAUDE.md rule 3): no-checksum types need a never-deleted file; stream ends and starts must be proven; a newer file of the same container (HEIC in an old MP4's space) or the same kind (a longer clip in an old clip's space) no longer passes as the old file.
+- Still open from this work:
+  - Fragmented gzip: garbage often decodes as "copy earlier text", so only the final checksum catches it and can't say which cluster was wrong. It never produces a wrong file, but rebuilding is hit or miss.
+  - Fragmented MKV/WebM and SQLite aren't rebuilt yet. SQLite pages describe themselves, so a page-by-page rebuild is feasible.
+  - BMP, HEIC and WebM from deleted files are saved but labeled "not proven". HEIC's HEVC tiles and WebM's VP9 frames have no internal checks.
+  - Not yet: NTFS/ext4/APFS names, 7z/RAR, OLE2 (old .doc/.xls), PSD, MPEG-PS (.MPG/.VOB).
+
 ## Known limitations and open problems
 
 1. **Only simulated hardware so far.** Everything has run on card images, loop devices and CI disk images. Raw device reads on a real Mac and a real Windows PC are untested. So are permission prompts, failing cards and USB readers.
@@ -64,7 +77,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
      - Assign fragments jointly across all broken photos.
    - Use `tools/debug_card.py` to see why a photo missed.
 4. **Weakly checked files still block clusters while photos are rebuilt.** This covers RAW, PDF, HEIC, GIF and RIFF, and keeps the search fast. A fragmented RAW can therefore hide another photo's piece, and that photo is saved as partial.
-5. **Video rebuilding** covers MP4/MOV/M4V/3GP with an H.264 or HEVC index. `_materialize` and `_check` rebuild sets on every step, which may be slow for multi-GB videos on small clusters (untested at that size). AVCHD (`.MTS`) isn't supported.
+5. **Video rebuilding** covers MP4/MOV/M4V/3GP with an H.264 or HEVC index. `_materialize` and `_check` rebuild sets on every step, which may be slow for multi-GB videos on small clusters (untested at that size). AVCHD (`.MTS`) is found and rebuilt by `reassemble_stream.py`.
 6. **Containers that don't point to their contents.** Some previews may appear as extra photos: Nikon MakerNote previews, CR3 previews, JPEGs inside H.264 MP4s. These are duplicates, not losses.
 7. **Carving edge cases:**
    - A PDF is measured only up to the next carved header, so a PDF holding a sector-aligned JPEG is cut short.

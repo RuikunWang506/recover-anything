@@ -294,7 +294,11 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
         broken = [r for r in mine if r.kind == "jpeg" and r.status in ("corrupt", "partial") and aligned(r)]
         videos = [r for r in mine if r.kind == "isobmff" and r.status in ("corrupt", "partial") and aligned(r)
                   and r.ext not in (".heic", ".avif", ".cr3")]
-        if not broken and not videos:
+        from .formats.more import NOT_PROVEN
+        from .reassemble_stream import WALKERS
+        streams = [r for r in mine if r.kind in WALKERS and aligned(r)
+                   and (r.status in ("corrupt", "partial") or (r.status == "unverified" and r.note == NOT_PROVEN))]
+        if not broken and not videos and not streams:
             continue
         blocked = bytearray(g.last_cluster + 2)
         blocked[0:2] = b"\x01\x01"
@@ -394,6 +398,9 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
         if videos:
             from .reassemble_video import reassemble_videos
             reassemble_videos(src, g, blocked, sorted(videos, key=lambda r: r.start), own)
+        if streams:
+            from .reassemble_stream import reassemble_streams
+            reassemble_streams(src, g, blocked, sorted(streams, key=lambda r: r.start), own, others=mine)
         for r in todo:
             if r.status == "corrupt":
                 # keep the readable top of the picture rather than nothing
