@@ -12,6 +12,7 @@ import random
 import sqlite3
 import struct
 import tempfile
+import zlib
 
 from ..formats.more import _CRC16, crc8, crc32_msb
 
@@ -272,3 +273,155 @@ def make_heic(seed: int, size: int = 900000) -> bytes:
     meta = struct.pack(">I", 8 + len(meta_body)) + b"meta" + meta_body
     mdat = struct.pack(">I", 8 + size) + b"mdat" + _noise(rng, size)
     return ftyp + meta + mdat
+
+
+# ------------------------------------------------------------------ OLE2 (old Office)
+def make_ole(seed: int, kind: str = "doc", size: int = 40000) -> bytes:
+    """A compound file like Word 97-2003 writes: allocation table, folder,
+    and streams (all at least 4 KB, so no small-stream table is needed)."""
+    rng = _rng("ole", seed)
+    ss = 512
+    names = {"doc": ["WordDocument", "1Table", "\x05SummaryInformation"],
+             "xls": ["Workbook", "\x05SummaryInformation", "\x05DocumentSummaryInformation"],
+             "ppt": ["PowerPoint Document", "Current User", "\x05SummaryInformation"]}[kind]
+    streams = [_noise(rng, size)] + [_noise(rng, 4096 + rng.randint(0, 6000)) for _ in names[1:]]
+    data_secs = [(len(s) + ss - 1) // ss for s in streams]
+    ndir = 1
+    nfat = 1
+    while (sum(data_secs) + ndir + nfat) > nfat * (ss // 4):
+        nfat += 1
+    fat = [0xFFFFFFFD] * nfat + [0xFFFFFFFE] * ndir  # allocation sectors, then the folder (one sector)
+    starts = []
+    for n in data_secs:
+        first = len(fat)
+        starts.append(first)
+        fat += list(range(first + 1, first + n)) + [0xFFFFFFFE]
+    fat += [0xFFFFFFFF] * (nfat * (ss // 4) - len(fat))
+
+    def entry(name, typ, left, right, child, start, sz):
+        raw = (name.encode("utf-16-le") + b"\0\0") if name else b""
+        e = raw.ljust(64, b"\0") + struct.pack("<HBB", len(raw), typ, 1) + struct.pack("<III", left, right, child)
+        e += b"\0" * 16 + b"\0" * 4 + b"\0" * 16 + struct.pack("<IQ", start, sz)
+        return e
+
+    F_ = 0xFFFFFFFF
+    dirs = [entry("Root Entry", 5, F_, F_, 1, 0xFFFFFFFE, 0)]
+    for i, (nm, st, s) in enumerate(zip(names, starts, streams)):
+        dirs.append(entry(nm, 2, F_, i + 2 if i + 2 <= len(names) else F_, F_, st, len(s)))
+    folder = b"".join(dirs).ljust(ss, b"\0")
+    hdr = OLE_SIGNATURE + b"\0" * 16 + struct.pack("<HHHHH", 0x3E, 3, 0xFFFE, 9, 6) + b"\0" * 6
+    hdr += struct.pack("<IIIIIIIII", 0, nfat, nfat, 0, 4096, 0xFFFFFFFE, 0, 0xFFFFFFFE, 0)
+    hdr += struct.pack("<109I", *(list(range(nfat)) + [0xFFFFFFFF] * (109 - nfat)))
+    body = struct.pack("<%dI" % len(fat), *fat) + folder
+    body += b"".join(s.ljust(n * ss, b"\0") for s, n in zip(streams, data_secs))
+    return hdr + body
+
+
+OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+# ------------------------------------------------------------------ MPEG program stream
+def _scr(scr: int) -> bytes:
+    return bytes([0x40 | ((scr >> 27) & 0x38) | 0x04 | ((scr >> 28) & 0x03), (scr >> 20) & 0xFF,
+                  ((scr >> 12) & 0xF8) | 0x04 | ((scr >> 13) & 0x03), (scr >> 5) & 0xFF,
+                  ((scr << 3) & 0xF8) | 0x04, 0x01])
+
+
+def make_ps(seed: int, packs: int = 400, first_clock: int = 0, end_code: bool = True) -> bytes:
+    """An MPEG-2 program stream as DVD camcorders write: 2048-byte packs, each
+    a pack header and one video packet; a system header in the first."""
+    rng = _rng("ps", seed)
+    mux = struct.pack(">I", (25200 << 2) | 3)[1:]
+    out, clock = [], first_clock
+    for i in range(packs):
+        pk = b"\x00\x00\x01\xba" + _scr(clock) + mux + b"\xf8"
+        if i == 0:
+            sh = b"\x80\x01\x01\x04\xe1\xff" + b"\xe0\xe0\xe8"
+            pk += b"\x00\x00\x01\xbb" + struct.pack(">H", len(sh)) + sh
+        n = 2048 - len(pk) - 6
+        pes = b"\x81\x80\x05" + bytes([0x21 | ((clock >> 29) & 0x0E), 0, 1, 0, 1]) + _noise(rng, n - 8)
+        pk += b"\x00\x00\x01\xe0" + struct.pack(">H", n) + pes
+        out.append(pk)
+        clock += 300 + rng.randint(0, 40)
+    return b"".join(out) + (b"\x00\x00\x01\xb9" if end_code else b"")
+
+
+# ------------------------------------------------------------------ RAR
+def make_rar(seed: int, files: int = 3, version: int = 4) -> bytes:
+    """A RAR archive of stored (uncompressed) files."""
+    rng = _rng("rar", seed)
+    items = [("photo%02d.txt" % i, ("note %d from seed %d\n" % (i, seed)).encode() * rng.randint(200, 900))
+             for i in range(files)]
+    if version == 4:
+        def block(typ, flags, body):
+            hdr = struct.pack("<BHH", typ, flags, 7 + len(body)) + body
+            return struct.pack("<H", zlib.crc32(hdr) & 0xFFFF) + hdr
+        out = [b"Rar!\x1a\x07\x00", block(0x73, 0, b"\0" * 6)]
+        for name, data in items:
+            nm = name.encode()
+            body = struct.pack("<IIBIIBBHI", len(data), len(data), 2, zlib.crc32(data) & 0xFFFFFFFF, 0x5AE10000,
+                               20, 0x30, len(nm), 0x20) + nm
+            out.append(block(0x74, 0x8000, body) + data)
+        out.append(block(0x7B, 0x4000, b""))
+        return b"".join(out)
+
+    def vint(v):
+        b = bytearray()
+        while True:
+            c = v & 0x7F
+            v >>= 7
+            b.append(c | (0x80 if v else 0))
+            if not v:
+                return bytes(b)
+
+    def block5(typ, flags, body, data=b""):
+        h = vint(typ) + vint(flags) + (vint(len(data)) if flags & 2 else b"") + body
+        h = vint(len(h)) + h
+        return struct.pack("<I", zlib.crc32(h) & 0xFFFFFFFF) + h + data
+    out = [b"Rar!\x1a\x07\x01\x00", block5(1, 0, vint(0))]
+    for name, data in items:
+        nm = name.encode()
+        body = vint(0x04) + vint(len(data)) + vint(0x20) + struct.pack("<I", zlib.crc32(data) & 0xFFFFFFFF) \
+            + vint(0) + vint(0) + vint(len(nm)) + nm
+        out.append(block5(2, 2, body, data))
+    out.append(block5(5, 0, vint(0)))
+    return b"".join(out)
+
+
+# ------------------------------------------------------------------ 7z
+def _num7(v: int) -> bytes:
+    for n in range(8):
+        if v < (1 << (7 * (n + 1))):
+            first = ((0xFF << (8 - n)) & 0xFF) | (v >> (8 * n))
+            return bytes([first]) + (v & ((1 << (8 * n)) - 1)).to_bytes(n, "little")
+    return b"\xff" + v.to_bytes(8, "little")
+
+
+def make_7z(seed: int, size: int = 30000) -> bytes:
+    """A 7z archive holding one file with the Copy method."""
+    rng = _rng("7z", seed)
+    data = ("backup line %d\n" % seed).encode() * (size // 16) + _noise(rng, 100)
+    name = ("backup-%d.txt" % seed).encode("utf-16-le") + b"\0\0"
+    hdr = bytes([0x01, 0x04, 0x06]) + _num7(0) + _num7(1) + b"\x09" + _num7(len(data)) + b"\x00"
+    hdr += bytes([0x07, 0x0B]) + _num7(1) + b"\x00" + _num7(1) + b"\x01\x00" + b"\x0c" + _num7(len(data)) + b"\x00"
+    hdr += bytes([0x08, 0x0A, 0x01]) + struct.pack("<I", zlib.crc32(data) & 0xFFFFFFFF) + b"\x00\x00"
+    hdr += bytes([0x05]) + _num7(1) + b"\x11" + _num7(len(name) + 1) + b"\x00" + name + b"\x00\x00"
+    start = struct.pack("<QQI", len(data), len(hdr), zlib.crc32(hdr) & 0xFFFFFFFF)
+    return b"7z\xbc\xaf\x27\x1c\x00\x04" + struct.pack("<I", zlib.crc32(start) & 0xFFFFFFFF) + start + data + hdr
+
+
+# ------------------------------------------------------------------ Photoshop
+def make_psd(seed: int, width: int = 160, height: int = 120) -> bytes:
+    rng = _rng("psd", seed)
+    res = b"8BIM" + struct.pack(">H", 0x03ED) + b"\0\0" + struct.pack(">I", 16) + struct.pack(">IHHIHH", 72 << 16,
+                                                                                            1, 1, 72 << 16, 1, 1)
+    hdr = b"8BPS" + struct.pack(">H", 1) + b"\0" * 6 + struct.pack(">HIIHH", 3, height, width, 8, 3)
+    return hdr + struct.pack(">I", 0) + struct.pack(">I", len(res)) + res + struct.pack(">I", 0) \
+        + struct.pack(">H", 0) + _noise(rng, 3 * width * height)
+
+
+# ------------------------------------------------------------------ AMR
+def make_amr(seed: int, seconds: float = 20.0) -> bytes:
+    """A phone voice memo: AMR-NB at 12.2 kbit/s, 50 frames a second."""
+    rng = _rng("amr", seed)
+    return b"#!AMR\n" + b"".join(bytes([(7 << 3) | 0x04]) + _noise(rng, 31) for _ in range(int(seconds * 50)))
