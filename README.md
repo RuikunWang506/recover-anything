@@ -156,7 +156,7 @@ Everything has `--json` for agents and scripts.
 
 ## Contributing
 
-Bug reports from real cards are the most valuable thing you can send. If something didn't come back, run `recover-anything triage` on the card and include the output (it contains no file contents). To add a disaster scenario, write a builder in `src/recover_anything/simcard/scenarios.py` and it becomes part of `selftest`.
+Bug reports from real cards are the most valuable thing you can send. If something didn't come back, run `recover-anything triage` on the card and include the output (it contains no file contents). To add a disaster scenario, write a builder in `src/recover_anything/simcard/scenarios.py` and it becomes part of `selftest`. When a randomized card misses a file, `python tools/debug_card.py SEED` shows where each missed file really was and what the recovery found there.
 
 ```bash
 git clone https://github.com/RuikunWang506/recover-anything && cd recover-anything
