@@ -6,7 +6,7 @@ import html
 import io
 import os
 
-from .carve import GROUP
+from .carve import group_of
 from .exif import jpeg_exif
 
 MAX_THUMBS = 400
@@ -46,7 +46,7 @@ def _human(n: int) -> str:
 
 
 def summarize(res, written) -> dict:
-    counts = {"photo": 0, "video": 0, "document": 0, "other": 0}
+    counts = {"photo": 0, "video": 0, "audio": 0, "document": 0, "other": 0}
     partial = 0
     reassembled = 0
     named = 0
@@ -57,7 +57,7 @@ def summarize(res, written) -> dict:
             continue
         if r.status == "unverified" and r.kind != "other":
             unconfirmed += 1
-        counts[GROUP.get(r.kind, "other")] += 1
+        counts[group_of(r.kind, r.ext)] += 1
         if r.meta.get("reassembled_from"):
             reassembled += 1
         if r.name:
@@ -71,7 +71,7 @@ def headline(s: dict) -> str:
     c = s["counts"]
     parts = []
     for key, one, many in (("photo", "photo", "photos"), ("video", "video", "videos"),
-                           ("document", "document", "documents"), ("other", "other file", "other files")):
+                           ("audio", "audio file", "audio files"), ("document", "document", "documents"), ("other", "other file", "other files")):
         if c[key]:
             parts.append("%d %s" % (c[key], one if c[key] == 1 else many))
     if not parts:
@@ -128,7 +128,7 @@ def write_html(res, written, out_dir: str) -> str:
         shown_dir = "~" + shown_dir[len(home):]
     lede = "Everything below was copied to <b>%s</b>. Nothing was written to the card." % e(shown_dir)
     out.append("<p class='lede'>%s</p>" % lede)
-    stats = [(c["photo"], "photos"), (c["video"], "videos"), (c["document"] + c["other"], "documents & other files")]
+    stats = [(c["photo"], "photos"), (c["video"], "videos"), (c["audio"], "audio files"), (c["document"] + c["other"], "documents & other files")]
     stats = [st for st in stats if st[0]] or [(0, "files")]
     if s["named"]:
         stats.append((s["named"], "kept their original names"))
@@ -144,7 +144,7 @@ def write_html(res, written, out_dir: str) -> str:
     media_title = "Photos and videos" if c["photo"] and c["video"] else ("Videos" if c["video"] else "Photos")
     order = lambda r: (r.meta.get("when") or "9999", (r.name or "").lower(), r.start)  # noqa: E731
     for title, keep in ((media_title, lambda r: r.status not in ("partial", "corrupt")
-                         and GROUP.get(r.kind) in ("photo", "video")),
+                         and group_of(r.kind, r.ext) in ("photo", "video")),
                         ("Partly recovered", lambda r: r.status in ("partial", "corrupt"))):
         items = sorted((r for r in written if keep(r)), key=order)
         if not items:
@@ -175,7 +175,7 @@ def write_html(res, written, out_dir: str) -> str:
                 e(rel.replace(os.sep, "/")), img, chip.replace("class='chip", "class='chip badge"),
                 e(os.path.basename(rel))))
         out.append("</div>")
-    others = [r for r in written if r.status not in ("partial", "corrupt") and GROUP.get(r.kind) not in ("photo", "video")]
+    others = [r for r in written if r.status not in ("partial", "corrupt") and group_of(r.kind, r.ext) not in ("photo", "video")]
     if others:
         out.append("<h2>Documents and other files <span class='kicker'>(%d)</span></h2><div class='wrap'><table>"
                    "<tr><th>File</th><th>Size</th><th>Check</th></tr>" % len(others))

@@ -222,7 +222,8 @@ def cmd_recover(a):
                   file=sys.stderr)
     kinds = set(a.only.split(",")) if a.only else None
     if kinds:
-        kinds = {{"photos": "photo", "videos": "video", "documents": "document"}.get(k, k) for k in kinds}
+        kinds = {{"photos": "photo", "videos": "video", "audio": "audio", "documents": "document"}.get(k.strip(), k.strip())
+                 for k in kinds}
     res = scan(work, kinds=kinds, include_live=a.include_live, reassemble=not a.no_reassemble,
                workers=a.workers, progress=bar, fast=a.fast, deep=a.deep)
     res.source = src_path
@@ -346,7 +347,7 @@ def main(argv=None) -> int:
     s = sub.add_parser("recover", help="find and save everything recoverable")
     s.add_argument("source")
     s.add_argument("-o", "--output", required=True, help="folder on a DIFFERENT drive")
-    s.add_argument("--only", help="photos,videos,documents")
+    s.add_argument("--only", help="photos,videos,audio,documents")
     s.add_argument("--include-live", action="store_true", help="also copy files that are still visible")
     s.add_argument("--direct", action="store_true", help="read the device directly instead of imaging it first")
     s.add_argument("--no-reassemble", action="store_true", help="skip rebuilding fragmented photos")
