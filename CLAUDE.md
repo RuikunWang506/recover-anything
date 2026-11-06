@@ -8,13 +8,13 @@ Recover Anything gets deleted and formatted photos, videos and documents back fr
 
 ```bash
 python -m pip install -e ".[dev]"        # once, inside a virtualenv
-python -m pytest -q -rs                   # about 125 tests, about 4 min
+python -m pytest -q -rs                   # about 150 tests, about 7 min
 recover-anything selftest --quick         # 4 small simulated cards, about 1 min
 recover-anything selftest                 # the README results table (7 cards), about 3 min
 recover-anything selftest --stress 9      # the README stress numbers (seeds 6-14), about 6 min
 python tools/debug_card.py 11             # rebuild one stress card and explain every miss
 python tools/eval_cards.py mixed 1-20     # randomized cards shared by many devices: what came back, what's wrong
-python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file (mp3 ts mts flac opus mp4 jpg amr mpg doc)
+python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file (mp3 ts mts flac opus mp4 jpg amr mpg doc pdf docx wav avi raw gif)
 ```
 
 ## Rules that must never break
@@ -25,7 +25,7 @@ python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file 
    - A file is only marked recovered when its check passed. For a JPEG, it decoded to its last block with the right block count, and a deleted or rebuilt one also matches the thumbnail the camera stored in it (`jpeg.Thumb`): the decoder falls back into step after damage, so a run of another photo's data can decode cleanly. For a video, every frame start matched its index. For a PNG or ZIP, the checksums matched.
    - Everything else is `partial`, `corrupt` or `unverified`, saved under "Partly recovered" with a label.
    - The stress test counts files "marked recovered but wrong". That count must stay 0. So must the `mixed_device` scenarios (`tests/test_more_formats.py`).
-   - A type with no checksums (BMP, HEIC/AVIF/CR3 pictures, VP8/VP9/AV1 video) is `ok` only for a file that was never deleted (`validate.layout_known`): a deleted file's clusters can be reused and freed again without a trace.
+   - A type with no checksums (BMP, HEIC/AVIF/CR3 pictures, VP8/VP9/AV1 video, WAV and WebP, a RAW's sensor data, uncompressed or encrypted PDF streams) is `ok` only for a file that was never deleted (`validate.layout_known`): a deleted file's clusters can be reused and freed again without a trace. PDF, AVI and GIF are checked by their contents (`formats/checks.py`).
    - A stream without an end marker (MP3, MPEG-TS) is `ok` only when its end is proven: a length in the file or the folder entry, a tag, or frames that stop inside the cluster holding the last checked header (`more.same_cluster`). A carved one must also mark its start (an ID3 tag or Xing header; transport-stream counters at 0), or it may be the second half of a recording.
    - Files of one kind fragment into each other's holes, and another recording's data passes checks that junk fails: MP3 frames, transport-stream counters, AMR and MPEG-PS frames all look alike from file to file. So a rebuilt MP3 or transport stream is `ok` only when the recording's own clock (`more.TsClock`: the PCR, and an `.MTS` file's per-packet time stamps) checked out after every join. AMR and MPEG-PS are `ok` only for a file that was never deleted. `tools/eval_cards.py one KIND` must report 0 wrong for every kind.
 4. **One bad file never stops a run.** Parsers and rebuilders run inside a try/except per file. Work on hostile or huge input is bounded (`MAX_SAMPLES`, `ZIP_CHECK_BUDGET`, `MAX_JPEG`, `MAX_MOOV`, chain limits).
@@ -50,6 +50,7 @@ python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file 
 | `formats/others.py` | MP4/MOV/HEIC sample tables, PNG, GIF, RIFF/AVI, TIFF/RAW, PDF, ZIP |
 | `formats/more.py` | MP3/MP2, FLAC, Ogg, MPEG-TS/MTS, MKV/WebM, SQLite, gzip, BMP: probe, exact length, honest check. Holds the registry (`KINDS`) for these and `extra.py` |
 | `formats/extra.py` | Old Office and other OLE2 files, MPEG program streams, RAR, 7z, Photoshop, AMR |
+| `formats/checks.py` | Content checks: PDF (every object where its table says, every compressed stream's checksum), AVI (the chunk chain, every frame decoded), GIF (every frame decoded to the right number of pixels), TIFF/RAW (previews decoded; a camera's sensor data can't be) |
 | `validate.py` | Per-file checks; deep, fast and sampled modes; process pool; ZIP checksums |
 | `pipeline.py` | `scan()`: filesystem pass, carve, check, de-duplicate, rebuild, drop files that are part of other files |
 | `reassemble.py` | Rebuilds fragmented JPEGs: gap skipping, first-piece claims, seam scores; a finished picture that doesn't match its thumbnail sends the search back to where it stops matching. `reassemble_all` runs every rebuilder in rounds (each file that checks out takes its clusters out of the others' way) and builds the maps they share: clusters in use or holding folders (blocked), and clusters of files saved but not proven (`soft_map`, tried last) |
@@ -57,7 +58,7 @@ python tools/eval_cards.py one mts 1-4    # cards holding only one kind of file 
 | `reassemble_stream.py` | Rebuilds fragmented MP3, MPEG-TS, Ogg, FLAC and gzip with resumable unit-by-unit walkers; a join counts only when a checksum or the recording's clock confirms it |
 | `organize.py`, `report.py` | Output folders, names, dates, `recovery.json`, self-contained `report.html` |
 | `triage.py`, `hunt.py` | Honest odds and don'ts; other places copies survive (Claude Code transcripts, git, editors, trash, snapshots) |
-| `selftest.py`, `simcard/` | Simulated FAT32/exFAT cards, test photos and videos, disaster scenarios; `simcard/files.py` builds real music, voice memo, dashcam, camcorder, MKV, SQLite, gzip, BMP, Office 97, RAR, 7z and Photoshop files from fixed seeds; `scenarios.mixed_device` is a randomized card shared by many devices, `scenarios.single_kind` one holding a single kind |
+| `selftest.py`, `simcard/` | Simulated FAT32/exFAT cards, test photos and videos, disaster scenarios; `simcard/files.py` builds real music, voice memo, dashcam, camcorder, MKV, SQLite, gzip, BMP, Office 97, RAR, 7z, Photoshop, PDF, Word, WAV, Motion-JPEG AVI, Canon RAW and GIF files from fixed seeds; `scenarios.mixed_device` is a randomized card shared by many devices, `scenarios.single_kind` one holding a single kind |
 
 ## Conventions
 

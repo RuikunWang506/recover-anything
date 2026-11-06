@@ -5,6 +5,7 @@ end (bytes from start), complete (looked whole), ext, and a reason.
 """
 from __future__ import annotations
 
+import re
 import struct
 import sys
 import zlib
@@ -508,31 +509,48 @@ def probe_pdf(head: bytes) -> bool:
 
 
 def measure_pdf(read, start: int, limit: int, stop_at=None) -> Result:
-    pos, last_eof, chunk = 0, -1, 1 << 20
+    pos, eofs, chunk = 0, [], 1 << 20
     tail = b""
     while pos < limit:
-        data = read(start + pos, chunk)
+        data = read(start + pos, min(chunk, limit - pos))  # never past the next file's header
         if not data:
             break
         buf = tail + data
         base = pos - len(tail)
-        i = buf.rfind(b"%%EOF")
-        if i >= 0:
-            last_eof = base + i + 5
-        if stop_at and last_eof > 0 and stop_at(pos + len(data)):
+        i = buf.find(b"%%EOF")
+        while i >= 0:
+            if not eofs or base + i + 5 > eofs[-1]:
+                eofs.append(base + i + 5)
+            i = buf.find(b"%%EOF", i + 1)
+        del eofs[:-4096]
+        if stop_at and eofs and stop_at(pos + len(data)):
             break
         tail = buf[-5:]
         pos += len(data)
-        if last_eof > 0 and data.count(0) == len(data):
+        if eofs and data.count(0) == len(data):
             break
-    if last_eof < 0:
+    if not eofs:
         return Result(0, False, ".pdf", "no end marker")
-    nl = read(start + last_eof, 2)
+    # The file ends at the last end marker that is its own: the startxref
+    # before it points back to a cross-reference section inside the file. A
+    # later one (a deleted PDF's leftover tail in the free space after this
+    # one) points somewhere else. An update appended to the PDF has its own.
+    end = eofs[-1]
+    for e in reversed(eofs):
+        lo = max(0, e - 5 - 48)
+        m = re.search(rb"startxref\s+(\d+)\s*$", read(start + lo, e - 5 - lo))
+        if not m or int(m.group(1)) >= e:
+            continue
+        h = read(start + int(m.group(1)), 32)
+        if h.startswith(b"xref") or re.match(rb"\d+\s+\d+\s+obj", h):
+            end = e
+            break
+    nl = read(start + end, 2)
     if nl[:2] == b"\r\n":
-        last_eof += 2
+        end += 2
     elif nl[:1] in (b"\n", b"\r"):
-        last_eof += 1
-    return Result(last_eof, True, ".pdf")
+        end += 1
+    return Result(end, True, ".pdf")
 
 
 # ---------------------------------------------------------------------- ZIP
