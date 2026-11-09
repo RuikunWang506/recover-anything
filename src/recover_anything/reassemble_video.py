@@ -79,6 +79,7 @@ class _Video:
         self._plaus: dict = {}
         self.file_len = 0  # set once the index says how long the file is
         self.ambiguous = False
+        self.heif = False
 
     def next_free(self, c, skip, index=None, used=None):
         """The next unclaimed cluster after c that could hold this video's
@@ -138,7 +139,7 @@ class _Video:
     def run(self, expected_size=None):
         cs = self.cs
         path = [self.start]
-        off, mdat, moov_box = 0, None, None
+        off, mdat, moov_box, meta_box = 0, None, None, None
         for _ in range(64):
             if not self.extend(path, (off + 16) // cs, set()):
                 return None
@@ -152,6 +153,8 @@ class _Video:
                 return None
             if h[4:8] == b"moov":
                 moov_box = (off, size)
+            if h[4:8] == b"meta":
+                meta_box = (off, size)
             if h[4:8] == b"mdat":
                 mdat = (off, size)
                 break
@@ -160,7 +163,18 @@ class _Video:
             return None
         v_end = mdat[0] + mdat[1]
         fixed: dict[int, int] = {}
-        if moov_box:
+        if meta_box and not moov_box:
+            # A HEIF picture (HEIC): its item table, at the start, says where every
+            # tile is. Each tile is an HEVC unit with its length: a checkpoint.
+            if meta_box[1] > MAX_MOOV or not self.extend(path, (meta_box[0] + meta_box[1]) // cs, set()):
+                return None
+            items = others.heif_items(lambda o, k: self.vread(path, o, k), meta_box[0] + meta_box[1])
+            if not items:
+                return None
+            samples = sorted((o, n, True) for t, ext in items.values() if t in (b"hvc1", b"hev1") for o, n in ext)
+            moov_box, tail_start, self.file_len = meta_box, v_end, v_end
+            self.heif = True
+        elif moov_box:
             if moov_box[1] > MAX_MOOV or not self.extend(path, (moov_box[0] + moov_box[1]) // cs, set()):
                 return None
             moov = self.vread(path, *moov_box)
@@ -210,7 +224,8 @@ class _Video:
         full = full[:n]
         if self.ambiguous:
             full = self._fewest_jumps(full, checks, fixed, v_end)
-        st, why, _ = others.validate_isobmff(lambda o, k: self.vread(full, o, k), total)
+        rd = lambda o, k: self.vread(full, o, k)  # noqa: E731
+        st, why, _ = others.validate_heif(rd, total) if self.heif else others.validate_isobmff(rd, total)
         if st != "ok":
             return None
         return full, total, self.ambiguous
@@ -456,7 +471,7 @@ def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None
             r.meta["unsure_layout"] = True  # not evidence of where other files are
         else:
             r.status = "ok"
-            r.note = "every frame position checked"
+            r.note = "every picture tile checked" if r.ext in (".heic", ".heif") else "every frame position checked"
             r.meta.pop("unsure_layout", None)
         pieces = _Assembler._pieces(clusters)
         if pieces > 1:

@@ -426,7 +426,7 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
             return r.extents and r.start >= g.data_offset and (r.start - g.data_offset) % cs == 0
         broken = [r for r in mine if r.kind == "jpeg" and r.status in ("corrupt", "partial") and aligned(r)]
         videos = [r for r in mine if r.kind == "isobmff" and r.status in ("corrupt", "partial") and aligned(r)
-                  and r.ext not in (".heic", ".avif", ".cr3")]
+                  and r.ext not in (".avif", ".cr3")]
         from .formats.checks import EMPTY_TABLE, NO_TABLE
         from .formats.more import NOT_PROVEN
         from .reassemble_stream import WALKERS
