@@ -47,6 +47,9 @@ class Header:
         self.mpf_starts: tuple = ()  # where the MPF index says the other pictures start (from SOI)
         self.main_end = None  # end of the main picture (its first EOI), set by measure()
         self.has_exif = False
+        self.q0: dict[int, int] = {}  # quantization table id -> its DC step
+        self.qt: dict[int, list] = {}  # quantization table id -> its 64 steps, in zigzag order
+        self.thumb = None  # (offset from SOI, length) of the EXIF thumbnail
 
     @property
     def decodable(self) -> bool:
@@ -87,6 +90,31 @@ def _parse_mpf(seg: bytes, seg_tiff_pos: int):
     return None, ()
 
 
+def _exif_thumb(tiff: bytes, tiff_pos: int):
+    """(offset from SOI, length) of the thumbnail an EXIF block points to
+    (IFD1's JPEGInterchangeFormat), or None."""
+    try:
+        bo = {b"II": "<", b"MM": ">"}[tiff[:2]]
+        ifd0 = struct.unpack(bo + "I", tiff[4:8])[0]
+        n = struct.unpack(bo + "H", tiff[ifd0:ifd0 + 2])[0]
+        nxt = ifd0 + 2 + 12 * n
+        ifd1 = struct.unpack(bo + "I", tiff[nxt:nxt + 4])[0]
+        if not ifd1:
+            return None
+        n = struct.unpack(bo + "H", tiff[ifd1:ifd1 + 2])[0]
+        tags = {}
+        for i in range(min(n, 64)):
+            e = ifd1 + 2 + 12 * i
+            tag, typ = struct.unpack(bo + "HH", tiff[e:e + 4])
+            tags[tag] = struct.unpack(bo + ("I" if typ == 4 else "H"), tiff[e + 8:e + (12 if typ == 4 else 10)])[0]
+        off, size = tags.get(0x0201), tags.get(0x0202)
+        if off is None or not size or off + size > len(tiff) or tiff[off:off + 2] != b"\xff\xd8":
+            return None
+        return tiff_pos + off, size
+    except (KeyError, struct.error):
+        return None
+
+
 def parse_header(read, start: int, limit: int = 4 * 1024 * 1024) -> Header:
     """Parse markers from SOI to the first SOS. `read(off, n)` reads the medium."""
     h = Header()
@@ -122,7 +150,16 @@ def parse_header(read, start: int, limit: int = 4 * 1024 * 1024) -> Header:
         need(2 + seglen)
         seg = buf[pos + 4:pos + 2 + seglen]
         if m == 0xE1 and seg[:6] == b"Exif\x00\x00":
+            if not h.has_exif:
+                h.thumb = _exif_thumb(seg[6:], pos + 10)
             h.has_exif = True
+        elif m == 0xDB:
+            p = 0
+            while p + 65 <= len(seg):
+                pq, tq = seg[p] >> 4, seg[p] & 15
+                h.q0[tq] = seg[p + 1] if pq == 0 else struct.unpack(">H", seg[p + 1:p + 3])[0]
+                h.qt[tq] = list(seg[p + 1:p + 65]) if pq == 0 else list(struct.unpack(">64H", seg[p + 1:p + 129]))
+                p += 65 if pq == 0 else 129
         elif m == 0xE2 and seg[:4] == b"MPF\x00":
             h.mpf_end, h.mpf_starts = _parse_mpf(seg, pos + 8)
         elif m in SOF_ALL:
@@ -285,6 +322,21 @@ class _Huff:
         self.lookup = lookup
 
 
+_HUFF_CACHE: dict = {}
+
+
+def _huff(counts, syms) -> _Huff:
+    """A table's lookup, built once: a camera uses the same few tables for
+    every photo and every video frame, and a rebuild makes many decoders."""
+    key = (tuple(counts), tuple(syms))
+    t = _HUFF_CACHE.get(key)
+    if t is None:
+        if len(_HUFF_CACHE) >= 32:
+            _HUFF_CACHE.clear()  # (each table is 512 KB: keep only a few)
+        t = _HUFF_CACHE[key] = _Huff(counts, syms)
+    return t
+
+
 # Standard tables (ITU T.81 Annex K) for "motion JPEG" files that omit DHT.
 _STD = {
     (0, 0): ([0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], list(range(12))),
@@ -315,10 +367,10 @@ class Decoder:
         vmax = max(c[2] for c in h.components)
         tables = {}
         for k, v in h.huff.items():
-            tables[k] = _Huff(*v)
+            tables[k] = _huff(*v)
         for k, v in _STD.items():
             if k not in tables:
-                tables[k] = _Huff(*v)
+                tables[k] = _huff(*v)
         self.units = []  # per scan component: (dc lookup, ac lookup, h, v, is_luma)
         try:
             for i, (cid, td, ta) in enumerate(h.scan):
@@ -575,6 +627,237 @@ class _NeedMore(Exception):
     pass
 
 
+ZIGZAG = (0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14,
+          21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60,
+          61, 54, 47, 55, 62, 63)
+_COS = [[(0.5 ** 0.5 if u == 0 else 1.0) / 2 * __import__("math").cos((2 * x + 1) * u * __import__("math").pi / 16)
+         for u in range(8)] for x in range(8)]
+
+
+def luma_pixels(data: bytes, max_pixels: int = 1 << 20):
+    """(width, height, brightness of every pixel, row by row) of a small
+    baseline JPEG, such as a thumbnail. Simple rather than fast."""
+    h = parse_header(lambda o, n: data[o:o + n], 0, len(data))
+    if not h.decodable or h.width * h.height > max_pixels:
+        raise JpegError("not a small baseline JPEG")
+    q = h.qt.get(h.components[0][3])
+    if not q:
+        raise JpegError("no quantization table")
+    tables = {k: _huff(*v) for k, v in h.huff.items()}
+    comps = {c[0]: c for c in h.components}
+    try:
+        units = [(tables[(0, td)].lookup, tables[(1, ta)].lookup, comps[cid][1], comps[cid][2])
+                 for cid, td, ta in h.scan]
+    except KeyError:
+        raise JpegError("missing table")
+    if len(units) == 1:
+        units = [(units[0][0], units[0][1], 1, 1)]
+        mw, mh = (h.width + 7) // 8, (h.height + 7) // 8
+    else:
+        hm, vm = max(c[1] for c in h.components), max(c[2] for c in h.components)
+        mw, mh = (h.width + 8 * hm - 1) // (8 * hm), (h.height + 8 * vm - 1) // (8 * vm)
+    h0, v0 = units[0][2], units[0][3]
+    bw = mw * h0
+    pw = bw * 8
+    pix = [128.0] * (pw * mh * v0 * 8)
+    end = data.find(b"\xff\xd9", h.entropy_start)
+    segs = re.split(rb"\xff[\xd0-\xd7]", data[h.entropy_start:end if end > 0 else len(data)])
+    per = h.restart or mw * mh
+    mcu = 0
+    for seg in segs:
+        seg = seg.replace(b"\xff\x00", b"\xff")
+        bits = bin(int.from_bytes(b"\x01" + seg, "big"))[3:] + "1" * 16
+        p, preds = 0, [0] * len(units)
+
+        def get(n):
+            nonlocal p
+            v = int(bits[p:p + n], 2) if n else 0
+            p += n
+            return v - (1 << n) + 1 if n and v < 1 << (n - 1) else v
+
+        for _ in range(per):
+            if mcu >= mw * mh:
+                break
+            my, mx = divmod(mcu, mw)
+            for ui, (dct, act, hh, vv) in enumerate(units):
+                for v in range(vv):
+                    for hz in range(hh):
+                        e = dct[int(bits[p:p + 16], 2)]
+                        if not e:
+                            raise JpegError("bad code")
+                        p += e >> 8
+                        preds[ui] += get(e & 255)
+                        coef = {0: preds[ui] * q[0]} if ui == 0 else None
+                        k = 1
+                        while k < 64:
+                            e = act[int(bits[p:p + 16], 2)]
+                            if not e:
+                                raise JpegError("bad code")
+                            p += e >> 8
+                            r, sz = (e & 255) >> 4, e & 15
+                            if sz == 0:
+                                if r != 15:
+                                    break
+                                k += 16
+                                continue
+                            k += r
+                            val = get(sz)
+                            if coef is not None and k < 64:
+                                coef[ZIGZAG[k]] = val * q[k]
+                            k += 1
+                        if coef is None:
+                            continue
+                        by, bx = my * v0 + v, mx * h0 + hz
+                        block = [0.0] * 64
+                        for pos, c in coef.items():
+                            cu, cv = _COS, c
+                            u, vv2 = pos & 7, pos >> 3
+                            for y in range(8):
+                                f = cv * cu[y][vv2]
+                                row = cu
+                                for x in range(8):
+                                    block[y * 8 + x] += f * row[x][u]
+                        base = by * 8 * pw + bx * 8
+                        for y in range(8):
+                            pix[base + y * pw:base + y * pw + 8] = [128.0 + t for t in block[y * 8:y * 8 + 8]]
+            mcu += 1
+    out = [pix[y * pw + x] for y in range(h.height) for x in range(h.width)]
+    return h.width, h.height, out
+
+
+THUMB_WINDOW = 32    # MCUs in a row of decoding order whose blocks are compared together
+# Over a window: how far the blocks' brightness is from the thumbnail's range
+# around each (of 255), and the mean signed difference where the thumbnail is
+# flat (everything brighter or darker: a step in the blocks' DC values). On
+# 443 correctly recovered photos (four encoders, black bars, hard edges)
+# neither went above 6.4 and 12.6; a run of another photo's clusters gave 49
+# and 63.
+THUMB_DIFF = 20.0
+THUMB_SHIFT = 25.0
+THUMB_NOTE = ("every block decodes, but part of the picture doesn't match the small preview stored in it: "
+              "part of it may be another photo's; check it")
+THUMB_FLAT = 12.0    # where the thumbnail varies less than this around a block, it shows a step in DC
+
+
+class Thumb:
+    """Checks a decoded picture against its own EXIF thumbnail.
+
+    Every 8x8 block of the picture has a mean brightness (its DC value), and
+    the thumbnail shows the same spot at about one pixel per block. The
+    differences are averaged over runs of MCUs in decoding order. A run of
+    another photo's data doesn't match there; and since each block's DC is
+    stored as a step from the block before, everything after it usually comes
+    out brighter or darker too."""
+
+    def __init__(self, h: Header, data: bytes):
+        w, ht, pix = luma_pixels(data)
+        q = h.q0.get(h.components[0][3])
+        if not q:
+            raise JpegError("no quantization table")
+        W, H = h.width, h.height
+        s = min(w / W, ht / H)
+        if W * s * H * s < 0.6 * w * ht:
+            raise JpegError("the thumbnail has a different shape")
+        self.h, self.k, self.s = h, q / 8.0, s
+        self.x0, self.y0 = (w - W * s) / 2, (ht - H * s) / 2  # black bars, if the shapes differ
+        self.tw, self.th, self.pix = w, ht, pix
+        self.expect = None
+
+    def _build(self, dec):
+        """For the middle of every block of the picture: the thumbnail's
+        brightness there, and the lowest and highest values around it (a
+        thumbnail is rarely aligned to the pixel, so at an edge any value in
+        between is fine). Blocks near a black bar or the thumbnail's edge are
+        left out."""
+        W, H, s, tw, th, pix = self.h.width, self.h.height, self.s, self.tw, self.th, self.pix
+        nan = float("nan")
+        n = len(dec.dc)
+        exp, lo, hi = [nan] * n, [nan] * n, [nan] * n
+        cx0, cx1 = max(self.x0, 0) + 1.5, min(self.x0 + W * s, tw) - 2.5
+        cy0, cy1 = max(self.y0, 0) + 1.5, min(self.y0 + H * s, th) - 2.5
+        cols = []
+        for x in range((W + 7) // 8):
+            tx = (8 * x + 4) * s + self.x0 - 0.5
+            if not cx0 <= tx <= cx1:
+                cols.append(None)
+                continue
+            a = int(tx)
+            cols.append((x, a, tx - a))
+        for y in range((H + 7) // 8):
+            ty = (8 * y + 4) * s + self.y0 - 0.5
+            if not cy0 <= ty <= cy1:
+                continue
+            b = int(ty)
+            fy = ty - b
+            rows = [pix[(b + d) * tw:(b + d + 1) * tw] for d in (-1, 0, 1, 2)]
+            base = y * dec.bw
+            for c in cols:
+                if c is None:
+                    continue
+                x, a, fx = c
+                r0, r1 = rows[1], rows[2]
+                top = r0[a] * (1 - fx) + r0[a + 1] * fx
+                bot = r1[a] * (1 - fx) + r1[a + 1] * fx
+                exp[base + x] = top * (1 - fy) + bot * fy
+                near = [r[a + d] for r in rows for d in (-1, 0, 1, 2)]
+                lo[base + x], hi[base + x] = min(near), max(near)
+        self.expect, self.lo, self.hi = exp, lo, hi
+
+    def errors(self, dec):
+        """Per MCU decoded so far: (mean distance of its blocks' brightness
+        from the thumbnail's range there, mean signed difference where the
+        thumbnail is flat or None), or None."""
+        if self.expect is None:
+            self._build(dec)
+        exp, lo, hi, dc, k = self.expect, self.lo, self.hi, dec.dc, self.k
+        out = []
+        for m in range(dec.mcu):
+            i0 = dec.block_index(m)
+            u = sg = n = nf = 0
+            for v in range(dec.bv):
+                for hz in range(dec.bh):
+                    i = i0 + v * dec.bw + hz
+                    e = exp[i]
+                    if e == e:  # not NaN
+                        got = 128.0 + k * dc[i]
+                        u += max(0.0, got - hi[i], lo[i] - got)
+                        n += 1
+                        if hi[i] - lo[i] < THUMB_FLAT:
+                            sg += got - e
+                            nf += 1
+            out.append((u / n, sg / nf if nf else None) if n else None)
+        return out
+
+    def _windows(self, dec):
+        win = []
+        for m, e in enumerate(self.errors(dec)):
+            if e is None:
+                continue
+            win.append((m, e))
+            if len(win) > THUMB_WINDOW:
+                win.pop(0)
+            if len(win) == THUMB_WINDOW:
+                u = sum(x[0] for _, x in win) / THUMB_WINDOW
+                flat = [x[1] for _, x in win if x[1] is not None]
+                sg = abs(sum(flat)) / len(flat) if len(flat) >= THUMB_WINDOW // 4 else 0.0
+                yield win[0][0], m, u, sg
+
+    def unlike(self, dec):
+        """(first MCU, last MCU) of the first run, in decoding order, that
+        doesn't match the thumbnail; None if the picture matches."""
+        for first, last, u, sg in self._windows(dec):
+            if u > THUMB_DIFF or sg > THUMB_SHIFT:
+                return first, last
+        return None
+
+    def worst(self, dec):
+        """The largest window differences (for calibration): (mean, signed)."""
+        u = sg = 0.0
+        for _, _, a, b in self._windows(dec):
+            u, sg = max(u, a), max(sg, b)
+        return u, sg
+
+
 def deep_check(data: bytes) -> tuple[bool, str]:
     """Decode a whole JPEG held in memory. (True, 'ok') if it is coherent."""
     try:
@@ -595,7 +878,7 @@ def deep_check(data: bytes) -> tuple[bool, str]:
     return st == "done", "ok" if st == "done" else st
 
 
-def check(data: bytes) -> tuple[str, str, int | None]:
+def check(data: bytes, thumb: bool = False) -> tuple[str, str, int | None]:
     """Classify an in-memory JPEG: ('ok'|'partial'|'corrupt', message, bad byte).
 
     'partial' means the beginning decodes but the data stops early (the top
@@ -625,6 +908,16 @@ def check(data: bytes) -> tuple[str, str, int | None]:
         return "corrupt", msg, e.pos
     if st != "done":
         return "partial", "the file stops partway through the picture", len(data)
+    if thumb and h.thumb:
+        # The decoder falls back into step after damage, so a run of another
+        # photo's data can decode to the right number of blocks. The thumbnail
+        # shows what the picture should look like.
+        try:
+            t = Thumb(h, data[h.thumb[0]:h.thumb[0] + h.thumb[1]])
+        except Exception:
+            t = None  # no usable thumbnail
+        if t is not None and t.unlike(d) is not None:
+            return "unverified", THUMB_NOTE, None
     return "ok", "every block decoded", None
 
 

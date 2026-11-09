@@ -117,7 +117,8 @@ def test_other_file_types_are_carved(workdir):
         zf.writestr("[Content_Types].xml", "<Types/>")
         zf.writestr("word/document.xml", "<w:document>" + "hello " * 5000 + "</w:document>")
     docx = z.getvalue()
-    pdf = b"%PDF-1.4\n" + b"1 0 obj << /Type /Catalog >> endobj\n" * 2000 + b"trailer\n%%EOF\n"
+    from recover_anything.simcard.files import make_pdf
+    pdf = make_pdf(1)  # a real one: a PDF with no table to check is only "unverified" once deleted
     vid = make_video(3, frames=60)
     img = os.path.join(workdir, "mixed.img")
     with Fat32Card(img, **SMALL) as card:

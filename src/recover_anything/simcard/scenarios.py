@@ -178,3 +178,176 @@ def stress(workdir: str, seed: int, cluster_size: int = 32768, mixed: bool = Tru
     sc.groups["videos"] = {h for h in truth if truth[h].endswith(".MP4")}
     sc.groups["fragmented videos"] = {h for h in frag if truth[h].endswith(".MP4")}
     return sc
+
+
+def _device_file(rng, n: int):
+    """One random file of the kinds a phone, recorder, dashcam or laptop leaves on a card or stick."""
+    from . import files as F
+    k = rng.choice(["photo", "photo", "mp3", "mp3", "flac", "opus", "ts", "mts", "webm", "mkv", "sqlite", "gzip",
+                    "bmp", "heic", "video"])
+    s = 10_000 + n
+    if k == "photo":
+        w = rng.choice([1200, 1600])
+        return "DCIM/IMG_%04d.JPG" % n, make_photo(s, width=w, height=w * 3 // 4, style=PHOTO_STYLE)
+    if k == "video":
+        return "DCIM/MVI_%04d.MP4" % n, make_video(s, frames=rng.randint(60, 160))
+    if k == "mp3":
+        return "Music/track%03d.mp3" % n, F.make_mp3(s, seconds=rng.uniform(8, 40), xing=rng.random() < 0.6,
+                                                     id3v1=rng.random() < 0.3, id3=rng.random() < 0.8)
+    if k == "flac":
+        return "Music/track%03d.flac" % n, F.make_flac(s, seconds=rng.uniform(2, 8))
+    if k == "opus":
+        return "Recordings/memo%03d.opus" % n, F.make_ogg(s, seconds=rng.uniform(5, 60))
+    if k == "ts":
+        return "DashCam/REC%04d.TS" % n, F.make_ts(s, packets=rng.randint(1500, 6000))
+    if k == "mts":
+        return "AVCHD/BDMV/STREAM/%05d.MTS" % n, F.make_ts(s, packets=rng.randint(1500, 6000), m2ts=True)
+    if k in ("webm", "mkv"):
+        return "Videos/clip%03d.%s" % (n, k), F.make_mkv(s, clusters=rng.randint(3, 10), webm=k == "webm")
+    if k == "sqlite":
+        return "Backup/db%03d.sqlite" % n, F.make_sqlite(s, rows=rng.randint(100, 1500))
+    if k == "gzip":
+        return "Backup/log%03d.gz" % n, F.make_gzip(s, lines=rng.randint(3000, 30000))
+    if k == "bmp":
+        return "Pictures/scan%03d.bmp" % n, F.make_bmp(s, width=rng.choice([200, 320, 480]), height=240)
+    return "DCIM/IMG_%04d.HEIC" % n, F.make_heic(s, size=rng.randint(300_000, 1_500_000))
+
+
+def mixed_device(workdir: str, seed: int, cluster_size: int = 4096, size: int = 512 * 1024**2,
+                 fs: str = "FAT32") -> Scenario:
+    """A card or stick used by several devices: photos, music, voice memos,
+    dashcam and camcorder clips, screen recordings, phone databases, logs and
+    scans. Three rounds of saving and deleting (so files fragment), then a
+    format that recreates the folders, so no names survive. Ground truth:
+    every file present at the format whose clusters weren't reused."""
+    import random as _random
+    rng = _random.Random("mixed-%d" % seed)
+    img = os.path.join(workdir, "mixed-%d-%s.img" % (seed, fs.lower()))
+    present: dict = {}
+    counter = [0]
+    ever: set = set()
+
+    def save(card, k):
+        for _ in range(k):
+            counter[0] += 1
+            path, data = _device_file(rng, counter[0])
+            cl = card.write_file(path, data, _when(counter[0]))
+            present[path] = (data, set(cl))
+            ever.add(_sha(data))
+
+    def delete(card, k):
+        for path in rng.sample(sorted(present), min(k, len(present))):
+            card.delete(path)
+            del present[path]
+
+    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+        save(card, 30)
+        delete(card, 12)
+        save(card, 16)
+        delete(card, 9)
+        save(card, 10)
+        card.format(recreate_dirs=["DCIM", "Music"])
+        used = card.allocated_clusters()
+    truth = {_sha(d): p for p, (d, cl) in present.items() if not (cl & used)}
+    frag = {_sha(d) for p, (d, cl) in present.items()
+            if len(cl) > 1 and max(cl) - min(cl) + 1 != len(cl) and _sha(d) in truth}
+    sc = Scenario("mixed", "Shared by many devices, 3 rounds of save/delete, formatted", img, truth, fs=fs)
+    sc.groups["fragmented"] = frag
+    sc.groups["in one piece"] = set(truth) - frag
+    sc.groups["ever written"] = ever  # a file deleted earlier that comes back exact is a correct find too
+    return sc
+
+
+SINGLE_KINDS = ("mp3", "ts", "mts", "flac", "opus", "mp4", "jpg", "amr", "mpg", "doc",
+                "pdf", "docx", "wav", "avi", "raw", "gif", "heic", "webm", "mkv")
+
+
+def _one_kind_file(kind: str, rng, n: int):
+    from . import files as F
+    s = 20_000 + n
+    if kind == "mp3":
+        return "MUSIC/%03d.mp3" % n, F.make_mp3(s, seconds=rng.uniform(10, 40), xing=rng.random() < 0.6,
+                                                id3=rng.random() < 0.8, id3v1=rng.random() < 0.3)
+    if kind == "ts":
+        return "DCIM/REC%04d.TS" % n, F.make_ts(s, packets=rng.randint(2000, 7000))
+    if kind == "mts":
+        return "AVCHD/BDMV/STREAM/%05d.MTS" % n, F.make_ts(s, packets=rng.randint(2000, 7000), m2ts=True)
+    if kind == "flac":
+        return "MUSIC/%03d.flac" % n, F.make_flac(s, seconds=rng.uniform(2, 8))
+    if kind == "opus":
+        return "VOICE/%03d.opus" % n, F.make_ogg(s, seconds=rng.uniform(10, 60))
+    if kind == "mp4":
+        return "DCIM/MVI_%04d.MP4" % n, make_video(s, frames=rng.randint(60, 160))
+    if kind == "jpg":
+        w = rng.choice([1200, 1600])
+        return "DCIM/IMG_%04d.JPG" % n, make_photo(s, width=w, height=w * 3 // 4, style=PHOTO_STYLE)
+    if kind == "amr":
+        return "VOICE/%03d.amr" % n, F.make_amr(s, seconds=rng.uniform(10, 60))
+    if kind == "mpg":
+        return "MP_ROOT/MOV%03d.MOD" % n, F.make_ps(s, packs=rng.randint(200, 700))
+    if kind == "doc":
+        return "Documents/report%03d.doc" % n, F.make_ole(s, size=rng.randint(8000, 120000))
+    if kind == "pdf":
+        return "Documents/report%03d.pdf" % n, F.make_pdf(s, pages=rng.randint(2, 30))
+    if kind == "docx":
+        return "Documents/letter%03d.docx" % n, F.make_docx(s, paragraphs=rng.randint(20, 400))
+    if kind == "wav":
+        return "RECORD/REC%04d.WAV" % n, F.make_wav(s, seconds=rng.uniform(10, 120))
+    if kind == "avi":
+        return "DCIM/100MEDIA/IMAG%04d.AVI" % n, F.make_avi(s, frames=rng.randint(20, 80))
+    if kind == "raw":
+        return "DCIM/100CANON/IMG_%04d.CR2" % n, F.make_raw(s, raw_size=rng.randint(1_000_000, 3_000_000))
+    if kind == "gif":
+        return "Pictures/anim%03d.gif" % n, F.make_gif(s, frames=rng.randint(1, 8))
+    if kind == "heic":
+        return "DCIM/100APPLE/IMG_%04d.HEIC" % n, F.make_heic(s, size=rng.randint(800_000, 2_500_000))
+    if kind == "webm":
+        return "Movies/screen%03d.webm" % n, F.make_mkv(s, clusters=rng.randint(3, 10), webm=True)
+    if kind == "mkv":
+        return "Videos/clip%03d.mkv" % n, F.make_mkv(s, clusters=rng.randint(3, 10))
+    raise ValueError(kind)
+
+
+def single_kind(workdir: str, kind: str, seed: int, cluster_size: int = 4096, size: int = 384 * 1024**2,
+                fs: str = "FAT32") -> Scenario:
+    """One device, one kind of file: a music stick, a dashcam, a camcorder, a
+    voice recorder. Files of the same kind sit side by side and fragment into
+    each other's holes, which is the hardest case for telling them apart.
+    Three rounds of saving and deleting, then a format that recreates the
+    folders. Ground truth as in mixed_device."""
+    import random as _random
+    rng = _random.Random("one-%s-%d" % (kind, seed))
+    img = os.path.join(workdir, "one-%s-%d-%s.img" % (kind, seed, fs.lower()))
+    present: dict = {}
+    ever: set = set()
+    counter = [0]
+
+    def save(card, k):
+        for _ in range(k):
+            counter[0] += 1
+            path, data = _one_kind_file(kind, rng, counter[0])
+            cl = card.write_file(path, data, _when(counter[0]))
+            present[path] = (data, set(cl))
+            ever.add(_sha(data))
+
+    def delete(card, k):
+        for path in rng.sample(sorted(present), min(k, len(present))):
+            card.delete(path)
+            del present[path]
+
+    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+        save(card, 24)
+        delete(card, 10)
+        save(card, 14)
+        delete(card, 8)
+        save(card, 8)
+        top = sorted({p.split("/")[0] for p in present})
+        card.format(recreate_dirs=top)
+        used = card.allocated_clusters()
+    truth = {_sha(d): p for p, (d, cl) in present.items() if not (cl & used)}
+    frag = {_sha(d) for p, (d, cl) in present.items()
+            if len(cl) > 1 and max(cl) - min(cl) + 1 != len(cl) and _sha(d) in truth}
+    sc = Scenario("one-" + kind, "Only %s files, 3 rounds of save/delete, formatted" % kind, img, truth, fs=fs)
+    sc.groups["fragmented"] = frag
+    sc.groups["ever written"] = ever
+    return sc

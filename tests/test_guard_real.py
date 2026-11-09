@@ -5,14 +5,15 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
 from recover_anything import devices
 
 
-def _run(*cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+def _run(*cmd, timeout=None):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 def _diag(*parts):
@@ -31,6 +32,39 @@ def _attach(dmg):
     whole = min((e["dev-entry"] for e in ents), key=len)
     mnt = next(e["mount-point"] for e in ents if e.get("mount-point"))
     return whole, mnt
+
+
+def _detach(devs, run=_run, tries=4, wait=5.0, timeout=180):
+    """Detach disk images, innermost first, waiting longer before each new try
+    (DiskArbitration can take a while to let go). Returns {device: why} for
+    every one still attached. Once one is stuck, the ones after it are not
+    tried: they hold its image file, so they can't detach either."""
+    stuck = {}
+    for d in devs:
+        if stuck:
+            stuck[d] = "not tried: %s is still attached from it" % next(iter(stuck))
+            continue
+        why = None
+        for i in range(tries):
+            if i:
+                time.sleep(wait * i)
+            try:
+                r = run("hdiutil", "detach", "-force", d, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                why = "hdiutil detach didn't answer in %d s" % timeout
+                continue
+            if r.returncode == 0:
+                why = None
+                break
+            why = (r.stderr or r.stdout or "exit code %d" % r.returncode).strip()
+        if why:
+            stuck[d] = why
+    return stuck
+
+
+def _stuck_message(stuck):
+    return ("These test disk images are still attached: %s. Eject them in Disk Utility, "
+            "or restart the Mac." % "; ".join("%s (%s)" % kv for kv in stuck.items()))
 
 
 @pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("hdiutil"), reason="macOS only")
@@ -61,8 +95,48 @@ def test_mac_card_image_and_an_image_stored_on_it(tmp_path):
         assert not ok and "same disk" in why, why
         _diag("macOS: card volume, disk image stored on the card: both refused; own disk allowed")
     finally:
-        for d in attached:
-            _run("hdiutil", "detach", "-force", d)
+        # if the checks above failed, that error is the one pytest reports
+        stuck = _detach(attached)
+        if stuck:
+            _diag("macOS:", _stuck_message(stuck))
+    # On a Mac you use, images left attached jam hdiutil and diskutil until a
+    # restart: say so loudly. A CI machine is thrown away after the run, so
+    # there it is only reported (the save guard's checks above still count).
+    if stuck and not os.environ.get("CI"):
+        pytest.fail(_stuck_message(stuck))
+
+
+class _Done:
+    def __init__(self, code, err=""):
+        self.returncode, self.stderr, self.stdout = code, err, ""
+
+
+def test_detach_reports_images_that_stay_attached():
+    calls = []
+
+    def run(*cmd, timeout=None):
+        calls.append(cmd[-1])
+        if cmd[-1] == "/dev/disk7":
+            return _Done(1, "hdiutil: detach: timeout for DiskArbitration expired\n")
+        return _Done(0)
+
+    stuck = _detach(["/dev/disk7", "/dev/disk6"], run=run, wait=0)
+    assert calls == ["/dev/disk7"] * 4                     # retried, and the outer disk not tried
+    assert "DiskArbitration" in stuck["/dev/disk7"]
+    assert "not tried" in stuck["/dev/disk6"]
+    assert "/dev/disk7" in _stuck_message(stuck)
+
+
+def test_detach_retries_and_handles_a_hung_hdiutil():
+    answers = iter([subprocess.TimeoutExpired("hdiutil", 1), _Done(0), _Done(0)])
+
+    def run(*cmd, timeout=None):
+        a = next(answers)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    assert _detach(["/dev/disk7", "/dev/disk6"], run=run, wait=0) == {}
 
 
 # ------------------------------------------------------------------ Windows

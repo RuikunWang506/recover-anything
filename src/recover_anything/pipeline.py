@@ -18,6 +18,13 @@ EXT_KIND = {
     ".arw": "tiff", ".dng": "tiff", ".orf": "tiff", ".rw2": "tiff", ".pef": "tiff", ".srw": "tiff",
     ".avi": "riff", ".wav": "riff", ".webp": "riff", ".pdf": "pdf",
     ".zip": "zip", ".docx": "zip", ".xlsx": "zip", ".pptx": "zip", ".epub": "zip",
+    # not .ts (also TypeScript) or .db (also Thumbs.db): a wrong guess would call a file lost
+    ".mp3": "mp3", ".mp2": "mp3", ".flac": "flac", ".ogg": "ogg", ".opus": "ogg", ".oga": "ogg", ".ogv": "ogg",
+    ".spx": "ogg", ".mts": "ts", ".m2ts": "ts", ".m2t": "ts", ".mkv": "mkv", ".webm": "mkv", ".mka": "mkv",
+    ".sqlite": "sqlite", ".sqlite3": "sqlite", ".gz": "gzip", ".tgz": "gzip", ".bmp": "bmp",
+    # not .mod/.tod (also tracker music) or .msg (also plain mail text)
+    ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".rar": "rar", ".7z": "7z", ".psd": "psd", ".psb": "psd",
+    ".amr": "amr", ".awb": "amr", ".mpg": "ps", ".mpeg": "ps", ".vob": "ps",
 }
 
 
@@ -62,7 +69,7 @@ def _fix_high_word(src, fsr, rec: Found, want: str) -> bool:
             break
         if fsr.is_allocated(c):
             continue
-        head = src.read(fsr.cluster_offset(c), 16)
+        head = src.read(fsr.cluster_offset(c), carver.HEAD)
         if carver.identify(head) == want:
             rec.extents = fsr.contiguous_extents(c, rec.expected_size)
             rec.meta["start_cluster"] = c
@@ -172,13 +179,15 @@ class _Owner:
         return at < self.verified or at in self.refs
 
     def _contents(self):
-        from .formats import others
+        from .formats import more, others
         from .validate import validate_zip
         rec, r = self.rec, self.reader
         kind, check = rec.kind, rec.meta.get("check")
         try:
             if kind == "png" and check == "full":
                 return r.length, set()  # every chunk's checksum matched
+            if kind in more.DENSE or (kind == "sqlite" and check == "full"):
+                return r.length, set()  # checked frame by frame or page by page, with nothing in between
             if kind == "zip":
                 if check == "full":
                     return r.length, set()  # every member's checksum matched
@@ -198,6 +207,13 @@ class _Owner:
         return 0, set()
 
 
+def _can_claim(r: Found) -> bool:
+    """A file that checked out claims what it holds. A container whose contents
+    couldn't all be proven (a deleted RAW: its sensor data can't be checked)
+    still claims what its own structure points to, and nothing else."""
+    return r.status == "ok" or (r.status == "unverified" and r.kind in ("tiff", "riff", "isobmff", "zip"))
+
+
 def _drop_embedded(src, recs: list[Found]) -> None:
     """A file found inside another file that checked out is either part of it
     (a preview inside a RAW, a photo stored in a ZIP, a frame of a Motion-JPEG
@@ -206,7 +222,7 @@ def _drop_embedded(src, recs: list[Found]) -> None:
     is checked by structure only, and a fragmented one "contains" whatever
     happens to follow its first piece on the card."""
     import heapq
-    spans = sorted((o, o + n, i, r) for i, r in enumerate(recs) if r.status == "ok" and r.extents
+    spans = sorted((o, o + n, i, r) for i, r in enumerate(recs) if _can_claim(r) and r.extents
                    for o, n in r.extents)
     if not spans:
         return
@@ -252,12 +268,24 @@ def _lenient(head: bytes, want: str) -> bool:
         return len(head) >= 8 and head[4:8] in TOP_LEVEL
     if want == "riff":
         return head[:4] == b"RIFF"
+    if want == "ts":
+        from .formats.more import _ts_layout
+        return _ts_layout(head) is not None  # a clip cut from a longer recording starts mid-stream
     return False
+
+
+def _brand_clash(head: bytes, ext: str) -> bool:
+    """A name says video (.mp4/.mov) but the data is a still picture
+    (.heic/.avif/.cr3), or the other way round."""
+    from .formats.others import isobmff_ext
+    if head[4:8] != b"ftyp" or ext not in EXT_KIND:
+        return False
+    return carver.group_of("isobmff", isobmff_ext(head)) != carver.group_of("isobmff", ext)
 
 
 def _identify_record(src, fsr, r: Found) -> None:
     want = EXT_KIND.get(r.ext)
-    head = src.read(r.start, 16) if r.extents else b""
+    head = src.read(r.start, carver.HEAD) if r.extents else b""
     got = carver.identify(head)
     if want and got != want and r.deleted and r.meta.get("high_word_zero"):
         if _fix_high_word(src, fsr, r, want):
@@ -272,9 +300,10 @@ def _identify_record(src, fsr, r: Found) -> None:
     live = not r.deleted
     if live:
         r.meta["live"] = True
-    if want and got and got != want and not live:
+    if want and got and not live and (got != want or (got == "isobmff" and _brand_clash(head, r.ext))):
         # The folder entry says one thing, the data at its start is another
-        # file: this file's own beginning was overwritten.
+        # file: this file's own beginning was overwritten. (An MP4 and an
+        # iPhone HEIC photo share a container, so compare what they hold.)
         r.kind = want
         r.status, r.note = "lost", "its space now holds a different file"
         return
@@ -381,6 +410,11 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
             for o, n in r.extents:
                 claimed.add(o, o + n)
     known = {r.start for r in all_found if r.status != "lost" and r.extents}
+    # A frame or packet in the middle of a recording the folders already name
+    # is not another recording.
+    from .formats.more import STREAMS
+    streams_known = sorted((o, o + n, r.kind) for r in all_found if r.kind in STREAMS and r.status != "lost"
+                           for o, n in r.extents)
     regions, pos = [], 0
     for a, b in sorted(skip_ranges):
         if a > pos:
@@ -391,7 +425,8 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
     headers_all = []
     for a, b in regions:
         carved, headers = carver.carve(src, a, b, 512, 0, known, claimed,
-                                       progress=lambda d, t: prog("scan", d, t), kinds=kinds)
+                                       progress=lambda d, t: prog("scan", d, t), kinds=kinds,
+                                       inside_known=streams_known)
         headers_all += headers
         all_found += carved
     for vr in res.volumes:
@@ -435,6 +470,8 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
         pass
     _mark_unreadable(all_found, bad)
     res.found = [r for r in all_found if r.status != "embedded" and (include_live or not r.meta.get("live"))]
+    if kinds:  # --only: the files the folders name are filtered too, not just carved ones
+        res.found = [r for r in res.found if carver.group_of(r.kind, r.ext) in kinds]
     res.live_count = sum(1 for r in all_found if r.meta.get("live"))
     res.bad_ranges = bad
     res.seconds = time.time() - t0
