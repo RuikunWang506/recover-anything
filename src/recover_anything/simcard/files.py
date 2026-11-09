@@ -559,9 +559,10 @@ def make_wav(seed: int, seconds: float = 10.0, rate: int = 16000, channels: int 
 
 
 # ------------------------------------------------------------------ AVI
-def make_avi(seed: int, frames: int = 30, width: int = 320, height: int = 240) -> bytes:
+def make_avi(seed: int, frames: int = 30, width: int = 320, height: int = 240, audio: int = 0) -> bytes:
     """A Motion-JPEG AVI, as trail cameras and older digital cameras write:
-    every frame is a JPEG in a '00dc' chunk, with an idx1 index at the end."""
+    every frame is a JPEG in a '00dc' chunk, with an idx1 index at the end.
+    `audio`: bytes of sound (a '01wb' chunk) after each frame."""
     from .media import make_photo
     rng = _rng("avi", seed)
     jpegs = [make_photo(seed * 1000 + i, width=width, height=height, thumbnail=False, noise=4.0,
@@ -571,6 +572,9 @@ def make_avi(seed: int, frames: int = 30, width: int = 320, height: int = 240) -
     for j in jpegs:
         idx += b"00dc" + struct.pack("<III", 0x10, len(movi), len(j))
         movi += b"00dc" + struct.pack("<I", len(j)) + j + bytes(len(j) & 1)
+        if audio:
+            idx += b"01wb" + struct.pack("<III", 0, len(movi), audio)
+            movi += b"01wb" + struct.pack("<I", audio) + _noise(rng, audio) + bytes(audio & 1)
     big = max(len(j) for j in jpegs)
     avih = struct.pack("<IIIIIIIIII4I", 66666, big * 15, 0, 0x10, frames, 0, 1, big, width, height, 0, 0, 0, 0)
     strh = b"vidsMJPG" + struct.pack("<IHHIIIIIIIIhhhh", 0, 0, 0, 0, 1, 15, 0, frames, big, 10000, 0,
