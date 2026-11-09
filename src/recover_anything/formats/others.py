@@ -509,7 +509,7 @@ def probe_pdf(head: bytes) -> bool:
 
 
 def measure_pdf(read, start: int, limit: int, stop_at=None) -> Result:
-    pos, eofs, chunk = 0, [], 1 << 20
+    pos, eofs, chunk, last = 0, [], 1 << 20, 0
     tail = b""
     while pos < limit:
         data = read(start + pos, min(chunk, limit - pos))  # never past the next file's header
@@ -526,11 +526,16 @@ def measure_pdf(read, start: int, limit: int, stop_at=None) -> Result:
         if stop_at and eofs and stop_at(pos + len(data)):
             break
         tail = buf[-5:]
+        used = len(data.rstrip(b"\x00"))
+        if used:
+            last = pos + used  # the last byte that isn't blank
         pos += len(data)
-        if eofs and data.count(0) == len(data):
-            break
+        if not used:
+            break  # blank space: the file (or its first piece) ended before it
     if not eofs:
-        return Result(0, False, ".pdf", "no end marker")
+        # Its end isn't in reach: keep what was found as its first piece (the
+        # rest may be elsewhere on the card, for the rebuild to find).
+        return Result(last, False, ".pdf", "no end marker", break_pos=last)
     # The file ends at the last end marker that is its own: the startxref
     # before it points back to a cross-reference section inside the file. A
     # later one (a deleted PDF's leftover tail in the free space after this
@@ -558,8 +563,55 @@ def probe_zip(head: bytes) -> bool:
     return len(head) >= 6 and head[:4] == b"PK\x03\x04" and 10 <= struct.unpack("<H", head[4:6])[0] <= 63
 
 
+_ZIP_KINDS = ((b"word/", ".docx"), (b"xl/", ".xlsx"), (b"ppt/", ".pptx"), (b"META-INF/container.xml", ".epub"),
+              (b"AndroidManifest.xml", ".apk"))
+
+
+def _zip_walk(read, start: int, limit: int):
+    """Follow the local headers from the start, each member's stated size to
+    the next. (where the chain ends, whether it reached the central directory,
+    an extension guessed from the member names), or None when sizes aren't
+    known up front (ZIP64, sizes written after the data)."""
+    pos, names = 0, b""
+    while pos + 30 <= limit:
+        h = read(start + pos, 30)
+        if h[:4] in (b"PK\x01\x02", b"PK\x05\x06"):
+            return pos, True, names
+        if len(h) < 30 or h[:4] != b"PK\x03\x04":
+            return pos, False, names
+        flags, _m, _t, _d, _c, csize, usize, nlen, xlen = struct.unpack("<HHHHIIIHH", h[6:30])
+        if flags & 8 or 0xFFFFFFFF in (csize, usize):
+            return None
+        names += read(start + pos + 30, min(nlen, 256)) + b"\n"
+        pos += 30 + nlen + xlen + csize
+    return min(pos, limit), False, names
+
+
+def _zip_ext(names: bytes) -> str:
+    if b"[Content_Types].xml" in names or b"META-INF/container.xml" in names or b"AndroidManifest.xml" in names:
+        for key, ext in _ZIP_KINDS:
+            if key in names:
+                return ext
+    return ".zip"
+
+
 def measure_zip(read, start: int, limit: int) -> Result:
-    pos, chunk = 0, 1 << 20
+    walk = _zip_walk(read, start, limit)
+    if walk is not None and not walk[1]:
+        # The chain of members breaks. An Android app keeps a signing block
+        # there, so look a little further for the archive's end record; with
+        # none, the rest of it is somewhere else (or gone): keep what checked
+        # out, and don't search the rest of the card.
+        pos, _, names = walk
+        got = _zip_end(read, start, pos, min(limit, pos + (16 << 20)))
+        return got or Result(pos, False, _zip_ext(names), "the rest of it isn't where it should be", break_pos=pos)
+    return _zip_end(read, start, walk[0] if walk else 0, limit) or Result(0, False, ".zip", "no central directory")
+
+
+def _zip_end(read, start: int, pos: int, limit: int):
+    """The archive whose end record (with its directory right before it) lies
+    in [pos, limit), or None."""
+    chunk = 1 << 20
     while pos < limit:
         data = read(start + pos, chunk + 22)
         if not data:
@@ -585,4 +637,4 @@ def measure_zip(read, start: int, limit: int) -> Result:
                 return Result(eocd + 22 + clen, True, ext)
             i = data.find(b"PK\x05\x06", i + 1)
         pos += chunk
-    return Result(0, False, ".zip", "no central directory")
+    return None

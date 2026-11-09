@@ -28,6 +28,8 @@ import zlib
 from . import jpeg
 from .others import measure_riff, measure_tiff
 
+NO_TABLE = "its cross-reference table can't be read, so its contents can't be checked"
+EMPTY_TABLE = "its cross-reference table lists nothing here, so its contents can't be checked"
 UNPROVEN = ("its structure checks out, but parts of it can't be checked here, so it can't prove all of "
             "its contents; check that it opens")
 MAX_PDF = 256 << 20       # bytes of PDF read into memory to check
@@ -165,12 +167,10 @@ def validate_pdf(read, length: int, layout_known: bool = False, deep: bool = Tru
     data = read(0, length)
     xr = _xref(data)
     if xr is None:
-        return ("ok", "structure checked", None) if layout_known else (
-            "unverified", "its cross-reference table can't be read, so its contents can't be checked", None)
+        return ("ok", "structure checked", None) if layout_known else ("unverified", NO_TABLE, None)
     offs, encrypted = xr
     if not offs:  # nothing listed: nothing to check against (an old file's leftover table, say)
-        return ("ok", "structure checked", None) if layout_known else (
-            "unverified", "its cross-reference table lists nothing here, so its contents can't be checked", None)
+        return ("ok", "structure checked", None) if layout_known else ("unverified", EMPTY_TABLE, None)
     bad, unproven, budget = None, 0, PDF_INFLATE
     order = sorted(set(offs.values()))
     nxt = {o: (order[i + 1] if i + 1 < len(order) else length) for i, o in enumerate(order)}
