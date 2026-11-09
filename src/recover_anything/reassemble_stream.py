@@ -24,6 +24,7 @@ MAX_SCAN = 4000       # free clusters to try after a break
 MAX_TRIALS = 6000     # candidate pieces tried per file, in all
 MAX_PIECES = 64       # more breaks than this: give up on the file
 SPAN = 8              # clusters a single unit (page, frame) may stretch over
+KEEP_STATES = 256     # walker states kept for the latest clusters (see _Rebuild.run)
 
 
 class _Path:
@@ -57,6 +58,7 @@ class _Walker:
     need = 1        # bytes of the next unit needed to tell it isn't there
     checked = -1    # for a weak kind: the last position where something tied the data to what came before
     horizon = 0     # clusters from the failing unit to its next check, when that's further than usual
+    weak = ()       # (start, end) stretches nothing checks: a join inside one proves nothing
 
     def __init__(self, read, expected=None):
         self.read, self.expected = read, expected
@@ -766,7 +768,288 @@ class _Pdf(_Walker):
         return validate_pdf(read, length)
 
 
-WALKERS = {"mp3": _Mp3, "ts": _Ts, "ogg": _Ogg, "flac": _Flac, "gzip": _Gzip, "zip": _Zip, "pdf": _Pdf}
+class _Avi(_Walker):
+    """AVI, chunk by chunk: every chunk header must follow the last chunk
+    exactly, every Motion-JPEG frame must decode as a whole picture, and the
+    index at the end must list the frames where they were found. Audio and
+    other video can't be checked inside, so those stretches are `weak`."""
+
+    strong = True
+    grain = 1 << 16
+    any_cluster = True
+    MJPEG = (b"MJPG", b"mjpg", b"AVRn", b"jpeg", b"JPEG", b"dmb1", b"AVDJ")
+
+    def __init__(self, read, expected=None):
+        super().__init__(read, expected)
+        h = read(0, 12)
+        if h[:4] != b"RIFF" or h[8:12] != b"AVI ":
+            raise ValueError("not an AVI")  # (a WAV or WebP: nothing in it to rebuild by)
+        size = struct.unpack("<I", h[4:8])[0]
+        self.riff_end = 8 + size + (size & 1)
+        self.pos = 12
+        self.codecs: dict = {}
+        self.chunks: dict = {}
+        self.movi = None
+        self.weak = []
+        self.after_weak = None  # where the unchecked chunk just walked began
+
+    def _bad(self):
+        """A check failed: if it came right after a stretch nothing checks, the
+        wrong piece may be anywhere in that stretch."""
+        if self.after_weak is not None:
+            self.unit = self.after_weak
+            self.horizon = (self.pos - self.after_weak) // max(1, self.grain) + 2
+        return "bad"
+
+    def advance(self, limit):
+        read, g = self.read, self.grain
+        while True:
+            self.unit = self.pos
+            if self.pos >= self.riff_end:
+                h = read(self.pos, 12) if self.pos + 12 <= limit else b""
+                if h[:4] == b"RIFF" and h[8:12] == b"AVIX":  # (a long recording goes on in another RIFF)
+                    size = struct.unpack("<I", h[4:8])[0]
+                    self.riff_end = self.pos + 8 + size + (size & 1)
+                    self.pos += 12
+                    continue
+                if h == b"" and self.riff_end > 1 << 29 and (self.expected is None or self.pos < self.expected):
+                    return "need"  # a part this big may go on in another one: look at what follows
+                self.end = self.riff_end
+                return "end"
+            if self.pos + 12 > limit:
+                return "need"
+            h = read(self.pos, 12)
+            fourcc, size = h[:4], struct.unpack("<I", h[4:8])[0]
+            body = self.pos + 8
+            if not all(32 <= b < 127 for b in fourcc) or body + size > self.riff_end:
+                return self._bad()
+            if fourcc == b"LIST":
+                if h[8:12] == b"hdrl":
+                    if body + size > limit:
+                        return "need"
+                    self._streams(read(body + 4, size - 4))
+                elif h[8:12] == b"movi":
+                    self.movi = body
+                self.pos = body + 4  # walk into the list
+                continue
+            kind = fourcc[2:4]
+            if fourcc[:2].isdigit() and kind in (b"dc", b"db") and size:
+                codec = self.codecs.get(int(fourcc[:2]))
+                if body + size > limit:
+                    self.horizon = size // g + 2  # the frame is checked as a whole
+                    return "need"
+                frame = read(body, 4)
+                if codec in self.MJPEG or (codec is None and frame[:3] == b"\xff\xd8\xff"):
+                    from .formats import jpeg
+                    data = read(body, size)
+                    # markers first (most wrong clusters fail there), then the full decode
+                    if jpeg.check_fast(data)[0] != "ok" or jpeg.check(data)[0] != "ok":
+                        return "bad"
+                    self.after_weak = None
+                else:
+                    if not (frame[:3] == b"\x00\x00\x01" or frame == b"\x00\x00\x00\x01"):
+                        return self._bad()
+                    self.weak.append((body + 4, body + size))  # only its start is checked
+                    self.after_weak = self.pos
+                self.chunks[self.pos] = (fourcc, size)
+            elif fourcc == b"idx1":
+                if body + size > limit:
+                    return "need"
+                if not self._index(read(body, size)):
+                    return self._bad()
+            else:
+                if fourcc[:2].isdigit():
+                    self.chunks[self.pos] = (fourcc, size)
+                self.weak.append((body, body + size))  # audio, padding: nothing checks it
+                if self.after_weak is None:
+                    self.after_weak = self.pos
+                if body + size > limit:
+                    return "need"
+            self.horizon = 0
+            self.pos = body + size + (size & 1)
+
+    def _streams(self, hdrl: bytes):
+        n, p = 0, 0
+        while p + 8 <= len(hdrl):
+            fourcc, size = hdrl[p:p + 4], struct.unpack("<I", hdrl[p + 4:p + 8])[0]
+            if fourcc == b"LIST" and hdrl[p + 8:p + 12] == b"strl":
+                strh = hdrl[p + 12:p + 12 + 64]
+                if strh[:4] == b"strh" and strh[8:12] == b"vids":
+                    self.codecs[n] = strh[12:16]
+                    q = p + 12 + 8 + struct.unpack("<I", strh[4:8])[0]
+                    strf = hdrl[q:q + 28]
+                    if strf[:4] == b"strf" and strf[24:28].strip(b"\0"):
+                        self.codecs[n] = strf[24:28]
+                n += 1
+            p += 8 + size + (size & 1)
+
+    def _index(self, idx: bytes) -> bool:
+        base = None
+        for k in range(0, len(idx) - 15, 16):
+            ck, _flags, off, size = struct.unpack("<4sIII", idx[k:k + 16])
+            if base is None:  # offsets count from the 'movi' fourcc (or just after it), or from the start
+                base = next((b for b in (self.movi or 0, (self.movi or 0) + 4, 0) if b + off in self.chunks), None)
+                if base is None:
+                    return False
+            if self.chunks.get(base + off, (ck, size)) != (ck, size):
+                return False
+        return True
+
+    def proven_end(self):
+        return self.end is not None
+
+
+class _Lzw:
+    """GIF's LZW, fed in pieces: counts the pixels, fails on a code that can't be."""
+
+    def __init__(self, min_size: int):
+        if not 2 <= min_size <= 8:
+            raise ValueError("bad LZW code size")
+        self.min = min_size
+        self.clear, self.eoi = 1 << min_size, (1 << min_size) + 1
+        self.lens = [1] * self.clear + [0] * (4096 - self.clear)
+        self.size, self.nxt, self.prev = min_size + 1, self.eoi + 1, -1
+        self.count = self.acc = self.nacc = 0
+        self.ended = False
+
+    def copy(self):
+        c = _Lzw.__new__(_Lzw)
+        c.__dict__.update(self.__dict__)
+        c.lens = list(self.lens)
+        return c
+
+    def feed(self, data: bytes) -> bool:
+        acc, nacc, size = self.acc, self.nacc, self.size
+        lens, count, prev, nxt = self.lens, self.count, self.prev, self.nxt
+        clear, eoi = self.clear, self.eoi
+        ok = True
+        for b in data:
+            acc |= b << nacc
+            nacc += 8
+            while nacc >= size and not self.ended:
+                code = acc & ((1 << size) - 1)
+                acc >>= size
+                nacc -= size
+                if code == clear:
+                    size, nxt, prev = self.min + 1, eoi + 1, -1
+                    continue
+                if code == eoi:
+                    self.ended = True
+                    break
+                if prev < 0:
+                    if code >= clear:
+                        ok = False
+                        break
+                    count += 1
+                elif code < nxt:
+                    count += lens[code]
+                elif code == nxt:
+                    count += lens[prev] + 1
+                else:
+                    ok = False
+                    break
+                if prev >= 0 and nxt < 4096:
+                    lens[nxt] = lens[prev] + 1
+                    nxt += 1
+                    if nxt == 1 << size and size < 12:
+                        size += 1
+                prev = code
+            if not ok:
+                break
+        self.acc, self.nacc, self.size, self.count, self.prev, self.nxt = acc, nacc, size, count, prev, nxt
+        return ok
+
+
+class _Gif(_Walker):
+    """GIF, block by block: each picture's compressed data must decode to
+    exactly its number of pixels, every code valid where it stands. Comment
+    and application blocks can't be checked (`weak`)."""
+
+    strong = True
+    grain = 1 << 16
+    any_cluster = True
+
+    def __init__(self, read, expected=None):
+        super().__init__(read, expected)
+        h = read(0, 13)
+        if h[:6] not in (b"GIF87a", b"GIF89a"):
+            raise ValueError("not a GIF")
+        self.pos = 13 + (3 * (2 << (h[10] & 7)) if h[10] & 0x80 else 0)
+        self.lzw = None
+        self.want = 0
+        self.pic = 0
+        self.weak = []
+        self.ext = False
+
+    def snapshot(self):
+        snap = super().snapshot()
+        snap["lzw"] = self.lzw.copy() if self.lzw is not None else None
+        return snap
+
+    def restore(self, snap):
+        super().restore(snap)
+        self.lzw = snap["lzw"].copy() if snap["lzw"] is not None else None
+
+    def advance(self, limit):
+        read = self.read
+        while True:
+            if self.lzw is not None or self.ext:
+                # sub-blocks: a length byte, then that many bytes; 0 ends them
+                if self.pos >= limit:
+                    return "need"
+                n = read(self.pos, 1)[0]
+                if n == 0:
+                    self.pos += 1
+                    if self.lzw is not None and self.lzw.count != self.want:
+                        self.unit = self.pic
+                        return "bad"
+                    self.lzw, self.ext = None, False
+                    continue
+                if self.pos + 1 + n > limit:
+                    return "need"
+                if self.lzw is not None:
+                    if not self.lzw.feed(read(self.pos + 1, n)) or self.lzw.count > self.want:
+                        self.unit = max(self.pic, self.pos - self.grain)
+                        return "bad"
+                else:
+                    self.weak.append((self.pos + 1, self.pos + 1 + n))
+                self.pos += 1 + n
+                continue
+            self.unit = self.pos
+            if self.pos >= limit:
+                return "need"
+            b = read(self.pos, 1)[0]
+            if b == 0x3B:
+                self.end = self.pos + 1
+                return "end"
+            if b == 0x21:
+                self.pos += 2
+                self.ext = True
+                continue
+            if b != 0x2C:
+                return "bad"
+            if self.pos + 11 > limit:
+                return "need"
+            d = read(self.pos, 11)
+            w, h = struct.unpack("<HH", d[5:9])
+            lf = d[9]
+            self.pic = self.pos
+            self.pos += 10 + (3 * (2 << (lf & 7)) if lf & 0x80 else 0)
+            if self.pos >= limit:
+                return "need"
+            try:
+                self.lzw = _Lzw(read(self.pos, 1)[0])
+            except ValueError:
+                return "bad"
+            self.want = w * h
+            self.pos += 1
+
+    def proven_end(self):
+        return self.end is not None
+
+
+WALKERS = {"mp3": _Mp3, "ts": _Ts, "ogg": _Ogg, "flac": _Flac, "gzip": _Gzip, "zip": _Zip, "pdf": _Pdf,
+           "riff": _Avi, "gif": _Gif}
 
 
 # ------------------------------------------------------------------ the search
@@ -824,6 +1107,10 @@ class _Rebuild:
         complete: the part that checked out before the trail went cold."""
         w = self.w
         snap = w.snapshot()
+        # The walker's state each time it needed more than the first L clusters:
+        # a trial for slot j >= L starts from there instead of re-checking
+        # everything since the last fix (the state depends only on those L).
+        self.snaps: dict = {}
         while True:
             st = w.advance(self.limit())
             if st == "end":
@@ -831,6 +1118,8 @@ class _Rebuild:
             if st == "need" and self.expected and len(self.path) * self.cs >= self.expected:
                 st = "bad"  # all the clusters its size calls for, and still not finished: one is wrong
             if st == "need":
+                self.snaps[len(self.path)] = w.snapshot()
+                self.snaps.pop(len(self.path) - KEEP_STATES, None)
                 c = self.next_free(self.path[-1], set(self.path))
                 if c is None:
                     return self._prefix(w.unit) + (False,)
@@ -852,10 +1141,19 @@ class _Rebuild:
             fix = self._search(first, u, snap, max(SPAN, w.horizon))
             if fix is None:
                 return self._prefix(w.unit) + (False,)
+            # the slot that changed (the trial may have run on past it): later states are stale
+            j = next((i for i, (a, b) in enumerate(zip(fix, self.path)) if a != b), min(len(fix), len(self.path)))
+            for L in [L for L in self.snaps if L > j]:
+                del self.snaps[L]
             self.path[:] = fix
-            w.restore(snap)
+            w.restore(self._base(j, snap))
             snap = w.snapshot()
             continue
+
+    def _base(self, j: int, snap):
+        """The latest saved state that only depends on the clusters before slot j."""
+        L = max((L for L in self.snaps if L <= j), default=None)
+        return self.snaps[L] if L is not None else snap
 
     def _search(self, first: int, u: int, snap, span: int = SPAN):
         """Try the next piece starting at each slot the failing unit covers."""
@@ -865,16 +1163,17 @@ class _Rebuild:
             # before the (k+1)-th for any, so a break in a later slot is found
             # without first exhausting the earlier ones.
             state = {j: self.path[j - 1] for j in slots}
+            taken = {j: set(self.path[:j]) for j in slots}
             live = list(slots)
             for _k in range(MAX_SCAN):
                 if not live or self.trials >= MAX_TRIALS:
                     break
                 for j in list(live):
                     prefix = self.path[:j]
-                    c = self.next_free(state[j], set(prefix), skip_soft)
+                    c = self.next_free(state[j], taken[j], skip_soft)
                     while c is not None and (c == self.path[j] or (not skip_soft and self.soft is not None
                                                                      and not self.soft[c])):
-                        c = self.next_free(c, set(prefix), skip_soft)  # what failed, or tried in round one
+                        c = self.next_free(c, taken[j], skip_soft)  # what failed, or tried in round one
                     if c is None:
                         live.remove(j)
                         continue
@@ -892,7 +1191,7 @@ class _Rebuild:
         saved = self.path[:]
         self.path[:] = trial
         try:
-            w.restore(snap)
+            w.restore(self._base(j, snap))
             goal = (j + 1) * self.cs
             taken = set(trial)
             for _ in range(span + 1):
@@ -965,7 +1264,12 @@ def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=Non
         sized = r.expected_size is not None and length == r.expected_size
         cs = geom.cluster_size
         seams = [i * cs for i in range(1, len(clusters)) if clusters[i] != clusters[i - 1] + 1]
-        if w.strong and final is not None and st != "ok":
+        weak = [(a, b) for a, b in getattr(rb.w, "weak", ()) if any(a < x < b for x in seams)]
+        if w.strong and weak:
+            r.status = "unverified"
+            r.note = ("rebuilt from %d pieces, but a join falls in data nothing in it can check; "
+                      "check that it plays" % pieces)
+        elif w.strong and final is not None and st != "ok":
             r.status, r.note = "unverified", why  # (parts of it can't be checked: say which)
         elif w.strong:
             r.status, r.note = "ok", "every piece checked"

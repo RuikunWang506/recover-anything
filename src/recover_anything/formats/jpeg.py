@@ -322,6 +322,21 @@ class _Huff:
         self.lookup = lookup
 
 
+_HUFF_CACHE: dict = {}
+
+
+def _huff(counts, syms) -> _Huff:
+    """A table's lookup, built once: a camera uses the same few tables for
+    every photo and every video frame, and a rebuild makes many decoders."""
+    key = (tuple(counts), tuple(syms))
+    t = _HUFF_CACHE.get(key)
+    if t is None:
+        if len(_HUFF_CACHE) >= 32:
+            _HUFF_CACHE.clear()  # (each table is 512 KB: keep only a few)
+        t = _HUFF_CACHE[key] = _Huff(counts, syms)
+    return t
+
+
 # Standard tables (ITU T.81 Annex K) for "motion JPEG" files that omit DHT.
 _STD = {
     (0, 0): ([0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], list(range(12))),
@@ -352,10 +367,10 @@ class Decoder:
         vmax = max(c[2] for c in h.components)
         tables = {}
         for k, v in h.huff.items():
-            tables[k] = _Huff(*v)
+            tables[k] = _huff(*v)
         for k, v in _STD.items():
             if k not in tables:
-                tables[k] = _Huff(*v)
+                tables[k] = _huff(*v)
         self.units = []  # per scan component: (dc lookup, ac lookup, h, v, is_luma)
         try:
             for i, (cid, td, ta) in enumerate(h.scan):
@@ -628,7 +643,7 @@ def luma_pixels(data: bytes, max_pixels: int = 1 << 20):
     q = h.qt.get(h.components[0][3])
     if not q:
         raise JpegError("no quantization table")
-    tables = {k: _Huff(*v) for k, v in h.huff.items()}
+    tables = {k: _huff(*v) for k, v in h.huff.items()}
     comps = {c[0]: c for c in h.components}
     try:
         units = [(tables[(0, td)].lookup, tables[(1, ta)].lookup, comps[cid][1], comps[cid][2])
