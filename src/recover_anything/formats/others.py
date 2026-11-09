@@ -296,6 +296,155 @@ def _find(read, b, e, path):
     return b, e
 
 
+# ---------------------------------------------------------------------- HEIF
+def heif_items(read, length: int):
+    """{item: (type, [(file offset, length)])} of a HEIF picture (HEIC, AVIF):
+    what each item is ('iinf') and where its data lies ('iloc'). None if there
+    is no readable table."""
+    meta = next(((b, e) for t, b, e in _boxes(read, 0, length) if t == b"meta"), None)
+    if meta is None:
+        return None
+    types, locs, idat = {}, {}, None
+    for typ, cb, ce in _boxes(read, meta[0] + 4, meta[1]):  # (meta is a full box)
+        if typ == b"iinf":
+            ver = read(cb, 1)[0]
+            start = cb + 4 + (2 if ver == 0 else 4)
+            for t2, ib, ie in _boxes(read, start, ce):
+                if t2 != b"infe":
+                    continue
+                h = read(ib, 14)
+                if h[0] == 2:
+                    types[struct.unpack(">H", h[4:6])[0]] = h[8:12]
+                elif h[0] == 3:
+                    types[struct.unpack(">I", h[4:8])[0]] = h[10:14]
+        elif typ == b"iloc":
+            d = read(cb, min(ce - cb, 1 << 20))
+            ver, p = d[0], 4
+            osz, lsz = d[p] >> 4, d[p] & 15
+            bsz, isz = d[p + 1] >> 4, (d[p + 1] & 15 if ver in (1, 2) else 0)
+            p += 2
+            wid = 2 if ver < 2 else 4
+            n = int.from_bytes(d[p:p + wid], "big")
+            p += wid
+            for _ in range(min(n, 100000)):
+                iid = int.from_bytes(d[p:p + wid], "big")
+                p += wid
+                method = 0
+                if ver in (1, 2):
+                    method = int.from_bytes(d[p:p + 2], "big") & 15
+                    p += 2
+                p += 2  # data reference
+                base = int.from_bytes(d[p:p + bsz], "big")
+                p += bsz
+                count = int.from_bytes(d[p:p + 2], "big")
+                p += 2
+                ext = []
+                for _ in range(count):
+                    p += isz
+                    off = int.from_bytes(d[p:p + osz], "big")
+                    p += osz
+                    ln = int.from_bytes(d[p:p + lsz], "big")
+                    p += lsz
+                    ext.append((base + off, ln))
+                if p > len(d):
+                    return None
+                locs[iid] = (method, ext)
+        elif typ == b"idat":
+            idat = cb
+    if not locs:
+        return None
+    out = {}
+    for iid, (method, ext) in locs.items():
+        if method == 1 and idat is not None:
+            ext = [(idat + o, n) for o, n in ext]
+        elif method != 0:
+            continue  # (data taken from another item: rare)
+        out[iid] = (types.get(iid, b"????"), [(o, n if n else length - o) for o, n in ext])
+    return out
+
+
+def _nal_chain(read, off: int, ln: int):
+    """HEVC units with 4-byte lengths filling [off, off+ln) exactly, each with a
+    valid header; the first offset where that fails, or None."""
+    p, end = off, off + ln
+    for _ in range(100000):
+        if p == end:
+            return None
+        h = read(p, 6)
+        n = struct.unpack(">I", h[:4])[0] if len(h) >= 4 else 0
+        if len(h) < 6 or n < 2 or p + 4 + n > end or h[4] & 0x80 or (h[4] >> 1) & 0x3F > 40 \
+                or ((h[4] & 1) << 5 | h[5] >> 3) or not h[5] & 7:
+            return p
+        p += 4 + n
+    return p
+
+
+def _obu_chain(read, off: int, ln: int):
+    """AV1 units (each with its size) filling [off, off+ln) exactly; the first
+    offset where that fails, or None."""
+    p, end = off, off + ln
+    for _ in range(100000):
+        if p == end:
+            return None
+        h = read(p, 10)
+        if not h:
+            return p
+        t, ext, sized = (h[0] >> 3) & 15, h[0] >> 2 & 1, h[0] >> 1 & 1
+        if h[0] & 0x81 or not sized or t == 0 or 9 <= t <= 14:
+            return p
+        q, size, shift = 1 + ext, 0, 0
+        while q < len(h):
+            size |= (h[q] & 0x7F) << shift
+            shift += 7
+            q += 1
+            if not h[q - 1] & 0x80:
+                break
+        else:
+            return p
+        if p + q + size > end:
+            return p
+        p += q + size
+    return p
+
+
+def validate_heif(read, length: int):
+    """A HEIF picture: every coded item (HEVC or AV1 tiles, the thumbnail) must
+    be made of units whose lengths chain exactly to the end of its data, with
+    valid headers, right where the item table says; a JPEG item must decode
+    and an EXIF item must start like one. As for a video's frames, a cluster
+    inside one tile can't be checked on its own."""
+    from . import jpeg
+    try:
+        items = heif_items(read, length)
+    except (struct.error, IndexError, ValueError):
+        items = None
+    if not items:
+        return "unverified", "no item table", None
+    checked = 0
+    for iid, (typ, ext) in sorted(items.items(), key=lambda kv: kv[1][1][0][0] if kv[1][1] else 0):
+        for off, ln in ext:
+            if off + ln > length:
+                return "corrupt", "item %d lies past the end of the file" % iid, min(off, length)
+            if typ in (b"hvc1", b"hev1", b"av01"):
+                bad = (_nal_chain if typ != b"av01" else _obu_chain)(read, off, ln)
+                if bad is not None:
+                    return "corrupt", "picture tile %d (byte %d) is not where the table says" % (iid, bad), bad
+                checked += 1
+            elif typ == b"jpeg":
+                if jpeg.check(read(off, ln))[0] != "ok":
+                    return "corrupt", "picture %d (byte %d) is damaged" % (iid, off), off
+                checked += 1
+            elif typ == b"Exif":
+                h = read(off, 4)
+                skip = struct.unpack(">I", h)[0] if len(h) == 4 else 1 << 30
+                if skip > ln or read(off + 4 + skip, 4) not in (b"MM\x00*", b"II*\x00") \
+                        and read(off + 4 + skip, 10)[6:10] not in (b"MM\x00*", b"II*\x00"):
+                    return "corrupt", "its EXIF data (byte %d) is not where the table says" % off, off
+    if not checked:
+        return "unverified", "it holds no picture data that can be checked", None
+    return "ok", "every picture tile checked (%d)" % checked, None
+
+
 # ---------------------------------------------------------------------- PNG
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 

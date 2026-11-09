@@ -177,7 +177,9 @@ def test_a_newer_heic_in_an_old_videos_space_is_not_that_video(workdir):
     res = scan(img, workers=1)
     old = [r for r in res.found if r.name == "MVI_0001.MP4"]
     assert old and old[0].status == "lost"
-    assert not [r for r in res.found if r.status == "ok" and r.kind == "isobmff" and r.ext == ".heic"]
+    # (the photo itself is checked tile by tile now: recovered, but only as itself)
+    oks = [r for r in res.found if r.status == "ok" and r.kind == "isobmff"]
+    assert oks and all(r.ext == ".heic" and r.name != "MVI_0001.MP4" and r.read(res._src) == heic for r in oks)
 
 
 def test_fragmented_recordings_and_archives_are_rebuilt(workdir):

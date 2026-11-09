@@ -283,14 +283,68 @@ def make_bmp(seed: int, width: int = 320, height: int = 240) -> bytes:
 
 
 # ------------------------------------------------------------------ HEIC (structure only)
+def _box(t: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", 8 + len(payload)) + t + payload
+
+
+def _fullbox(t: bytes, version: int, flags: int, payload: bytes) -> bytes:
+    return _box(t, bytes([version]) + flags.to_bytes(3, "big") + payload)
+
+
 def make_heic(seed: int, size: int = 900000) -> bytes:
-    """An iPhone-style HEIC container: ftyp, meta, mdat (the image data is noise)."""
+    """An iPhone-style HEIC: the picture is a grid of HEVC tiles (each a
+    length-prefixed NAL unit, its body noise), plus a thumbnail and EXIF, all
+    listed in the item location table ('iloc'). The file is exactly as long as
+    the simpler one this replaced, so simulated cards keep their layout."""
     rng = _rng("heic", seed)
     ftyp = struct.pack(">I", 24) + b"ftypheic" + struct.pack(">I", 0) + b"mif1heic"
-    meta_body = b"\0\0\0\0" + struct.pack(">I", 33) + b"hdlr" + b"\0" * 8 + b"pict" + b"\0" * 13
-    meta = struct.pack(">I", 8 + len(meta_body)) + b"meta" + meta_body
-    mdat = struct.pack(">I", 8 + size) + b"mdat" + _noise(rng, size)
-    return ftyp + meta + mdat
+    total = 24 + 45 + 8 + size
+    cols, rows, tile = 4, 3, 512
+    tiles = list(range(2, 2 + cols * rows))
+    thumb_id, exif_id = tiles[-1] + 1, tiles[-1] + 2
+    grid = bytes([0, 0, rows - 1, cols - 1]) + struct.pack(">HH", cols * tile, rows * tile)
+    exif = struct.pack(">I", 0) + b"Exif\0\0" + b"MM\0*" + struct.pack(">I", 8) + struct.pack(">H", 0) + bytes(4)
+    hvcc = _box(b"hvcC", bytes([1, 1, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 90, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8, 0, 0,
+                                0x0F, 0]))  # lengthSizeMinusOne = 3: 4-byte NAL lengths
+
+    def meta_for(locs):
+        hdlr = _fullbox(b"hdlr", 0, 0, bytes(4) + b"pict" + bytes(12) + b"\0")
+        pitm = _fullbox(b"pitm", 0, 0, struct.pack(">H", 1))
+        items = [(1, b"grid", 1)] + [(t, b"hvc1", 0) for t in tiles] + [(thumb_id, b"hvc1", 0), (exif_id, b"Exif", 0)]
+        iloc = struct.pack(">BBH", 0x44, 0x00, len(items))
+        for i, _t, method in items:
+            off, ln = locs.get(i, (0, 0))
+            iloc += struct.pack(">HHHHII", i, method, 0, 1, off, ln)
+        iinf = struct.pack(">H", len(items)) + b"".join(
+            _fullbox(b"infe", 2, 1 if i in tiles else 0, struct.pack(">HH", i, 0) + t + b"\0") for i, t, _m in items)
+        iref = (_box(b"dimg", struct.pack(">HH", 1, len(tiles)) + b"".join(struct.pack(">H", t) for t in tiles))
+                + _box(b"thmb", struct.pack(">HHH", thumb_id, 1, 1)) + _box(b"cdsc", struct.pack(">HHH", exif_id, 1, 1)))
+        ipco = _box(b"ipco", hvcc + _fullbox(b"ispe", 0, 0, struct.pack(">II", tile, tile))
+                    + _fullbox(b"ispe", 0, 0, struct.pack(">II", cols * tile, rows * tile)))
+        ipma = struct.pack(">I", len(tiles) + 2) + struct.pack(">HBB", 1, 1, 0x82) + b"".join(
+            struct.pack(">HBBB", i, 2, 0x81, 0x02) for i in tiles + [thumb_id])
+        body = (hdlr + pitm + _fullbox(b"iloc", 1, 0, iloc) + _fullbox(b"iinf", 0, 0, iinf)
+                + _fullbox(b"iref", 0, 0, iref) + _box(b"iprp", ipco + _fullbox(b"ipma", 0, 0, ipma))
+                + _box(b"idat", grid))
+        return _fullbox(b"meta", 0, 0, body)
+
+    meta_len = len(meta_for({}))
+    room = total - len(ftyp) - meta_len - 8 - len(exif)  # the coded picture data
+    thumb = max(64, room // 25)
+    each = (room - thumb) // len(tiles)
+    sizes = [each] * len(tiles)
+    sizes[-1] += room - thumb - each * len(tiles)
+    units, locs, pos = [], {1: (0, len(grid))}, len(ftyp) + meta_len + 8
+    for i, n in zip(tiles + [thumb_id], sizes + [thumb]):
+        nal = b"\x26\x01" + _noise(rng, n - 6)  # an IDR picture (HEVC NAL type 19)
+        units.append(struct.pack(">I", len(nal)) + nal)
+        locs[i] = (pos, n)
+        pos += n
+    locs[exif_id] = (pos, len(exif))
+    data = b"".join(units) + exif
+    out = ftyp + meta_for(locs) + _box(b"mdat", data)
+    assert len(out) == total, (len(out), total)
+    return out
 
 
 # ------------------------------------------------------------------ OLE2 (old Office)

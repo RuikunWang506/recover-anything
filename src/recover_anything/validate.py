@@ -199,6 +199,12 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
     if rec.kind == "isobmff":
         st, why, pos = others.validate_isobmff(r.read, r.length)
         rec.meta["check"] = "full" if st == "ok" else "structure"
+        if st == "unverified" and why == "no moov box":
+            # a HEIF picture (HEIC, AVIF): its item table says where every tile is
+            hst, hwhy, hpos = others.validate_heif(r.read, r.length)
+            if hst != "unverified":
+                st, why, pos = hst, hwhy, hpos
+                rec.meta["check"] = "full" if st == "ok" else "structure"
         if st == "unverified":
             m = others.measure_isobmff(r.read, 0, r.length)
             st = "ok" if m.complete else "partial"
