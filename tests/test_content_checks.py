@@ -134,3 +134,46 @@ def test_a_cut_off_pdf_does_not_swallow_the_next_one():
     card[65536:65536 + len(a)] = a
     card[at:at + len(b)] = b
     assert (at, len(b)) in _carve_pdfs(bytes(card))
+
+
+def test_a_raw_cut_short_is_not_called_recovered():
+    """Regression: a RAW whose sensor data ran past the bytes at hand (an old
+    folder entry's smaller size over a newer photo, or the end of the card)
+    lost that block from the check, and its previews alone called it recovered."""
+    d = F.make_raw(3)
+    cut = len(d) - 200_000  # inside the sensor data, the last thing in the file
+    m = others.measure_tiff(_rd(d), 0, cut)
+    assert not m.complete and m.end <= cut
+    assert checks.validate_tiff(_rd(d[:cut]), cut)[0] == "partial"
+    assert checks.validate_tiff(_rd(d[:cut]), cut, layout_known=True)[0] == "partial"
+
+
+def _tiff(entries, data_at, data):
+    """A big-endian TIFF: one IFD at 8 with (tag, type, count, value field) entries."""
+    import struct
+    ifd = struct.pack(">H", len(entries)) + b"".join(struct.pack(">HHI", t, ty, c) + v for t, ty, c, v in entries)
+    head = b"MM\0*" + struct.pack(">I", 8) + ifd + bytes(4)
+    return head + bytes(data_at - len(head)) + data
+
+
+def test_tiff_values_kept_in_the_entry_itself():
+    """Regression: up to two 16-bit values sit in the entry itself, not where
+    its value field would point; read as an offset, the picture data vanished."""
+    import struct
+    d = _tiff([(0x100, 3, 1, struct.pack(">HH", 64, 0)), (0x101, 3, 1, struct.pack(">HH", 64, 0)),
+               (0x103, 3, 1, struct.pack(">HH", 1, 0)), (0x111, 3, 2, struct.pack(">HH", 200, 2200)),
+               (0x117, 3, 2, struct.pack(">HH", 2000, 2000))], 200, random.Random(4).randbytes(4000))
+    m = others.measure_tiff(_rd(d), 0, len(d))
+    assert m.complete and m.end == 4200 == len(d)
+    assert not others.measure_tiff(_rd(d), 0, 3000).complete
+
+
+def test_a_tiff_cut_before_its_next_directory_is_not_complete():
+    import struct
+    d = bytearray(_tiff([(0x100, 3, 1, struct.pack(">HH", 8, 0)), (0x111, 4, 1, struct.pack(">I", 100)),
+                         (0x117, 4, 1, struct.pack(">I", 3000))], 100, random.Random(5).randbytes(3000)))
+    nxt = len(d)
+    d[8 + 2 + 36:8 + 2 + 36 + 4] = struct.pack(">I", nxt)  # a second IFD after the picture data
+    d += struct.pack(">H", 1) + struct.pack(">HHI", 0x100, 3, 1) + struct.pack(">HH", 8, 0) + bytes(4)
+    assert others.measure_tiff(_rd(bytes(d)), 0, len(d)).complete
+    assert not others.measure_tiff(_rd(bytes(d)), 0, nxt).complete

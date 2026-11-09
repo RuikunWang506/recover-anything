@@ -569,7 +569,10 @@ _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4
 
 def measure_tiff(read, start: int, limit: int) -> Result:
     """RAW files (CR2, NEF, ARW, DNG, ORF, RW2...) are TIFF containers. The file
-    ends where the last thing any IFD points to ends."""
+    ends where the last thing any IFD points to ends. Anything an IFD points to
+    past the limit (another IFD, a tag's data, picture data) means the file is
+    cut short there: not complete, though its length stays what could be seen
+    (a false header in random bytes mustn't swallow the rest of the card)."""
     head = read(start, 16)
     bo = "<" if head[:2] == b"II" else ">"
     ext = ".tif"
@@ -585,11 +588,20 @@ def measure_tiff(read, start: int, limit: int) -> Result:
     todo = [struct.unpack(bo + "I", head[4:8])[0]]
     strip_pairs = {(0x0111, 0x0117), (0x0144, 0x0145), (0x0201, 0x0202)}
     refs = set()
+    cut = None  # the first thing an IFD points to past the limit
+
+    def past(at):
+        nonlocal cut
+        if seen:  # (a first IFD past the limit: no TIFF here at all)
+            cut = at if cut is None else min(cut, at)
+
     while todo and len(seen) < 64:
         ifd = todo.pop()
-        if ifd in seen or ifd < 8 or ifd > limit:
+        if ifd in seen or ifd < 8:
             continue
-        seen.add(ifd)
+        if ifd + 2 > limit:
+            past(ifd)
+            continue
         cnt_b = read(start + ifd, 2)
         if len(cnt_b) < 2:
             continue
@@ -597,20 +609,23 @@ def measure_tiff(read, start: int, limit: int) -> Result:
         if n == 0 or n > 1000:
             continue
         raw = read(start + ifd + 2, 12 * n + 4)
-        if len(raw) < 12 * n + 4:
+        if len(raw) < 12 * n + 4 or ifd + 6 + 12 * n > limit:
+            past(ifd)
             continue
+        seen.add(ifd)
         tags = {}
         for i in range(n):
             tag, typ, count, val = struct.unpack(bo + "HHII", raw[12 * i:12 * i + 12])
+            field = raw[12 * i + 8:12 * i + 12]
             ts = _TYPE_SIZE.get(typ, 1)
-            tags[tag] = (typ, count, val)
-            if ts * count > 4 and val + ts * count <= limit:
-                end = max(end, val + ts * count)
+            tags[tag] = (typ, count, field)
+            if ts * count > 4:
+                if val + ts * count <= limit:
+                    end = max(end, val + ts * count)
+                else:
+                    past(val)
             if tag in (0x8769, 0x014A, 0x8825, 0xA005) and typ in (4, 13):
-                if count == 1:
-                    todo.append(val)
-                elif val + 4 * count <= limit:
-                    todo.extend(struct.unpack(bo + "%dI" % count, read(start + val, 4 * count)))
+                todo.extend(_tiff_values(read, start, bo, typ, count, field))
             if tag == 0x010F:
                 make = read(start + val, min(count, 32)) if count > 4 else raw[12 * i + 8:12 * i + 12]
             if tag == 0xC612:
@@ -621,14 +636,15 @@ def measure_tiff(read, start: int, limit: int) -> Result:
             todo.append(nxt)
         for off_tag, len_tag in strip_pairs:
             if off_tag in tags and len_tag in tags:
-                (to, co, vo), (tl, cl, vl) = tags[off_tag], tags[len_tag]
-                offs = [vo] if co == 1 else list(_vals(read, start, bo, to, co, vo))
-                lens = [vl] if cl == 1 else list(_vals(read, start, bo, tl, cl, vl))
+                offs = _tiff_values(read, start, bo, *tags[off_tag])
+                lens = _tiff_values(read, start, bo, *tags[len_tag])
                 for o, ln in zip(offs, lens):
                     if o + ln <= limit:
                         end = max(end, o + ln)
                         if len(refs) < 100000:
                             refs.add(o)
+                    elif ln:
+                        past(o)
     if ext == ".tif":
         m = make.upper()
         if m.startswith(b"NIKON"):
@@ -639,17 +655,24 @@ def measure_tiff(read, start: int, limit: int) -> Result:
             ext = ".pef"
         elif m.startswith(b"CANON"):
             ext = ".cr2"
+    if cut is not None:
+        return Result(end, False, ext, "it goes on past the end of what was found", break_pos=cut, refs=refs)
     return Result(end, end > 1024, ext, "ok" if end > 1024 else "too small", refs=refs)
 
 
-def _vals(read, start, bo, typ, count, off):
+def _tiff_values(read, start, bo, typ, count, field: bytes):
+    """The values of a TIFF tag whose 4-byte value field is `field`: in the
+    field itself when they fit there (up to two 16-bit ones), else where it points."""
     fmt = {3: "H", 4: "I", 13: "I"}.get(typ)
     if not fmt or count > 100000:
         return []
     size = struct.calcsize(fmt)
-    raw = read(start + off, size * count)
-    raw = raw[:len(raw) // size * size]  # a cut-off read: keep the whole values
-    return struct.unpack(bo + "%d%s" % (len(raw) // size, fmt), raw)
+    if size * count <= 4:
+        raw = field[:size * count]
+    else:
+        raw = read(start + struct.unpack(bo + "I", field)[0], size * count)
+        raw = raw[:len(raw) // size * size]  # a cut-off read: keep the whole values
+    return list(struct.unpack(bo + "%d%s" % (len(raw) // size, fmt), raw))
 
 
 # ---------------------------------------------------------------------- PDF

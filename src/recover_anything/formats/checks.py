@@ -26,7 +26,7 @@ import struct
 import zlib
 
 from . import jpeg
-from .others import measure_riff, measure_tiff
+from .others import _tiff_values, measure_riff, measure_tiff
 
 NO_TABLE = "its cross-reference table can't be read, so its contents can't be checked"
 EMPTY_TABLE = "its cross-reference table lists nothing here, so its contents can't be checked"
@@ -348,34 +348,21 @@ def _ifd_images(read, length: int):
             continue
         tags = {}
         for i in range(n):
-            tag, typ, count, val = struct.unpack(bo + "HHII", raw[12 * i:12 * i + 12])
-            if typ == 3 and count == 1:
-                val = struct.unpack(bo + "H", raw[12 * i + 8:12 * i + 10])[0]
-            tags[tag] = (typ, count, val)
+            tag, typ, count = struct.unpack(bo + "HHI", raw[12 * i:12 * i + 8])
+            tags[tag] = (typ, count, raw[12 * i + 8:12 * i + 12])
             if tag in (0x8769, 0x014A) and typ in (4, 13):
-                todo.extend([val] if count == 1 else _vals(read, bo, typ, count, val))
+                todo.extend(_tiff_values(read, 0, bo, typ, count, tags[tag][2]))
         nxt = struct.unpack(bo + "I", raw[12 * n:12 * n + 4])[0]
         if nxt:
             todo.append(nxt)
-        comp = tags.get(0x103, (0, 0, 1))[2]
+        comp = (_tiff_values(read, 0, bo, *tags[0x103]) or [1])[0] if 0x103 in tags else 1
         for off_tag, len_tag in ((0x111, 0x117), (0x144, 0x145), (0x201, 0x202)):
             if off_tag in tags and len_tag in tags:
-                offs = _vals(read, bo, *tags[off_tag])
-                lens = _vals(read, bo, *tags[len_tag])
+                offs = _tiff_values(read, 0, bo, *tags[off_tag])
+                lens = _tiff_values(read, 0, bo, *tags[len_tag])
                 c = 6 if off_tag == 0x201 else comp
-                out.append((c, [(o, n) for o, n in zip(offs, lens) if o + n <= length]))
+                out.append((c, list(zip(offs, lens))))  # (one past the end makes the file partial: measure_tiff)
     return out
-
-
-def _vals(read, bo, typ, count, val):
-    if count == 1:
-        return [val]
-    fmt = {3: "H", 4: "I", 13: "I"}.get(typ)
-    if not fmt or count > 100000:
-        return []
-    size = struct.calcsize(fmt)
-    raw = read(val, size * count)
-    return list(struct.unpack(bo + "%d%s" % (len(raw) // size, fmt), raw[:len(raw) // size * size]))
 
 
 def validate_tiff(read, length: int, layout_known: bool = False, deep: bool = True):
@@ -387,6 +374,8 @@ def validate_tiff(read, length: int, layout_known: bool = False, deep: bool = Tr
         for off, n in blocks:
             if not n:
                 continue
+            if off + n > length:
+                return "partial", "it goes on past the end of what was found", off
             data = read(off, n)
             if comp in (6, 7) and data[:2] == b"\xff\xd8":
                 h = None
