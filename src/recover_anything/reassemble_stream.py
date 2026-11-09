@@ -56,6 +56,7 @@ class _Walker:
     strong = False  # a unit that checks out is the file's own beyond reasonable doubt
     need = 1        # bytes of the next unit needed to tell it isn't there
     checked = -1    # for a weak kind: the last position where something tied the data to what came before
+    horizon = 0     # clusters from the failing unit to its next check, when that's further than usual
 
     def __init__(self, read, expected=None):
         self.read, self.expected = read, expected
@@ -405,7 +406,367 @@ class _Gzip(_Walker):
         return self.end is not None
 
 
-WALKERS = {"mp3": _Mp3, "ts": _Ts, "ogg": _Ogg, "flac": _Flac, "gzip": _Gzip}
+class _Zip(_Walker):
+    """ZIP and what is built on it (Word, Excel, PowerPoint, EPUB): every
+    member's data is checked as it goes (compressed data by decompressing it)
+    and against its CRC at its end, and the central directory at the end of
+    the archive must list exactly the members walked."""
+
+    strong = True
+    grain = 1 << 16
+    any_cluster = True  # members are often pictures stored as they are: JPEG data belongs here
+
+    def __init__(self, read, expected=None):
+        super().__init__(read, expected)
+        if read(0, 4) != b"PK\x03\x04":
+            raise ValueError("not a ZIP")
+        self.pos = 0
+        self.members: dict = {}   # local header offset -> CRC
+        self.member = None        # (data start, method, flags, crc, compressed size, size)
+        self.d = None
+        self.crc = self.size = 0
+        self.central = 0
+        self.cd_start = None
+
+    def snapshot(self):
+        snap = super().snapshot()
+        snap["d"] = self.d.copy() if self.d is not None else None
+        return snap
+
+    def restore(self, snap):
+        super().restore(snap)
+        self.d = snap["d"].copy() if snap["d"] is not None else None
+
+    def advance(self, limit):
+        read = self.read
+        while True:
+            if self.member is not None:
+                st = self._data(limit)
+                if st != "done":
+                    return st
+                continue
+            self.unit = self.pos
+            if self.pos + 4 > limit:
+                return "need"
+            sig = read(self.pos, 4)
+            if sig == b"PK\x03\x04":
+                if self.cd_start is not None or self.pos + 30 > limit:
+                    return "bad" if self.cd_start is not None else "need"
+                (_v, flags, method, _t, _d, crc, csize, usize, nlen, xlen) = struct.unpack("<HHHHHIIIHH",
+                                                                                         read(self.pos + 4, 26))
+                if method not in (0, 8) or flags & 1 or not 0 < nlen <= 1024 or 0xFFFFFFFF in (csize, usize):
+                    return "bad"  # encrypted, another method, ZIP64: nothing here can check it
+                if method == 0 and flags & 8:
+                    return "bad"  # stored with its size only after the data: its end can't be found
+                if self.pos + 30 + nlen + xlen > limit:
+                    return "need"
+                if b"\0" in read(self.pos + 30, nlen):
+                    return "bad"
+                self.members[self.pos] = crc
+                start = self.pos + 30 + nlen + xlen
+                self.member = (start, method, flags, crc, csize, usize)
+                self.d = zlib.decompressobj(-15) if method == 8 else None
+                self.crc = self.size = 0
+                self.pos = start
+                continue
+            if sig == b"PK\x01\x02":
+                if self.cd_start is None:
+                    self.cd_start = self.pos
+                if self.pos + 46 > limit:
+                    return "need"
+                h = read(self.pos, 46)
+                crc, nlen, xlen, clen, lho = (struct.unpack("<I", h[16:20])[0], *struct.unpack("<HHH", h[28:34]),
+                                              struct.unpack("<I", h[42:46])[0])
+                if self.members.get(lho) != crc:
+                    return "bad"  # the directory lists a member that isn't where it says
+                self.central += 1
+                self.pos += 46 + nlen + xlen + clen
+                continue
+            if sig == b"PK\x05\x06":
+                if self.pos + 22 > limit:
+                    return "need"
+                _d0, _d1, _n0, total, cd_size, cd_off, clen = struct.unpack("<HHHHIIH", read(self.pos + 4, 18))
+                cd = self.cd_start if self.cd_start is not None else self.pos
+                if not (total == self.central == len(self.members) and cd_off == cd and cd_size == self.pos - cd):
+                    return "bad"
+                if self.pos + 22 + clen > limit:
+                    return "need"
+                self.end = self.pos + 22 + clen
+                return "end"
+            return "bad"
+
+    def _data(self, limit):
+        start, method, flags, crc, csize, usize = self.member
+        g = self.grain
+        if method == 8:
+            while not self.d.eof:
+                if self.pos >= limit:
+                    return "need"
+                at = self.pos
+                data = self.read(at, min(limit - at, g - at % g))
+                buf = data
+                try:
+                    while buf and not self.d.eof:
+                        out = self.d.decompress(buf, 1 << 20)
+                        self.crc = zlib.crc32(out, self.crc)
+                        self.size += len(out)
+                        buf = self.d.unconsumed_tail
+                except zlib.error:
+                    # Data zlib couldn't shrink is stored in blocks of up to 64 KB that
+                    # nothing checks before the end: the break may be anywhere back to
+                    # the member's start.
+                    self.unit, self.horizon = start, (at + len(data) - start) // max(1, g) + 2
+                    return "bad"
+                self.pos = at + len(data) - (len(self.d.unused_data) if self.d.eof else len(buf))
+            if not flags & 8 and self.pos - start != csize:
+                self.unit, self.horizon = start, csize // max(1, g) + 2
+                return "bad"
+        else:
+            end = start + csize
+            self.horizon = (end - start) // max(1, g) + 2  # nothing checks stored data before its CRC
+            while self.pos < end:
+                if self.pos >= limit:
+                    return "need"
+                at = self.pos
+                n = min(end, limit) - at
+                n = min(n, g - at % g)
+                self.crc = zlib.crc32(self.read(at, n), self.crc)
+                self.size += n
+                self.pos = at + n
+        if flags & 8:  # the CRC and sizes come after the data
+            if self.pos + 16 > limit:
+                return "need"
+            dd = self.read(self.pos, 16)
+            skip = 4 if dd[:4] == b"PK\x07\x08" else 0
+            crc, csize, usize = struct.unpack("<III", dd[skip:skip + 12])
+            if self.pos - start != csize:
+                self.unit = start
+                return "bad"
+            self.pos += skip + 12
+            self.members[max(self.members)] = crc
+        if self.crc & 0xFFFFFFFF != crc or self.size != usize:
+            # the data doesn't add up: the wrong piece is somewhere in it
+            self.unit, self.horizon = start, (self.pos - start) // max(1, g) + 2
+            return "bad"
+        self.member, self.d, self.horizon = None, None, 0
+        return "done"
+
+    def proven_end(self):
+        return self.end is not None
+
+
+_OBJ_AT = __import__("re").compile(rb"(\d{1,10})\s+(\d{1,5})\s+obj\b")
+_PDF_STREAM = __import__("re").compile(rb"\bstream(\r\n|\n|\r)|\bendobj\b")
+_PDF_LENGTH = __import__("re").compile(rb"/Length\s+(\d+)(\s+\d+\s+R)?")
+_PDF_FILTER = __import__("re").compile(rb"/Filter\s*(\[[^\]]*\]|/[A-Za-z0-9]+)")
+_PDF_END = __import__("re").compile(rb"startxref\s+(\d+)\s*%%EOF(\r\n|\n|\r)?")
+
+
+class _Pdf(_Walker):
+    """PDF: object by object in file order. Each object must start where the
+    last one ended ('N G obj'), each compressed stream must decompress (zlib's
+    checksum at its end proves its bytes), and every cross-reference table must
+    list the objects at the offsets they were found. The rebuilt file is then
+    checked once more as a whole (`final`)."""
+
+    strong = True
+    grain = 1 << 16
+    any_cluster = True  # pictures are stored in it as JPEG data
+    WINDOW = 1 << 16    # an object's dictionary is looked for within this many bytes
+
+    def __init__(self, read, expected=None):
+        super().__init__(read, expected)
+        h = read(0, 1024)
+        if not h.startswith(b"%PDF-"):
+            raise ValueError("not a PDF")
+        i = h.find(b"\n", 5)
+        self.pos = i + 1 if i > 0 else 9
+        self.seen = set()       # (object number, offset)
+        self.pending = set()    # listed by a table before they were reached
+        self.stream = None      # (data start, length or None, flate)
+        self.d = None
+
+    def snapshot(self):
+        snap = super().snapshot()
+        snap["d"] = self.d.copy() if self.d is not None else None
+        return snap
+
+    def restore(self, snap):
+        super().restore(snap)
+        self.d = snap["d"].copy() if snap["d"] is not None else None
+
+    def _skip_space(self, limit):
+        """Move past whitespace and comments; False if more bytes are needed."""
+        while True:
+            if self.pos >= limit:
+                return False
+            chunk = self.read(self.pos, min(256, limit - self.pos))
+            stripped = chunk.lstrip(b" \t\r\n\x0c\x00")
+            self.pos += len(chunk) - len(stripped)
+            if not stripped:
+                continue
+            if stripped[:1] == b"%" and not stripped.startswith(b"%%EOF"):
+                i = min([k for k in (stripped.find(b"\n"), stripped.find(b"\r")) if k >= 0] or [-1])
+                if i < 0:
+                    if self.pos + len(stripped) >= limit:
+                        return False
+                    self.pos += len(stripped)
+                    continue
+                self.pos += i
+                continue
+            return True
+
+    def advance(self, limit):
+        read = self.read
+        while True:
+            if self.stream is not None:
+                st = self._stream(limit)
+                if st != "done":
+                    return st
+                continue
+            self.unit = self.pos
+            if not self._skip_space(limit):
+                return "need"
+            self.unit = self.pos
+            head = read(self.pos, min(64, limit - self.pos))
+            m = _OBJ_AT.match(head)
+            if m:
+                if len(head) == 64 or m.end() < len(head):
+                    num, at = int(m.group(1)), self.pos
+                    self.seen.add((num, at))
+                    self.pending.discard((num, at))
+                    end = min(limit, at + self.WINDOW)
+                    body = read(at, end - at)
+                    sm = _PDF_STREAM.search(body, m.end())
+                    if sm is None:
+                        if end >= limit and limit < at + self.WINDOW:
+                            return "need"
+                        return "bad"
+                    if sm.group(0).startswith(b"endobj"):
+                        self.pos = at + sm.end()
+                        continue
+                    dic = body[m.end():sm.start()]
+                    lm = _PDF_LENGTH.search(dic)
+                    fm = _PDF_FILTER.search(dic)
+                    flt = __import__("re").findall(rb"/(\w+)", fm.group(1)) if fm else []
+                    flate = bool(flt) and flt[0] == b"FlateDecode"
+                    length = int(lm.group(1)) if lm and not lm.group(2) else None
+                    if length is None and not flate:
+                        return "bad"  # no stated length and nothing to find its end by
+                    self.stream = (at + sm.end(), length, flate)
+                    self.d = zlib.decompressobj() if flate else None
+                    self.pos = at + sm.end()
+                    continue
+                return "need"
+            if head.startswith(b"xref"):
+                return self._xref(limit)
+            if head.startswith(b"trailer") or head.startswith(b"startxref"):
+                return self._tail(limit)
+            if len(head) < 9 and self.pos + len(head) >= limit:
+                return "need"
+            return "bad"
+
+    def _stream(self, limit):
+        start, length, flate = self.stream
+        g = self.grain
+        if flate:
+            while not self.d.eof:
+                if self.pos >= limit:
+                    return "need"
+                at = self.pos
+                data = self.read(at, min(limit - at, g - at % g))
+                buf = data
+                try:
+                    while buf and not self.d.eof:
+                        self.d.decompress(buf, 1 << 20)
+                        buf = self.d.unconsumed_tail
+                except zlib.error:
+                    # (stored blocks of data zlib couldn't shrink: nothing checks them
+                    # before the end, so the break may be anywhere back to the start)
+                    self.unit, self.horizon = start, (at + len(data) - start) // max(1, g) + 2
+                    return "bad"
+                self.pos = at + len(data) - (len(self.d.unused_data) if self.d.eof else len(buf))
+            if length is not None and self.pos - start != length:
+                self.unit, self.horizon = start, length // max(1, g) + 2
+                return "bad"
+        else:
+            end = start + length
+            self.horizon = (end - start) // max(1, g) + 2  # nothing checks it before the end
+            if end > limit:
+                self.pos = limit
+                return "need"
+            self.pos = end
+        tail = self.read(self.pos, 32)
+        stripped = tail.lstrip(b"\r\n")
+        if not stripped.startswith(b"endstream"):
+            self.unit = start
+            return "bad"
+        rest = stripped[9:].lstrip(b" \t\r\n")
+        if not rest.startswith(b"endobj") and len(tail) == 32:
+            self.unit = start
+            return "bad"
+        self.pos += len(tail) - len(stripped) + 9 + (len(stripped) - 9 - len(rest)) + 6
+        self.stream, self.d, self.horizon = None, None, 0
+        return "done"
+
+    def _xref(self, limit):
+        at = self.pos
+        pos = at + 4
+        while True:
+            hm = __import__("re").match(rb"\s*(\d+)\s+(\d+)[ \t]*(\r\n|\n|\r)", self.read(pos, 40))
+            if not hm:
+                break
+            first, count = int(hm.group(1)), int(hm.group(2))
+            pos += hm.end()
+            if pos + 20 * count > limit:
+                return "need"
+            raw = self.read(pos, 20 * count)
+            for k in range(count):
+                e = raw[20 * k:20 * k + 20]
+                if e[17:18] == b"n":
+                    ent = (first + k, int(e[:10]))
+                    if ent not in self.seen:
+                        if ent[1] < at:
+                            return "bad"  # the table says an object is somewhere it isn't
+                        self.pending.add(ent)  # (a linearized file lists objects before they come)
+                elif e[17:18] != b"f":
+                    return "bad"
+            pos += 20 * count
+        self.pos = pos
+        self.xref_at = at
+        return self._tail(limit)
+
+    def _tail(self, limit):
+        """'trailer << ... >> startxref N %%EOF': the end, or an update follows."""
+        start = self.pos
+        window = self.read(start, min(limit - start, 1 << 16))
+        m = _PDF_END.search(window)
+        if not m:
+            return "need" if start + len(window) >= limit and len(window) < 1 << 16 else "bad"
+        end = start + m.end()
+        if m.group(2) is None and end + 2 > limit:
+            return "need"
+        self.pos = end
+        if self.expected is not None and end < self.expected:
+            return self.advance(limit)  # an update appended to it follows
+        nxt = self.read(end, 64).lstrip(b" \t\r\n\x00")
+        if _OBJ_AT.match(nxt):
+            return self.advance(limit)
+        if self.pending:
+            return "bad"
+        self.end = end
+        return "end"
+
+    def proven_end(self):
+        return self.end is not None
+
+    @staticmethod
+    def final(read, length):
+        from .formats.checks import validate_pdf
+        return validate_pdf(read, length)
+
+
+WALKERS = {"mp3": _Mp3, "ts": _Ts, "ogg": _Ogg, "flac": _Flac, "gzip": _Gzip, "zip": _Zip, "pdf": _Pdf}
 
 
 # ------------------------------------------------------------------ the search
@@ -446,6 +807,8 @@ class _Rebuild:
             data = self.src.read(self.g.offset(c), self.cs)
             if data.count(0) == len(data):
                 v = False
+            elif getattr(self.w, "any_cluster", False):
+                v = True
             else:
                 ffs = data.count(b"\xff")
                 ok_pairs = data.count(b"\xff\x00") + sum(data.count(bytes([0xFF, m])) for m in range(0xD0, 0xD8))
@@ -486,7 +849,7 @@ class _Rebuild:
             u = w.unit
             first = u // self.cs if u % self.cs == 0 else u // self.cs + 1
             first = max(first, 1)
-            fix = self._search(first, u, snap)
+            fix = self._search(first, u, snap, max(SPAN, w.horizon))
             if fix is None:
                 return self._prefix(w.unit) + (False,)
             self.path[:] = fix
@@ -494,9 +857,9 @@ class _Rebuild:
             snap = w.snapshot()
             continue
 
-    def _search(self, first: int, u: int, snap):
+    def _search(self, first: int, u: int, snap, span: int = SPAN):
         """Try the next piece starting at each slot the failing unit covers."""
-        slots = range(first, min(len(self.path), first + SPAN))
+        slots = range(first, min(len(self.path), first + span))
         for skip_soft in ((True, False) if self.soft is not None else (False,)):
             # Round robin over the slots: the k-th candidate for every slot
             # before the (k+1)-th for any, so a break in a later slot is found
@@ -518,13 +881,13 @@ class _Rebuild:
                     state[j] = c
                     self.trials += 1
                     trial = prefix + [c]
-                    if self._passes(trial, j, snap):
+                    if self._passes(trial, j, snap, span):
                         return trial
         return None
 
-    def _passes(self, trial, j, snap) -> bool:
+    def _passes(self, trial, j, snap, span: int = SPAN) -> bool:
         """Does the file check out through cluster j of `trial` (adding the
-        next free clusters if a unit runs on)?"""
+        next free clusters if a unit runs on, up to `span` of them)?"""
         w = self.w
         saved = self.path[:]
         self.path[:] = trial
@@ -532,7 +895,7 @@ class _Rebuild:
             w.restore(snap)
             goal = (j + 1) * self.cs
             taken = set(trial)
-            for _ in range(SPAN + 1):
+            for _ in range(span + 1):
                 st = w.advance(self.limit())
                 if st == "bad":
                     return False
@@ -590,12 +953,21 @@ def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=Non
                     r.meta["reassembled_from"] = pieces
             blocked[start] = was
             continue
-        r.extents = _extents(geom, clusters, length)
         w = WALKERS[r.kind]
+        final = getattr(w, "final", None)
+        if final is not None:
+            # a last look at the whole file (a PDF's table and every stream's checksum)
+            st, why, _bad = final(_Path(src, geom, clusters).read, length)
+            if st == "corrupt":
+                blocked[start] = was
+                continue
+        r.extents = _extents(geom, clusters, length)
         sized = r.expected_size is not None and length == r.expected_size
         cs = geom.cluster_size
         seams = [i * cs for i in range(1, len(clusters)) if clusters[i] != clusters[i - 1] + 1]
-        if w.strong:
+        if w.strong and final is not None and st != "ok":
+            r.status, r.note = "unverified", why  # (parts of it can't be checked: say which)
+        elif w.strong:
             r.status, r.note = "ok", "every piece checked"
         elif seams and rb.w.checked <= max(seams):
             # Frames of another recording of the same kind pass these checks, so a

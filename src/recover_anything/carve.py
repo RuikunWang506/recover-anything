@@ -179,12 +179,16 @@ def _measure_pdf(src, off: int, sure: list, region_end: int):
     starts a sector: with no end marker before the next header, look on past
     it, but never past the next PDF."""
     i = bisect_right(sure, (off, "~"))
+    first = None
     for k in range(i, min(i + 8, len(sure)) + 1):
         stop = sure[k][0] if k < len(sure) else region_end
         got = measure(src, "pdf", off, stop - off)
-        if got[0] > 0 or k == len(sure) or sure[k][1] == "pdf":
+        if got[1]:
             return got
-    return got
+        first = first or got  # no end marker in reach: its first piece, as far as the next header
+        if k == len(sure) or sure[k][1] == "pdf":
+            break
+    return first
 
 
 def carve(src, region_start: int, region_end: int, align: int, base: int, known_starts: set,

@@ -427,10 +427,13 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
         broken = [r for r in mine if r.kind == "jpeg" and r.status in ("corrupt", "partial") and aligned(r)]
         videos = [r for r in mine if r.kind == "isobmff" and r.status in ("corrupt", "partial") and aligned(r)
                   and r.ext not in (".heic", ".avif", ".cr3")]
+        from .formats.checks import EMPTY_TABLE, NO_TABLE
         from .formats.more import NOT_PROVEN
         from .reassemble_stream import WALKERS
+        # (a PDF whose table can't be read was most likely split: its table is in a later piece)
         streams = [r for r in mine if r.kind in WALKERS and aligned(r)
-                   and (r.status in ("corrupt", "partial") or (r.status == "unverified" and r.note == NOT_PROVEN))]
+                   and (r.status in ("corrupt", "partial")
+                        or (r.status == "unverified" and r.note in (NOT_PROVEN, NO_TABLE, EMPTY_TABLE)))]
         if not broken and not videos and not streams:
             continue
         blocked = bytearray(g.last_cluster + 2)
