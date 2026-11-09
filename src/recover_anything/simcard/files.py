@@ -41,10 +41,31 @@ def make_mp3(seed: int, seconds: float = 20.0, id3: bool = True, xing: bool = Tr
         hdr = bytes([0xFF, 0xFB, (bri << 4) | (pad << 1), 0x44])
         frames.append([hdr, size + pad])
     body = []
+    side = _rng("mp3-side", seed)  # (its own source: the payload and tag draws stay as they were)
+    # The bit reservoir, used the ways real encoders use it: LAME keeps it packed
+    # (each frame's data starts where the one before ended) and drains what is
+    # over its ceiling into the frame; others cap it lower and leave the rest
+    # unused (a gap); some don't use it at all (every frame starts afresh).
+    style = side.choice(("packed", "packed", "capped", "none"))
+    cap = {"packed": 511, "capped": side.choice((255, 333, 384)), "none": 0}[style]
+    level = side.uniform(0.8, 1.1)  # how busy the music is: it wanders between quiet and dense
+    room = 0  # bytes the frames so far left unused
     for i, (hdr, n) in enumerate(frames):
         if xing and i == 0:
             continue
-        body.append(hdr + _noise(rng, n - 4))
+        area = n - 4 - 32
+        level = min(1.15, max(0.8, level + side.uniform(-0.02, 0.02)))
+        want = int(area * level * side.uniform(0.6, 1.4))
+        mdb = min(room, cap)  # where its data begins: no further back than the room left, or the ceiling
+        size = max(0, min(mdb + area, want))
+        left = mdb + area - size
+        if style == "packed" and left > cap:
+            size, left = size + left - cap, cap  # drained into this frame's data
+        elif style == "none" and side.random() < 0.5:
+            size, left = mdb + area, 0  # filled to the end
+        bits = size * 8 - (side.randint(0, 7) if size else 0)
+        body.append(hdr + _side_info(side, mdb, bits) + _noise(rng, n - 4)[32:])
+        room = left
     audio = b"".join(body)
     out = []
     if xing:
@@ -63,6 +84,41 @@ def make_mp3(seed: int, seconds: float = 20.0, id3: bool = True, xing: bool = Tr
     if id3v1:
         data += b"TAG" + ("Track %d" % seed).encode().ljust(125, b"\0")
     return data
+
+
+def _side_info(rng: random.Random, main_data_begin: int, bits: int) -> bytes:
+    """MPEG-1 Layer III side information for a stereo frame (32 bytes): where
+    the frame's main data begins (bytes back in the reservoir) and how many
+    bits each granule and channel uses (part2_3_length), the rest plausible."""
+    parts = [bits // 4] * 4
+    parts[0] += bits - sum(parts)
+    out = acc = 0
+    nbits = 0
+
+    def put(value, width):
+        nonlocal acc, nbits
+        acc = (acc << width) | (value & ((1 << width) - 1))
+        nbits += width
+
+    put(main_data_begin, 9)
+    put(0, 3)  # private bits
+    put(0, 8)  # scfsi, two channels
+    tables = [t for t in range(32) if t not in (4, 14)]
+    for p in parts:
+        put(p, 12)
+        put(rng.randint(0, 288), 9)  # big_values
+        put(rng.randint(120, 210), 8)  # global_gain
+        put(rng.randint(0, 15), 4)  # scalefac_compress
+        put(0, 1)  # window_switching_flag
+        for _ in range(3):
+            put(rng.choice(tables), 5)
+        put(rng.randint(0, 15), 4)
+        put(rng.randint(0, 7), 3)
+        put(rng.randint(0, 1), 1)
+        put(rng.randint(0, 1), 1)
+        put(rng.randint(0, 1), 1)
+    del out
+    return acc.to_bytes(32, "big")
 
 
 # ------------------------------------------------------------------ FLAC
