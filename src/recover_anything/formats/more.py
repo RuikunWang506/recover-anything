@@ -163,6 +163,55 @@ def mp3_frame(h: bytes):
     return n, (ver, layer, sri)
 
 
+def mp3_side(h: bytes, n: int):
+    """(main_data_begin, bits of main data, room for main data in this frame)
+    of a Layer III frame of n bytes whose first bytes are h (header, CRC, side
+    information), or None for another layer or too few bytes."""
+    if len(h) < 4 or (h[1] >> 1) & 3 != 1:
+        return None
+    v1, mono = (h[1] >> 3) & 3 == 3, h[3] >> 6 == 3
+    crc = 0 if h[1] & 1 else 2
+    side = (17 if mono else 32) if v1 else (9 if mono else 17)
+    si = h[4 + crc:4 + crc + side]
+    if len(si) < side:
+        return None
+    val, nb = int.from_bytes(si, "big"), side * 8
+    nch = 1 if mono else 2
+    if v1:
+        mdb, pos, count, step = val >> (nb - 9), 9 + (5 if mono else 3) + 4 * nch, 2 * nch, 59
+    else:
+        mdb, pos, count, step = val >> (nb - 8), 8 + (1 if mono else 2), nch, 63
+    bits = 0
+    for _ in range(count):
+        bits += (val >> (nb - pos - 12)) & 0xFFF
+        pos += step
+    return mdb, bits, n - 4 - crc - side
+
+
+class Reservoir:
+    """Layer III's bit reservoir ties each frame to the one before: its main
+    data begins main_data_begin bytes back, in room the frames before left
+    unused, so it can't point further back than that room (a frame of another
+    recording often does). An exact encoder points at exactly that room: then
+    the frame is tied to the one before. An encoder may also leave a gap
+    (bytes it drains when the reservoir is full): legal, but no proof."""
+
+    def __init__(self):
+        self.room = None
+
+    def step(self, side) -> str:
+        """'tie', 'gap' or 'bad' for the next frame's (main_data_begin, bits,
+        room); 'start' for the first frame seen."""
+        mdb, bits, area = side
+        verdict = "start" if self.room is None else "bad" if mdb > self.room else "tie" if mdb == self.room else "gap"
+        used = (bits + 7) // 8
+        if used > mdb + area:
+            verdict = "bad"  # its main data can't fit where it says
+        if verdict != "bad":
+            self.room = mdb + area - used
+        return verdict
+
+
 def _synchsafe(b: bytes) -> int:
     return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
 
@@ -196,7 +245,10 @@ def measure_mp3(read, start: int, limit: int) -> Result:
     first_at, key, frames, declared, last = pos, None, 0, None, None
     ext = ".mp3"
     reason = "ok"
+    res = Reservoir()
     while pos < limit:
+        if declared is not None and pos - first_at == declared:
+            break  # where its own header says the audio ends
         f = mp3_frame(w.get(pos, 4))
         if f is None or (key is not None and f[1] != key):
             reason = "frames stop here"
@@ -204,6 +256,10 @@ def measure_mp3(read, start: int, limit: int) -> Result:
         n, k = f
         if pos + n > limit:
             reason = "last frame cut short"
+            break
+        side = mp3_side(w.get(pos, 40), n)
+        if side is not None and res.step(side) == "bad":
+            reason = "a frame of another recording follows here"  # its data can't be where it points
             break
         if key is None:
             key = k

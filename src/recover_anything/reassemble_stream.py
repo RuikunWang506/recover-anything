@@ -55,9 +55,11 @@ class _Walker:
     check out). Everything before self.unit is verified."""
 
     strong = False  # a unit that checks out is the file's own beyond reasonable doubt
+    grain = 1 << 16  # the cluster size, when a rebuild runs the walker (set by _Rebuild)
     need = 1        # bytes of the next unit needed to tell it isn't there
     checked = -1    # for a weak kind: the last position where something tied the data to what came before
     horizon = 0     # clusters from the failing unit to its next check, when that's further than usual
+    first_choice = False  # a tie only counts where the join is the first cluster the file could go on in
     weak = ()       # (start, end) stretches nothing checks: a join inside one proves nothing
 
     def __init__(self, read, expected=None):
@@ -65,6 +67,10 @@ class _Walker:
         self.unit = 0
         self.end = None
         self.start_marked = True
+
+    def tied(self, seams) -> bool:
+        """Does something in the file tie the data after every join to what came before?"""
+        return not seams or self.checked > max(seams)
 
     def snapshot(self):
         # sets, dicts and lists (open streams, packet counters) are copied:
@@ -77,6 +83,7 @@ class _Walker:
 
 class _Mp3(_Walker):
     need = 4
+    first_choice = True
 
     def __init__(self, read, expected=None):
         super().__init__(read, expected)
@@ -85,24 +92,76 @@ class _Mp3(_Walker):
         self.tagged = h[:3] == b"ID3"
         self.first_at, self.key, self.declared, self.last = self.pos, None, None, None
         self.start_marked = self.tagged
+        self.room = None   # the bit reservoir: room the frames so far left (see more.Reservoir)
+        self.tail = False  # past the end its Xing/Info header gives: only the song's tags may follow
+        self.audit = None  # when set: (cluster -> (verdict, main_data_begin) of the first frame
+        #                    starting in or after it, main_data_begin -> frames pointing there)
+
+    def tied(self, seams) -> bool:
+        # A join is tied when the first frame after it points exactly at the room
+        # the frames before left in the reservoir, at a value this recording
+        # seldom points at: 0 and an encoder's ceiling are where frames of any
+        # recording point. That alone is weak (frames of another recording tie
+        # about one time in 370), so _settle also asks that the join skips only
+        # clusters known to be other files' (see _first_choice). One more walk
+        # over the finished file counts what the frames point at (a search
+        # keeping that up would copy it with every state it saves).
+        a = _Mp3(self.read, self.expected)
+        a.grain, a.audit = self.grain, ({}, {})
+        a.advance(self.end if self.end is not None else self.pos)
+        joins, hist = a.audit
+        total = sum(hist.values())
+        for s in seams:
+            v = joins.get(s // a.grain)
+            if v is None or v[0] != "tie" or not v[1] or hist.get(v[1], 0) * 32 > total:
+                return False
+        return True
 
     def advance(self, limit):
         read = self.read
         while True:
             if self.expected is not None and self.pos in (self.expected, self.expected - 128):
                 if self.pos == self.expected or read(self.pos, 3) == b"TAG":
-                    self.end = self.expected
+                    self.end = self.expected  # (the rest of a tag may be in a cluster not taken yet)
                     return "end"
             if self.declared is not None and self.pos - self.first_at == self.declared:
-                self.end = self.pos + (128 if read(self.pos, 3) == b"TAG" and self.pos + 128 <= limit else 0)
-                return "end"
+                self.tail, self.declared = True, None
             if self.pos + 4 > limit:
                 return "need"
-            f = more.mp3_frame(read(self.pos, 4))
+            head = read(self.pos, min(32, limit - self.pos))
+            if self.last is not None:  # tags after the last frame are the song's
+                if head[:3] == b"TAG":
+                    self.end = self.pos + 128  # (its text may run into a cluster not taken yet)
+                    return "end"
+                if len(head) < 8 and b"APETAGEX".startswith(head):
+                    return "need"
+                if head[:8] == b"APETAGEX":
+                    if len(head) < 32:
+                        return "need"
+                    self.pos += struct.unpack("<I", head[12:16])[0] + 32
+                    continue
+            if self.tail:
+                self.end = self.pos
+                return "end"
+            f = more.mp3_frame(head[:4])
             if f is None or (self.key is not None and f[1] != self.key):
                 self.unit = self.last if self.last is not None else self.pos
                 return "bad"
             n, k = f
+            if self.pos + 40 > limit:
+                return "need"
+            side = more.mp3_side(read(self.pos, 40), n)
+            mdb = None
+            if side is not None:
+                res = more.Reservoir()
+                res.room = self.room
+                verdict = res.step(side)
+                if verdict == "bad":
+                    self.unit = self.last if self.last is not None else self.pos
+                    return "bad"  # a frame of another recording: its data can't be where it points
+                mdb = side[0]
+            else:
+                verdict, res = "gap", None
             if self.key is None:
                 if self.pos + 200 > limit:
                     return "need"
@@ -117,6 +176,15 @@ class _Mp3(_Walker):
                         break
                 self.key = k
                 self.start_marked = self.tagged or self.declared is not None
+            if self.audit is not None:
+                joins, hist = self.audit
+                g = self.grain
+                for ci in range((self.last // g + 1) if self.last is not None else 0, self.pos // g + 1):
+                    joins[ci] = (verdict, mdb)
+                if mdb is not None:
+                    hist[mdb] = hist.get(mdb, 0) + 1
+            if res is not None:
+                self.room = res.room
             self.last = self.pos
             self.unit = self.pos
             self.pos += n
@@ -1114,6 +1182,7 @@ class _Rebuild:
         while True:
             st = w.advance(self.limit())
             if st == "end":
+                self._reach(w.end)
                 return self._prefix(w.end) + (True,)
             if st == "need" and self.expected and len(self.path) * self.cs >= self.expected:
                 st = "bad"  # all the clusters its size calls for, and still not finished: one is wrong
@@ -1149,6 +1218,22 @@ class _Rebuild:
             w.restore(self._base(j, snap))
             snap = w.snapshot()
             continue
+
+    def _reach(self, end: int):
+        """Take clusters up to `end` when the file ends past the ones checked:
+        an MP3's tag can run into the next cluster, and its text (zeros, often)
+        can't be checked, so the next free cluster is taken even if empty."""
+        taken = set(self.path)
+        while len(self.path) * self.cs < end:
+            c = self.path[-1]
+            while True:
+                c = self.blocked.find(0, c + 1, self.lastc + 1)
+                if c < 0 or c not in taken:
+                    break
+            if c < 0:
+                return
+            self.path.append(c)
+            taken.add(c)
 
     def _base(self, j: int, snap):
         """The latest saved state that only depends on the clusters before slot j."""
@@ -1237,67 +1322,95 @@ def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=Non
                 out = rb.run()
         except Exception:
             out = None
-        if not out or not out[1]:
+        saved = (r.extents, r.status, r.note, r.origin, dict(r.meta))
+        try:
+            ok = _settle(src, geom, blocked, r, rb, out, start, was, own)
+        except Exception:
+            # one file's trouble never stops the others' rebuilds: put it back as it was
+            r.extents, r.status, r.note, r.origin = saved[:4]
+            r.meta.clear()
+            r.meta.update(saved[4])
             blocked[start] = was
-            continue
-        clusters, length, complete = out
-        from .reassemble import _Assembler, _extents
-        pieces = _Assembler._pieces(clusters)
-        if not complete:
-            # the trail went cold: keep it only if more of the file checked out than before
-            if r.status in ("partial", "corrupt") and length > r.size:
-                r.extents = _extents(geom, clusters, length)
-                r.status, r.note = "partial", "the rest of it could not be found"
-                if pieces > 1:
-                    r.meta["reassembled_from"] = pieces
-            blocked[start] = was
-            continue
-        w = WALKERS[r.kind]
-        final = getattr(w, "final", None)
-        if final is not None:
-            # a last look at the whole file (a PDF's table and every stream's checksum)
-            st, why, _bad = final(_Path(src, geom, clusters).read, length)
-            if st == "corrupt":
-                blocked[start] = was
-                continue
-        r.extents = _extents(geom, clusters, length)
-        sized = r.expected_size is not None and length == r.expected_size
-        cs = geom.cluster_size
-        seams = [i * cs for i in range(1, len(clusters)) if clusters[i] != clusters[i - 1] + 1]
-        weak = [(a, b) for a, b in getattr(rb.w, "weak", ()) if any(a < x < b for x in seams)]
-        if w.strong and weak:
-            r.status = "unverified"
-            r.note = ("rebuilt from %d pieces, but a join falls in data nothing in it can check; "
-                      "check that it plays" % pieces)
-        elif w.strong and final is not None and st != "ok":
-            r.status, r.note = "unverified", why  # (parts of it can't be checked: say which)
-        elif w.strong:
-            r.status, r.note = "ok", "every piece checked"
-        elif seams and rb.w.checked <= max(seams):
-            # Frames of another recording of the same kind pass these checks, so a
-            # join is only certain once the recording's own clock carries on across it.
-            r.status = "unverified"
-            r.note = ("rebuilt from %d pieces, but nothing in this file type ties every piece to it; "
-                      "check that it plays" % pieces)
-        elif rb.w.unit // cs != (length - 1) // cs:
-            # the last frame's body runs into a cluster nothing else confirms
-            r.status = "unverified"
-            r.note = "rebuilt from %d pieces, but its last frame can't be confirmed; check that it plays" % pieces
-        elif sized:
-            r.status, r.note = "ok", "every piece checked"
-        elif r.origin == "carved" and not rb_start_marked(src, geom, clusters, length, r.kind):
-            r.status, r.note = "unverified", more.NO_START
-        else:
-            r.status, r.note = "ok", "every frame checked; it ends inside a cluster, so nothing is missing"
-        if pieces > 1:
-            r.meta["reassembled_from"] = pieces
-            if r.origin == "carved":
-                r.origin = "reassembled"
-        if r.status == "ok":
-            own(r)
+            ok = False
+        if ok:
             done += 1
-        else:
-            blocked[start] = was
         if progress:
             progress(done, len(records))
     return done
+
+
+def _first_choice(rb, clusters) -> bool:
+    """Does every join go on in the first cluster the file could: the next one
+    after the piece before that isn't in use, another file's or empty? Then no
+    search chose it among others that also fit."""
+    for i in range(1, len(clusters)):
+        if clusters[i] != clusters[i - 1] + 1 and clusters[i] != rb.next_free(clusters[i - 1], set(clusters[:i])):
+            return False
+    return True
+
+
+def _settle(src, geom, blocked, r, rb, out, start, was, own) -> bool:
+    """Apply a finished rebuild to the record; True if it is now recovered."""
+    if not out or not out[1]:
+        blocked[start] = was
+        return False
+    clusters, length, complete = out
+    from .reassemble import _Assembler, _extents
+    pieces = _Assembler._pieces(clusters)
+    if not complete:
+        # the trail went cold: keep it only if more of the file checked out than before
+        if r.status in ("partial", "corrupt") and length > r.size:
+            r.extents = _extents(geom, clusters, length)
+            r.status, r.note = "partial", "the rest of it could not be found"
+            if pieces > 1:
+                r.meta["reassembled_from"] = pieces
+        blocked[start] = was
+        return False
+    w = WALKERS[r.kind]
+    final = getattr(w, "final", None)
+    if final is not None:
+        # a last look at the whole file (a PDF's table and every stream's checksum)
+        st, why, _bad = final(_Path(src, geom, clusters).read, length)
+        if st == "corrupt":
+            blocked[start] = was
+            return False
+    r.extents = _extents(geom, clusters, length)
+    sized = r.expected_size is not None and length == r.expected_size
+    cs = geom.cluster_size
+    seams = [i * cs for i in range(1, len(clusters)) if clusters[i] != clusters[i - 1] + 1]
+    weak = [(a, b) for a, b in getattr(rb.w, "weak", ()) if any(a < x < b for x in seams)]
+    if w.strong and weak:
+        r.status = "unverified"
+        r.note = ("rebuilt from %d pieces, but a join falls in data nothing in it can check; "
+                  "check that it plays" % pieces)
+    elif w.strong and final is not None and st != "ok":
+        r.status, r.note = "unverified", why  # (parts of it can't be checked: say which)
+    elif w.strong:
+        r.status, r.note = "ok", "every piece checked"
+    elif seams and not (rb.w.tied(seams) and (not rb.w.first_choice or _first_choice(rb, clusters))):
+        # Frames of another recording of the same kind pass these checks, so a
+        # join is only certain once the recording's own clock (a transport
+        # stream) carries on across it, or for MP3, its bit reservoir does and
+        # the join skips nothing but clusters known to be other files'.
+        r.status = "unverified"
+        r.note = ("rebuilt from %d pieces, but nothing in this file type ties every piece to it; "
+                  "check that it plays" % pieces)
+    elif rb.w.unit // cs != (length - 1) // cs:
+        # the last frame's body runs into a cluster nothing else confirms
+        r.status = "unverified"
+        r.note = "rebuilt from %d pieces, but its last frame can't be confirmed; check that it plays" % pieces
+    elif sized:
+        r.status, r.note = "ok", "every piece checked"
+    elif r.origin == "carved" and not rb_start_marked(src, geom, clusters, length, r.kind):
+        r.status, r.note = "unverified", more.NO_START
+    else:
+        r.status, r.note = "ok", "every frame checked; it ends inside a cluster, so nothing is missing"
+    if pieces > 1:
+        r.meta["reassembled_from"] = pieces
+        if r.origin == "carved":
+            r.origin = "reassembled"
+    if r.status == "ok":
+        own(r)
+        return True
+    blocked[start] = was
+    return False

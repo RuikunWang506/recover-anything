@@ -78,9 +78,9 @@ def main(argv=None) -> int:
                     continue
                 if h not in ever:
                     data = r.read(src)
-                    if any(len(w) > len(data) and data in w for w in written):
-                        parts += 1  # a real piece of a written file: a frame of a video, a preview in a RAW
-                        continue
+                    if any(len(w) > len(data) and w.find(data, 1) > 0 for w in written):
+                        parts += 1  # a real piece inside a written file: a frame of a video, a preview in a RAW
+                        continue  # (one that matches a file's start is that file cut short: wrong)
                     wrong += 1
                     print("  WRONG: seed %d, %s %s (%s, %d bytes): %s" % (seed, r.kind, r.ext, r.origin, r.size, r.note))
                 ok[h] = r
