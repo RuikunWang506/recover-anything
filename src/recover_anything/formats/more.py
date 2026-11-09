@@ -598,6 +598,304 @@ def validate_ts(read, length: int, sized: bool, after: bytes = b"", grid=None, l
     return st
 
 
+# ------------------------------------------------------------------ VP8, VP9 and AV1 frames (WebM)
+class _Bits:
+    """Big-endian bits, for VP9's uncompressed header."""
+    __slots__ = ("d", "p")
+
+    def __init__(self, data: bytes):
+        self.d, self.p = data, 0
+
+    def f(self, n: int) -> int:
+        v = 0
+        for _ in range(n):
+            i = self.p >> 3
+            if i >= len(self.d):
+                raise EOFError
+            v = (v << 1) | ((self.d[i] >> (7 - (self.p & 7))) & 1)
+            self.p += 1
+        return v
+
+
+def _vp9_tile_cols(width: int):
+    sb64 = (((width + 7) >> 3) + 7) >> 3
+    lo = 0
+    while (64 << lo) < sb64:
+        lo += 1
+    hi = 1
+    while (sb64 >> hi) >= 4:
+        hi += 1
+    return lo, hi - 1
+
+
+def vp9_frame(fr: bytes, st: dict):
+    """Why a VP9 frame (or superframe) is malformed, or None. Its header must
+    parse to the bit (marker, profile, a key frame's sync code, zero padding),
+    the compressed header and every tile must start with a zero marker bit,
+    and the tile sizes must fill the frame exactly. `st` carries the
+    stream's profile and reference frame sizes from frame to frame."""
+    n = len(fr)
+    if n == 0:
+        return "empty frame"
+    last = fr[-1]
+    if last & 0xE0 == 0xC0:  # a superframe: frames, then an index of their sizes
+        mag, count = ((last >> 3) & 3) + 1, (last & 7) + 1
+        sz = 2 + mag * count
+        if n >= sz and fr[n - sz] == last:
+            sizes = [int.from_bytes(fr[n - sz + 1 + i * mag:n - sz + 1 + (i + 1) * mag], "little")
+                     for i in range(count)]
+            if sum(sizes) != n - sz:
+                return "superframe sizes"
+            tmp, p = dict(st), 0
+            for s in sizes:
+                why = _vp9_one(fr[p:p + s], tmp)
+                if why:
+                    return why
+                p += s
+            st.update(tmp)
+            return None
+    return _vp9_one(fr, st)
+
+
+def _vp9_one(fr: bytes, st: dict):
+    try:
+        b = _Bits(fr)
+        if b.f(2) != 2:
+            return "frame marker"
+        profile = b.f(1) | (b.f(1) << 1)
+        if profile == 3 and b.f(1):
+            return "reserved bit"
+        if st.get("profile", profile) != profile:
+            return "profile"
+        if b.f(1):  # show an earlier frame again
+            b.f(3)
+            return None if len(fr) <= 2 else "frame too long"
+        key, show, err = b.f(1) == 0, b.f(1), b.f(1)
+        refs = st.get("refs")
+        if key or (not show and b.f(1)):  # a key frame or an intra-only one
+            if not key and not err:
+                b.f(2)
+            if b.f(24) != 0x498342:
+                return "sync code"
+            if key or profile > 0:
+                if profile >= 2:
+                    b.f(1)
+                if b.f(3) != 7:  # color space other than RGB
+                    b.f(1)
+                    if profile in (1, 3):
+                        b.f(2)
+                        if b.f(1):
+                            return "reserved bit"
+                elif profile in (1, 3) and b.f(1):
+                    return "reserved bit"
+            refresh = 0xFF if key else b.f(8)
+            w, h = b.f(16) + 1, b.f(16) + 1
+            if b.f(1):
+                b.f(32)
+            if refs is None:
+                refs = [None] * 8
+        else:
+            if refs is None:
+                return "no key frame before it"
+            if not err:
+                b.f(2)
+            refresh = b.f(8)
+            idx = []
+            for _ in range(3):
+                idx.append(b.f(3))
+                b.f(1)
+            for i in range(3):
+                if b.f(1):
+                    if refs[idx[i]] is None:
+                        return "no key frame before it"
+                    w, h = refs[idx[i]]
+                    break
+            else:
+                w, h = b.f(16) + 1, b.f(16) + 1
+            if b.f(1):
+                b.f(32)
+            b.f(1)
+            if not b.f(1):
+                b.f(2)
+        if not err:
+            b.f(2)
+        b.f(2)
+        b.f(9)  # loop filter level and sharpness
+        if b.f(1) and b.f(1):
+            for _ in range(6):
+                if b.f(1):
+                    b.f(7)
+        b.f(8)  # base quantizer
+        for _ in range(3):
+            if b.f(1):
+                b.f(5)
+        if b.f(1):  # segmentation
+            if b.f(1):
+                for _ in range(7):
+                    if b.f(1):
+                        b.f(8)
+                if b.f(1):
+                    for _ in range(3):
+                        if b.f(1):
+                            b.f(8)
+            if b.f(1):
+                b.f(1)
+                for _ in range(8):
+                    for bits in (9, 7, 2, 0):
+                        if b.f(1):
+                            b.f(bits)
+        lo, hi = _vp9_tile_cols(w)
+        cols = lo
+        while cols < hi and b.f(1):
+            cols += 1
+        rows = b.f(1)
+        if rows:
+            rows += b.f(1)
+        hsize = b.f(16)
+        while b.p & 7:
+            if b.f(1):
+                return "padding bits"
+        p = b.p >> 3
+        if hsize == 0 or p + hsize > len(fr) or fr[p] & 0x80:
+            return "compressed header"
+        p += hsize
+        tiles = (1 << cols) << rows
+        for t in range(tiles):
+            if t < tiles - 1:
+                if p + 4 > len(fr):
+                    return "tile size"
+                ts = int.from_bytes(fr[p:p + 4], "big")
+                p += 4
+            else:
+                ts = len(fr) - p
+            if ts <= 0 or p + ts > len(fr) or fr[p] & 0x80:
+                return "tile size"
+            p += ts
+        # it checks out: what later frames refer to
+        st["profile"] = profile
+        st["refs"] = [(w, h) if refresh >> (7 - i) & 1 else refs[i] for i in range(8)]
+        return None
+    except EOFError:
+        return "frame cut short"
+
+
+class _VpBool:
+    """VP8's boolean decoder (RFC 6386, section 7)."""
+
+    def __init__(self, data: bytes):
+        if len(data) < 2:
+            raise EOFError
+        self.d, self.i = data, 2
+        self.value, self.range, self.count = data[0] << 8 | data[1], 255, 0
+
+    def lit(self, n: int) -> int:
+        v = 0
+        for _ in range(n):
+            split = 1 + (((self.range - 1) * 128) >> 8)
+            big = split << 8
+            if self.value >= big:
+                bit = 1
+                self.range -= split
+                self.value -= big
+            else:
+                bit = 0
+                self.range = split
+            while self.range < 128:
+                self.value <<= 1
+                self.range <<= 1
+                self.count += 1
+                if self.count == 8:
+                    self.count = 0
+                    if self.i >= len(self.d):
+                        raise EOFError
+                    self.value |= self.d[self.i]
+                    self.i += 1
+            v = (v << 1) | bit
+        return v
+
+
+def vp8_frame(fr: bytes, st: dict):
+    """Why a VP8 frame is malformed, or None: its tag (one version for the whole
+    stream), a key frame's start code, a first partition that fits, and the
+    sizes of the other partitions (as many as its header says) within the frame."""
+    n = len(fr)
+    if n < 3:
+        return "frame cut short"
+    tag = fr[0] | fr[1] << 8 | fr[2] << 16
+    key, version, first = not tag & 1, (tag >> 1) & 7, tag >> 5
+    if version > 3 or st.setdefault("version", version) != version:
+        return "version"
+    p = 3
+    if key:
+        if fr[3:6] != b"\x9d\x01\x2a":
+            return "start code"
+        if not (fr[6] | fr[7] << 8) & 0x3FFF or not (fr[8] | fr[9] << 8) & 0x3FFF:
+            return "picture size"
+        p = 10
+    if first == 0 or p + first > n:
+        return "first partition"
+    try:
+        b = _VpBool(fr[p:p + first])
+        if key:
+            b.lit(2)
+        if b.lit(1):  # segmentation
+            upd_map = b.lit(1)
+            if b.lit(1):
+                b.lit(1)
+                for bits in (8, 8, 8, 8, 7, 7, 7, 7):
+                    if b.lit(1):
+                        b.lit(bits)
+            if upd_map:
+                for _ in range(3):
+                    if b.lit(1):
+                        b.lit(8)
+        b.lit(10)  # filter type, level, sharpness
+        if b.lit(1) and b.lit(1):
+            for _ in range(8):
+                if b.lit(1):
+                    b.lit(7)
+        parts = 1 << b.lit(2)
+    except EOFError:
+        return "first partition cut short"
+    q = p + first
+    if q + 3 * (parts - 1) > n:
+        return "partition sizes"
+    sizes = sum(int.from_bytes(fr[q + 3 * i:q + 3 * i + 3], "little") for i in range(parts - 1))
+    if q + 3 * (parts - 1) + sizes > n:
+        return "partition sizes"
+    return None
+
+
+def av1_frame(fr: bytes, st: dict):
+    """Why an AV1 frame is malformed, or None: units with valid headers whose
+    sizes fill it exactly (the last one may leave its size out)."""
+    p, n = 0, len(fr)
+    while p < n:
+        h = fr[p]
+        t, ext, sized = (h >> 3) & 15, h >> 2 & 1, h >> 1 & 1
+        if h & 0x81 or t == 0 or 9 <= t <= 14:
+            return "unit header"
+        q = p + 1 + ext
+        if not sized:
+            return None if q <= n else "unit cut short"
+        size = shift = 0
+        while True:
+            if q >= n or shift > 56:
+                return "unit size"
+            size |= (fr[q] & 0x7F) << shift
+            shift += 7
+            q += 1
+            if not fr[q - 1] & 0x80:
+                break
+        if q + size > n:
+            return "unit size"
+        p = q + size
+    return None
+
+
+VIDEO_FRAME_CHECKS = {b"V_VP9": vp9_frame, b"V_VP8": vp8_frame, b"V_AV1": av1_frame}
+
+
 # ------------------------------------------------------------------ Matroska / WebM
 _SEG_CHILDREN = {0x114D9B74, 0x1549A966, 0x1654AE6B, 0x1F43B675, 0x1C53BB6B, 0x1043A770, 0x1254C367, 0x1941A469,
                  0xEC, 0xBF}
@@ -655,7 +953,8 @@ def nal_chain_ok(data: bytes, nsize: int, hevc: bool) -> bool:
 
 
 def _mkv_tracks(body: bytes) -> dict:
-    """Track number -> (codec id, NAL length size or 0)."""
+    """Track number -> (codec id, NAL length size or 0, frames compressed or
+    encrypted: then nothing in them can be checked)."""
     out, p = {}, 0
     while p < len(body):
         e = _vint(body, p, True)
@@ -664,7 +963,7 @@ def _mkv_tracks(body: bytes) -> dict:
             break
         q, end = p + e[1] + s[1], p + e[1] + s[1] + s[0]
         if e[0] == 0xAE:
-            num, codec, priv = 0, b"", b""
+            num, codec, priv, enc = 0, b"", b"", False
             while q < end:
                 ce = _vint(body, q, True)
                 cs = ce and _vint(body, q + ce[1], False)
@@ -677,20 +976,23 @@ def _mkv_tracks(body: bytes) -> dict:
                     codec = v
                 elif ce[0] == 0x63A2:
                     priv = v
+                elif ce[0] == 0x6D80:
+                    enc = True
                 q += ce[1] + cs[1] + cs[0]
             nsize = 0
             if codec in (b"V_MPEG4/ISO/AVC",):
                 nsize = (priv[4] & 3) + 1 if len(priv) > 4 else 4
             elif codec in (b"V_MPEGH/ISO/HEVC",):
                 nsize = (priv[21] & 3) + 1 if len(priv) > 21 else 4
-            out[num] = (codec, nsize)
+            out[num] = (codec, nsize, enc)
         p = end
     return out
 
 
 def measure_mkv(read, start: int, limit: int, stats: dict | None = None) -> Result:
     """Walks every element down to each frame. With `stats`, frames of
-    H.264/H.265 tracks are checked NAL by NAL and counted."""
+    H.264/H.265 tracks are checked NAL by NAL, VP9, VP8 and AV1 ones by their
+    headers (VIDEO_FRAME_CHECKS), and counted."""
     rd = lambda o, n: read(start + o, n)  # noqa: E731
     e = _element(rd, 0)
     if not e or e[1] < 0 or e[1] > 4096:
@@ -705,6 +1007,7 @@ def measure_mkv(read, start: int, limit: int, stats: dict | None = None) -> Resu
     seg_end = min(declared, limit) if declared is not None else limit
     pos += s[2]
     tracks: dict = {}
+    states: dict = {}  # track -> what a codec check carries from frame to frame
 
     def frame(q, size, hl, kind):
         """Check one Block/SimpleBlock; return an error string or None."""
@@ -713,11 +1016,16 @@ def measure_mkv(read, start: int, limit: int, stats: dict | None = None) -> Resu
             return "a frame belongs to no track"
         if stats is None:
             return None
-        codec, nsize = tracks.get(t[0], (b"", 0))
+        codec, nsize, enc = tracks.get(t[0], (b"", 0, False))
         flags = rd(q + hl + t[1] + 2, 1)
-        if nsize and flags and not flags[0] & 0x06:  # not laced
+        check = VIDEO_FRAME_CHECKS.get(codec)
+        if (nsize or check) and flags and not flags[0] & 0x06 and not enc:  # not laced, compressed or encrypted
             body = rd(q + hl + t[1] + 3, size - t[1] - 3)
-            if not nal_chain_ok(body, nsize, codec == b"V_MPEGH/ISO/HEVC"):
+            if nsize:
+                bad = not nal_chain_ok(body, nsize, codec == b"V_MPEGH/ISO/HEVC")
+            else:
+                bad = check(body, states.setdefault(t[0], {})) is not None
+            if bad:
                 return "a frame is damaged (another file's data?)"
             stats["checked"] = stats.get("checked", 0) + 1
         elif codec.startswith(b"V_"):

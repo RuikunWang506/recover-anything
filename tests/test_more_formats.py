@@ -82,10 +82,11 @@ def test_spliced_cluster_is_caught():
 
 
 def test_no_checksum_types_are_not_called_recovered_when_deleted():
-    """BMP pictures and VP9 WebM video have no way to prove their contents."""
-    for d, fn in ((F.make_bmp(1), more.validate_bmp), (F.make_mkv(1, webm=True), more.validate_mkv)):
-        assert fn(_rd(d), len(d), True)[0] == "unverified"
-        assert fn(_rd(d), len(d), True, layout_known=True)[0] == "ok"
+    """BMP pictures have no way to prove their contents. (WebM video used to be
+    here too: its frames are now checked, see test_webm.py.)"""
+    d = F.make_bmp(1)
+    assert more.validate_bmp(_rd(d), len(d), True)[0] == "unverified"
+    assert more.validate_bmp(_rd(d), len(d), True, layout_known=True)[0] == "ok"
 
 
 def test_a_stream_end_is_proven_only_from_the_last_checked_header():
