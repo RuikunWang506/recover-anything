@@ -5,6 +5,7 @@ end (bytes from start), complete (looked whole), ext, and a reason.
 """
 from __future__ import annotations
 
+import re
 import struct
 import sys
 import zlib
@@ -12,11 +13,12 @@ from array import array
 
 
 class Result:
-    __slots__ = ("end", "complete", "ext", "reason", "kind", "break_pos", "refs")
+    __slots__ = ("end", "complete", "ext", "reason", "kind", "break_pos", "refs", "last")
 
-    def __init__(self, end, complete, ext, reason="ok", kind=None, break_pos=None, refs=()):
+    def __init__(self, end, complete, ext, reason="ok", kind=None, break_pos=None, refs=(), last=None):
         self.end, self.complete, self.ext, self.reason, self.kind, self.break_pos = end, complete, ext, reason, kind, break_pos
         self.refs = refs  # offsets (from the start) of files this one contains, e.g. a RAW's previews
+        self.last = last  # for streams: where the last checked frame or packet header is
 
 
 # ------------------------------------------------------------------ ISO BMFF
@@ -149,9 +151,15 @@ def validate_isobmff(read, length: int, refs: set | None = None) -> tuple[str, s
                 t = (hdr >> 1) & 0x3F if hevc else hdr & 0x1F
                 if (hevc and t > 40) or (not hevc and t in (0, 24, 25, 26, 27, 28, 29, 30, 31)):
                     return "corrupt", "video frame %d (byte %d) has an impossible unit type" % (si, pos), pos
-            checked += 1
+                checked += 1
+            elif codec in MJPEG_CODECS and sz >= 3:
+                # every Motion-JPEG frame is a JPEG: it starts with FF D8 FF
+                if read(pos, 3) != b"\xff\xd8\xff":
+                    return "corrupt", "video frame %d (byte %d) is not where the index says" % (si, pos), pos
+                checked += 1
+            # other tracks (AAC audio, timecode...): the index can't be checked against their bytes
     if checked == 0:
-        return "unverified", "no sample tables", None
+        return "unverified", "its frames can't be checked one by one", None
     return "ok", "%d frames checked" % checked, None
 
 
@@ -288,6 +296,155 @@ def _find(read, b, e, path):
     return b, e
 
 
+# ---------------------------------------------------------------------- HEIF
+def heif_items(read, length: int):
+    """{item: (type, [(file offset, length)])} of a HEIF picture (HEIC, AVIF):
+    what each item is ('iinf') and where its data lies ('iloc'). None if there
+    is no readable table."""
+    meta = next(((b, e) for t, b, e in _boxes(read, 0, length) if t == b"meta"), None)
+    if meta is None:
+        return None
+    types, locs, idat = {}, {}, None
+    for typ, cb, ce in _boxes(read, meta[0] + 4, meta[1]):  # (meta is a full box)
+        if typ == b"iinf":
+            ver = read(cb, 1)[0]
+            start = cb + 4 + (2 if ver == 0 else 4)
+            for t2, ib, ie in _boxes(read, start, ce):
+                if t2 != b"infe":
+                    continue
+                h = read(ib, 14)
+                if h[0] == 2:
+                    types[struct.unpack(">H", h[4:6])[0]] = h[8:12]
+                elif h[0] == 3:
+                    types[struct.unpack(">I", h[4:8])[0]] = h[10:14]
+        elif typ == b"iloc":
+            d = read(cb, min(ce - cb, 1 << 20))
+            ver, p = d[0], 4
+            osz, lsz = d[p] >> 4, d[p] & 15
+            bsz, isz = d[p + 1] >> 4, (d[p + 1] & 15 if ver in (1, 2) else 0)
+            p += 2
+            wid = 2 if ver < 2 else 4
+            n = int.from_bytes(d[p:p + wid], "big")
+            p += wid
+            for _ in range(min(n, 100000)):
+                iid = int.from_bytes(d[p:p + wid], "big")
+                p += wid
+                method = 0
+                if ver in (1, 2):
+                    method = int.from_bytes(d[p:p + 2], "big") & 15
+                    p += 2
+                p += 2  # data reference
+                base = int.from_bytes(d[p:p + bsz], "big")
+                p += bsz
+                count = int.from_bytes(d[p:p + 2], "big")
+                p += 2
+                ext = []
+                for _ in range(count):
+                    p += isz
+                    off = int.from_bytes(d[p:p + osz], "big")
+                    p += osz
+                    ln = int.from_bytes(d[p:p + lsz], "big")
+                    p += lsz
+                    ext.append((base + off, ln))
+                if p > len(d):
+                    return None
+                locs[iid] = (method, ext)
+        elif typ == b"idat":
+            idat = cb
+    if not locs:
+        return None
+    out = {}
+    for iid, (method, ext) in locs.items():
+        if method == 1 and idat is not None:
+            ext = [(idat + o, n) for o, n in ext]
+        elif method != 0:
+            continue  # (data taken from another item: rare)
+        out[iid] = (types.get(iid, b"????"), [(o, n if n else length - o) for o, n in ext])
+    return out
+
+
+def _nal_chain(read, off: int, ln: int):
+    """HEVC units with 4-byte lengths filling [off, off+ln) exactly, each with a
+    valid header; the first offset where that fails, or None."""
+    p, end = off, off + ln
+    for _ in range(100000):
+        if p == end:
+            return None
+        h = read(p, 6)
+        n = struct.unpack(">I", h[:4])[0] if len(h) >= 4 else 0
+        if len(h) < 6 or n < 2 or p + 4 + n > end or h[4] & 0x80 or (h[4] >> 1) & 0x3F > 40 \
+                or ((h[4] & 1) << 5 | h[5] >> 3) or not h[5] & 7:
+            return p
+        p += 4 + n
+    return p
+
+
+def _obu_chain(read, off: int, ln: int):
+    """AV1 units (each with its size) filling [off, off+ln) exactly; the first
+    offset where that fails, or None."""
+    p, end = off, off + ln
+    for _ in range(100000):
+        if p == end:
+            return None
+        h = read(p, 10)
+        if not h:
+            return p
+        t, ext, sized = (h[0] >> 3) & 15, h[0] >> 2 & 1, h[0] >> 1 & 1
+        if h[0] & 0x81 or not sized or t == 0 or 9 <= t <= 14:
+            return p
+        q, size, shift = 1 + ext, 0, 0
+        while q < len(h):
+            size |= (h[q] & 0x7F) << shift
+            shift += 7
+            q += 1
+            if not h[q - 1] & 0x80:
+                break
+        else:
+            return p
+        if p + q + size > end:
+            return p
+        p += q + size
+    return p
+
+
+def validate_heif(read, length: int):
+    """A HEIF picture: every coded item (HEVC or AV1 tiles, the thumbnail) must
+    be made of units whose lengths chain exactly to the end of its data, with
+    valid headers, right where the item table says; a JPEG item must decode
+    and an EXIF item must start like one. As for a video's frames, a cluster
+    inside one tile can't be checked on its own."""
+    from . import jpeg
+    try:
+        items = heif_items(read, length)
+    except (struct.error, IndexError, ValueError):
+        items = None
+    if not items:
+        return "unverified", "no item table", None
+    checked = 0
+    for iid, (typ, ext) in sorted(items.items(), key=lambda kv: kv[1][1][0][0] if kv[1][1] else 0):
+        for off, ln in ext:
+            if off + ln > length:
+                return "corrupt", "item %d lies past the end of the file" % iid, min(off, length)
+            if typ in (b"hvc1", b"hev1", b"av01"):
+                bad = (_nal_chain if typ != b"av01" else _obu_chain)(read, off, ln)
+                if bad is not None:
+                    return "corrupt", "picture tile %d (byte %d) is not where the table says" % (iid, bad), bad
+                checked += 1
+            elif typ == b"jpeg":
+                if jpeg.check(read(off, ln))[0] != "ok":
+                    return "corrupt", "picture %d (byte %d) is damaged" % (iid, off), off
+                checked += 1
+            elif typ == b"Exif":
+                h = read(off, 4)
+                skip = struct.unpack(">I", h)[0] if len(h) == 4 else 1 << 30
+                if skip > ln or read(off + 4 + skip, 4) not in (b"MM\x00*", b"II*\x00") \
+                        and read(off + 4 + skip, 10)[6:10] not in (b"MM\x00*", b"II*\x00"):
+                    return "corrupt", "its EXIF data (byte %d) is not where the table says" % off, off
+    if not checked:
+        return "unverified", "it holds no picture data that can be checked", None
+    return "ok", "every picture tile checked (%d)" % checked, None
+
+
 # ---------------------------------------------------------------------- PNG
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
@@ -412,7 +569,10 @@ _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4
 
 def measure_tiff(read, start: int, limit: int) -> Result:
     """RAW files (CR2, NEF, ARW, DNG, ORF, RW2...) are TIFF containers. The file
-    ends where the last thing any IFD points to ends."""
+    ends where the last thing any IFD points to ends. Anything an IFD points to
+    past the limit (another IFD, a tag's data, picture data) means the file is
+    cut short there: not complete, though its length stays what could be seen
+    (a false header in random bytes mustn't swallow the rest of the card)."""
     head = read(start, 16)
     bo = "<" if head[:2] == b"II" else ">"
     ext = ".tif"
@@ -428,11 +588,20 @@ def measure_tiff(read, start: int, limit: int) -> Result:
     todo = [struct.unpack(bo + "I", head[4:8])[0]]
     strip_pairs = {(0x0111, 0x0117), (0x0144, 0x0145), (0x0201, 0x0202)}
     refs = set()
+    cut = None  # the first thing an IFD points to past the limit
+
+    def past(at):
+        nonlocal cut
+        if seen:  # (a first IFD past the limit: no TIFF here at all)
+            cut = at if cut is None else min(cut, at)
+
     while todo and len(seen) < 64:
         ifd = todo.pop()
-        if ifd in seen or ifd < 8 or ifd > limit:
+        if ifd in seen or ifd < 8:
             continue
-        seen.add(ifd)
+        if ifd + 2 > limit:
+            past(ifd)
+            continue
         cnt_b = read(start + ifd, 2)
         if len(cnt_b) < 2:
             continue
@@ -440,20 +609,23 @@ def measure_tiff(read, start: int, limit: int) -> Result:
         if n == 0 or n > 1000:
             continue
         raw = read(start + ifd + 2, 12 * n + 4)
-        if len(raw) < 12 * n + 4:
+        if len(raw) < 12 * n + 4 or ifd + 6 + 12 * n > limit:
+            past(ifd)
             continue
+        seen.add(ifd)
         tags = {}
         for i in range(n):
             tag, typ, count, val = struct.unpack(bo + "HHII", raw[12 * i:12 * i + 12])
+            field = raw[12 * i + 8:12 * i + 12]
             ts = _TYPE_SIZE.get(typ, 1)
-            tags[tag] = (typ, count, val)
-            if ts * count > 4 and val + ts * count <= limit:
-                end = max(end, val + ts * count)
+            tags[tag] = (typ, count, field)
+            if ts * count > 4:
+                if val + ts * count <= limit:
+                    end = max(end, val + ts * count)
+                else:
+                    past(val)
             if tag in (0x8769, 0x014A, 0x8825, 0xA005) and typ in (4, 13):
-                if count == 1:
-                    todo.append(val)
-                elif val + 4 * count <= limit:
-                    todo.extend(struct.unpack(bo + "%dI" % count, read(start + val, 4 * count)))
+                todo.extend(_tiff_values(read, start, bo, typ, count, field))
             if tag == 0x010F:
                 make = read(start + val, min(count, 32)) if count > 4 else raw[12 * i + 8:12 * i + 12]
             if tag == 0xC612:
@@ -464,14 +636,15 @@ def measure_tiff(read, start: int, limit: int) -> Result:
             todo.append(nxt)
         for off_tag, len_tag in strip_pairs:
             if off_tag in tags and len_tag in tags:
-                (to, co, vo), (tl, cl, vl) = tags[off_tag], tags[len_tag]
-                offs = [vo] if co == 1 else list(_vals(read, start, bo, to, co, vo))
-                lens = [vl] if cl == 1 else list(_vals(read, start, bo, tl, cl, vl))
+                offs = _tiff_values(read, start, bo, *tags[off_tag])
+                lens = _tiff_values(read, start, bo, *tags[len_tag])
                 for o, ln in zip(offs, lens):
                     if o + ln <= limit:
                         end = max(end, o + ln)
                         if len(refs) < 100000:
                             refs.add(o)
+                    elif ln:
+                        past(o)
     if ext == ".tif":
         m = make.upper()
         if m.startswith(b"NIKON"):
@@ -482,17 +655,24 @@ def measure_tiff(read, start: int, limit: int) -> Result:
             ext = ".pef"
         elif m.startswith(b"CANON"):
             ext = ".cr2"
+    if cut is not None:
+        return Result(end, False, ext, "it goes on past the end of what was found", break_pos=cut, refs=refs)
     return Result(end, end > 1024, ext, "ok" if end > 1024 else "too small", refs=refs)
 
 
-def _vals(read, start, bo, typ, count, off):
+def _tiff_values(read, start, bo, typ, count, field: bytes):
+    """The values of a TIFF tag whose 4-byte value field is `field`: in the
+    field itself when they fit there (up to two 16-bit ones), else where it points."""
     fmt = {3: "H", 4: "I", 13: "I"}.get(typ)
     if not fmt or count > 100000:
         return []
     size = struct.calcsize(fmt)
-    raw = read(start + off, size * count)
-    raw = raw[:len(raw) // size * size]  # a cut-off read: keep the whole values
-    return struct.unpack(bo + "%d%s" % (len(raw) // size, fmt), raw)
+    if size * count <= 4:
+        raw = field[:size * count]
+    else:
+        raw = read(start + struct.unpack(bo + "I", field)[0], size * count)
+        raw = raw[:len(raw) // size * size]  # a cut-off read: keep the whole values
+    return list(struct.unpack(bo + "%d%s" % (len(raw) // size, fmt), raw))
 
 
 # ---------------------------------------------------------------------- PDF
@@ -501,31 +681,53 @@ def probe_pdf(head: bytes) -> bool:
 
 
 def measure_pdf(read, start: int, limit: int, stop_at=None) -> Result:
-    pos, last_eof, chunk = 0, -1, 1 << 20
+    pos, eofs, chunk, last = 0, [], 1 << 20, 0
     tail = b""
     while pos < limit:
-        data = read(start + pos, chunk)
+        data = read(start + pos, min(chunk, limit - pos))  # never past the next file's header
         if not data:
             break
         buf = tail + data
         base = pos - len(tail)
-        i = buf.rfind(b"%%EOF")
-        if i >= 0:
-            last_eof = base + i + 5
-        if stop_at and last_eof > 0 and stop_at(pos + len(data)):
+        i = buf.find(b"%%EOF")
+        while i >= 0:
+            if not eofs or base + i + 5 > eofs[-1]:
+                eofs.append(base + i + 5)
+            i = buf.find(b"%%EOF", i + 1)
+        del eofs[:-4096]
+        if stop_at and eofs and stop_at(pos + len(data)):
             break
         tail = buf[-5:]
+        used = len(data.rstrip(b"\x00"))
+        if used:
+            last = pos + used  # the last byte that isn't blank
         pos += len(data)
-        if last_eof > 0 and data.count(0) == len(data):
+        if not used:
+            break  # blank space: the file (or its first piece) ended before it
+    if not eofs:
+        # Its end isn't in reach: keep what was found as its first piece (the
+        # rest may be elsewhere on the card, for the rebuild to find).
+        return Result(last, False, ".pdf", "no end marker", break_pos=last)
+    # The file ends at the last end marker that is its own: the startxref
+    # before it points back to a cross-reference section inside the file. A
+    # later one (a deleted PDF's leftover tail in the free space after this
+    # one) points somewhere else. An update appended to the PDF has its own.
+    end = eofs[-1]
+    for e in reversed(eofs):
+        lo = max(0, e - 5 - 48)
+        m = re.search(rb"startxref\s+(\d+)\s*$", read(start + lo, e - 5 - lo))
+        if not m or int(m.group(1)) >= e:
+            continue
+        h = read(start + int(m.group(1)), 32)
+        if h.startswith(b"xref") or re.match(rb"\d+\s+\d+\s+obj", h):
+            end = e
             break
-    if last_eof < 0:
-        return Result(0, False, ".pdf", "no end marker")
-    nl = read(start + last_eof, 2)
+    nl = read(start + end, 2)
     if nl[:2] == b"\r\n":
-        last_eof += 2
+        end += 2
     elif nl[:1] in (b"\n", b"\r"):
-        last_eof += 1
-    return Result(last_eof, True, ".pdf")
+        end += 1
+    return Result(end, True, ".pdf")
 
 
 # ---------------------------------------------------------------------- ZIP
@@ -533,8 +735,55 @@ def probe_zip(head: bytes) -> bool:
     return len(head) >= 6 and head[:4] == b"PK\x03\x04" and 10 <= struct.unpack("<H", head[4:6])[0] <= 63
 
 
+_ZIP_KINDS = ((b"word/", ".docx"), (b"xl/", ".xlsx"), (b"ppt/", ".pptx"), (b"META-INF/container.xml", ".epub"),
+              (b"AndroidManifest.xml", ".apk"))
+
+
+def _zip_walk(read, start: int, limit: int):
+    """Follow the local headers from the start, each member's stated size to
+    the next. (where the chain ends, whether it reached the central directory,
+    an extension guessed from the member names), or None when sizes aren't
+    known up front (ZIP64, sizes written after the data)."""
+    pos, names = 0, b""
+    while pos + 30 <= limit:
+        h = read(start + pos, 30)
+        if h[:4] in (b"PK\x01\x02", b"PK\x05\x06"):
+            return pos, True, names
+        if len(h) < 30 or h[:4] != b"PK\x03\x04":
+            return pos, False, names
+        flags, _m, _t, _d, _c, csize, usize, nlen, xlen = struct.unpack("<HHHHIIIHH", h[6:30])
+        if flags & 8 or 0xFFFFFFFF in (csize, usize):
+            return None
+        names += read(start + pos + 30, min(nlen, 256)) + b"\n"
+        pos += 30 + nlen + xlen + csize
+    return min(pos, limit), False, names
+
+
+def _zip_ext(names: bytes) -> str:
+    if b"[Content_Types].xml" in names or b"META-INF/container.xml" in names or b"AndroidManifest.xml" in names:
+        for key, ext in _ZIP_KINDS:
+            if key in names:
+                return ext
+    return ".zip"
+
+
 def measure_zip(read, start: int, limit: int) -> Result:
-    pos, chunk = 0, 1 << 20
+    walk = _zip_walk(read, start, limit)
+    if walk is not None and not walk[1]:
+        # The chain of members breaks. An Android app keeps a signing block
+        # there, so look a little further for the archive's end record; with
+        # none, the rest of it is somewhere else (or gone): keep what checked
+        # out, and don't search the rest of the card.
+        pos, _, names = walk
+        got = _zip_end(read, start, pos, min(limit, pos + (16 << 20)))
+        return got or Result(pos, False, _zip_ext(names), "the rest of it isn't where it should be", break_pos=pos)
+    return _zip_end(read, start, walk[0] if walk else 0, limit) or Result(0, False, ".zip", "no central directory")
+
+
+def _zip_end(read, start: int, pos: int, limit: int):
+    """The archive whose end record (with its directory right before it) lies
+    in [pos, limit), or None."""
+    chunk = 1 << 20
     while pos < limit:
         data = read(start + pos, chunk + 22)
         if not data:
@@ -560,4 +809,4 @@ def measure_zip(read, start: int, limit: int) -> Result:
                 return Result(eocd + 22 + clen, True, ext)
             i = data.find(b"PK\x05\x06", i + 1)
         pos += chunk
-    return Result(0, False, ".zip", "no central directory")
+    return None

@@ -68,8 +68,10 @@ sudo recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
 It finds files three ways, in order: deleted entries the filesystem still lists (original
 names), folders that survived a format (original names again), and signature carving
 of every cluster. Fragmented JPEGs are rebuilt piece by piece and verified by decoding
-them; fragmented MP4/MOV videos are rebuilt from their own frame index. Every file is
-checked; anything not fully verified is labeled ("partial", "not checked").
+them; fragmented MP4/MOV videos are rebuilt from their own frame index; music, voice
+memos, dashcam and camcorder clips are rebuilt frame by frame. Besides photos and videos
+it finds audio, old and new Office files, PDFs, archives and SQLite databases. Every file
+is checked; anything not fully verified is labeled ("partial", "not checked").
 
 ### 4. Report back
 Open or point them to `report.html` in the output folder. Tell them the headline

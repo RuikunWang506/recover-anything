@@ -9,11 +9,11 @@ import os
 import re
 import shutil
 
-from .carve import GROUP
+from .carve import group_of
 from .exif import capture_time
 from .validate import ExtentReader
 
-FOLDER = {"photo": "Photos", "video": "Videos", "document": "Documents"}
+FOLDER = {"photo": "Photos", "video": "Videos", "audio": "Audio", "document": "Documents"}
 _BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
@@ -106,7 +106,7 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True, creat
         reader = ExtentReader(src, r.extents)
         when = capture_time(r.kind, reader.read, reader.length) if r.kind != "other" else None
         when = when or r.fs_time
-        group = GROUP.get(r.kind, "other")
+        group = group_of(r.kind, r.ext)
         if r.status in ("partial", "corrupt"):
             top = "Partly recovered"
         elif r.status == "unverified" and r.kind == "other":
@@ -120,7 +120,7 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True, creat
             if r.kind == "jpeg" and not name.lower().endswith((".jpg", ".jpeg", ".jpe", ".jfif")):
                 name += ".jpg"
         elif when:
-            label = {"photo": "Photo", "video": "Video"}.get(group, "File")
+            label = {"photo": "Photo", "video": "Video", "audio": "Recording"}.get(group, "File")
             name = "%s %s%s" % (label, when.strftime("%Y-%m-%d %H.%M.%S"), ext)
         else:
             name = "Recovered %010d%s" % (r.start // 512, ext)

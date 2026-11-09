@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ProcessPoolExecutor
 
-from .formats import jpeg, others
+from .formats import checks, jpeg, more, others
 from .records import Found
 
 
@@ -29,8 +29,8 @@ class ExtentReader:
         return b"".join(out)
 
 
-def _check_jpeg_bytes(data: bytes, deep: bool, expected: int | None):
-    st, note, pos = jpeg.check(data) if deep else jpeg.check_fast(data)
+def _check_jpeg_bytes(data: bytes, deep: bool, expected: int | None, deleted: bool = False):
+    st, note, pos = jpeg.check(data, thumb=deleted) if deep else jpeg.check_fast(data)
     actual = None
     if expected and st == "ok":
         m = jpeg.measure(lambda o, n: data[o:o + n], 0, len(data) + 1)
@@ -41,7 +41,7 @@ def _check_jpeg_bytes(data: bytes, deep: bool, expected: int | None):
 
 
 def _jpeg_job(args):
-    path, extents, deep, expected = args
+    path, extents, deep, expected, deleted = args
     from .source import Source
     try:
         with Source(path) as src:
@@ -49,7 +49,7 @@ def _jpeg_job(args):
             if total > jpeg.MAX_JPEG:
                 return "unverified", "too large to check", None, None, "none"
             data = b"".join(src.read(o, n) for o, n in extents)
-        return _check_jpeg_bytes(data, deep, expected)
+        return _check_jpeg_bytes(data, deep, expected, deleted)
     except Exception as e:  # never let one file stop the run
         return "unverified", "could not be checked (%s)" % type(e).__name__, None, None, "none"
 
@@ -165,21 +165,55 @@ def validate_one(src, rec: Found, deep: bool = True) -> None:
         rec.meta["check"] = "none"
 
 
+def layout_known(rec: Found) -> bool:
+    """True when the bytes are certainly the file's own: it was never deleted
+    and the filesystem still lists where it is. A deleted file's clusters can
+    be reused and freed again without a trace, so for a file type without
+    checksums nothing else can prove its contents."""
+    return bool(rec.meta.get("live")) and rec.meta.get("chain") in ("fat", "contiguous")
+
+
+def _grid(rec: Found):
+    """(phase, cluster size) of a file stored in one piece: how far into a
+    cluster its first byte sits. Sectors stand in when the filesystem is
+    unknown (every cluster boundary is also a sector boundary). None for a
+    file in several pieces."""
+    if len(rec.extents) != 1:
+        return None
+    vol = getattr(rec, "volume", None)
+    geo = getattr(vol, "geometry", None)
+    cs = getattr(vol, "cluster_size", 0) or 0
+    if geo is not None and cs and rec.start >= geo.data_offset:
+        return (rec.start - geo.data_offset) % cs, cs
+    return rec.start % 512, 512
+
+
 def _validate_one(src, rec: Found, deep: bool = True) -> None:
     if rec.kind == "jpeg":
         if rec.size > jpeg.MAX_JPEG:
             rec.status, rec.note, rec.meta["check"] = "unverified", "too large to check", "none"
             return
-        _apply_jpeg(rec, _check_jpeg_bytes(rec.read(src), deep, rec.expected_size))
+        _apply_jpeg(rec, _check_jpeg_bytes(rec.read(src), deep, rec.expected_size, not layout_known(rec)))
         return
     r = ExtentReader(src, rec.extents)
     if rec.kind == "isobmff":
         st, why, pos = others.validate_isobmff(r.read, r.length)
         rec.meta["check"] = "full" if st == "ok" else "structure"
+        if st == "unverified" and why == "no moov box":
+            # a HEIF picture (HEIC, AVIF): its item table says where every tile is
+            hst, hwhy, hpos = others.validate_heif(r.read, r.length)
+            if hst != "unverified":
+                st, why, pos = hst, hwhy, hpos
+                rec.meta["check"] = "full" if st == "ok" else "structure"
         if st == "unverified":
             m = others.measure_isobmff(r.read, 0, r.length)
             st = "ok" if m.complete else "partial"
             why = "structure checked" if m.complete else m.reason
+            if st == "ok" and not layout_known(rec):
+                # Nothing in it could be checked against its bytes (a HEIC picture,
+                # AAC audio, an index that lists no checkable frames): its boxes line
+                # up, but a deleted one may hold another file's data.
+                st, why = "unverified", more.WEAK
         rec.status, rec.note = st, why
         rec.meta["bad_at"] = pos
         return
@@ -188,8 +222,22 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
         rec.status, rec.note = st, why
         rec.meta["check"] = "full" if why.endswith(" members checksum-verified") else "structure"
         return
-    fn = {"png": others.measure_png, "gif": others.measure_gif, "riff": others.measure_riff,
-          "tiff": others.measure_tiff, "pdf": others.measure_pdf}.get(rec.kind)
+    if rec.kind in more.KINDS:
+        sized = rec.expected_size is not None and r.length == rec.expected_size
+        o, n = rec.extents[-1]
+        rec.status, rec.note, rec.meta["check"] = more.KINDS[rec.kind][2](
+            r.read, r.length, sized, after=src.read(o + n, 1024), grid=_grid(rec),
+            layout_known=layout_known(rec))
+        return
+    check = {"pdf": checks.validate_pdf, "riff": checks.validate_riff, "tiff": checks.validate_tiff,
+             "gif": checks.validate_gif}.get(rec.kind)
+    if check is not None:
+        st, why, bad = check(r.read, r.length, layout_known=layout_known(rec), deep=deep)
+        rec.status, rec.note = st, why
+        rec.meta["check"] = "full" if st == "ok" and why != "structure checked" else "structure"
+        rec.meta["bad_at"] = bad
+        return
+    fn = {"png": others.measure_png}.get(rec.kind)
     if fn is None:
         rec.status = "unverified"
         rec.note = rec.note or "no check exists for this file type"
@@ -213,7 +261,7 @@ def _check_jpegs(src, jpegs, workers, progress, deep, done0=0, total=None):
     path = getattr(src, "path", None)
     if workers > 1 and path and len(jpegs) > 4:
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            jobs = [(path, r.extents, deep, r.expected_size) for r in jpegs]
+            jobs = [(path, r.extents, deep, r.expected_size, not layout_known(r)) for r in jpegs]
             for i, (r, res) in enumerate(zip(jpegs, ex.map(_jpeg_job, jobs, chunksize=2))):
                 _apply_jpeg(r, res)
                 if progress:

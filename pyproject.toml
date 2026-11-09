@@ -42,3 +42,6 @@ recover_anything = ["skill/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A passing test's folder goes at once: the simulated cards are sparse files on
+# macOS and Linux but take their full size on Windows, and a run makes hundreds.
+tmp_path_retention_policy = "failed"
