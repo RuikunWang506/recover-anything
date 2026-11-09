@@ -60,6 +60,7 @@ class _Walker:
     checked = -1    # for a weak kind: the last position where something tied the data to what came before
     horizon = 0     # clusters from the failing unit to its next check, when that's further than usual
     first_choice = False  # a tie only counts where the join is the first cluster the file could go on in
+    ends_known = False  # it decides where it ends itself: no "it stops inside a cluster, so that's its end"
     weak = ()       # (start, end) stretches nothing checks: a join inside one proves nothing
 
     def __init__(self, read, expected=None):
@@ -1116,8 +1117,185 @@ class _Gif(_Walker):
         return self.end is not None
 
 
+class _Mkv(_Walker):
+    """Matroska and WebM, element by element: each element header must follow
+    the one before exactly, every block must belong to a track and its frame
+    must pass its codec's check (H.264/H.265 units, VP9/VP8/AV1 headers:
+    more.VIDEO_FRAME_CHECKS), and cluster times must go forward. A frame's
+    data past what its check reads proves nothing about the clusters it
+    fills, so a join only counts when a checked header falls in the cluster
+    right after it, and only where no other cluster could have come next
+    (first_choice): frames of another video of the same kind pass these
+    checks too."""
+
+    need = 8
+    first_choice = True
+    ends_known = True  # (it decides its own end: see advance)
+    MAX_STEP = 600  # seconds a cluster's time may jump ahead
+
+    def __init__(self, read, expected=None):
+        super().__init__(read, expected)
+        e = more._element(read, 0)
+        if not e or e[0] != 0x1A45DFA3 or e[1] < 0:
+            raise ValueError("not Matroska")
+        pos = e[2] + e[1]
+        s = more._element(read, pos)
+        if not s or s[0] != 0x18538067:
+            raise ValueError("no segment")
+        self.seg_end = pos + s[2] + s[1] if s[1] >= 0 else None
+        self.pos = pos + s[2]
+        self.cluster_end = None  # inside a cluster: where it ends (-1: until the next top-level element)
+        self.tracks: dict = {}
+        self.states: dict = {}  # track -> what its codec check carries from frame to frame
+        self.ctime = None  # the last cluster's time
+        self.scale = 1_000_000  # nanoseconds per tick of those times (the file's Info may say otherwise)
+        self.last_check = self.pos  # where the last header that was checked starts
+        self.audit = None  # when set: positions of every checked header
+
+    def tied(self, seams) -> bool:
+        a = _Mkv(self.read, self.expected)
+        a.grain, a.audit = self.grain, []
+        a.advance(self.end if self.end is not None else self.pos)
+        checks, g = a.audit, self.grain
+        import bisect
+        for s in seams:
+            i = bisect.bisect_left(checks, s)
+            if i == len(checks) or checks[i] >= s + g:
+                return False  # the cluster after the join lies inside a frame's data
+        return True
+
+    def snapshot(self):
+        s = super().snapshot()
+        s["states"] = {k: dict(v) for k, v in self.states.items()}  # (a codec's state is changed in place)
+        return s
+
+    def restore(self, snap):
+        super().restore(snap)
+        self.states = {k: dict(v) for k, v in snap["states"].items()}
+
+    def _bad(self):
+        """A check failed: the wrong piece may be anywhere since the last
+        header that checked out (inside a frame's data, nothing checks it)."""
+        self.unit = self.last_check
+        self.horizon = (self.pos - self.last_check) // max(1, self.grain) + 2
+        return "bad"
+
+    def _checked(self, at: int):
+        self.last_check = at
+        if self.audit is not None:
+            self.audit.append(at)
+
+    def advance(self, limit):
+        read = self.read
+        while True:
+            self.unit = self.pos
+            if self.seg_end is not None and self.pos >= self.seg_end:
+                if self.pos > self.seg_end:
+                    return self._bad()
+                self.end = self.seg_end
+                return "end"
+            room = 12 if self.seg_end is None else min(12, self.seg_end - self.pos)
+            if self.pos + room > limit:
+                return "need"
+            el = more._element(read, self.pos)
+            if not el or (el[0] not in more._SEG_CHILDREN and el[0] not in more._CLUSTER_CHILDREN):
+                if self.seg_end is None and self.pos % self.grain and self.pos > self.last_check:
+                    # A recording written live doesn't give its length: it ends where its
+                    # elements stop, inside the cluster holding the last one (the file
+                    # can't go on elsewhere from the middle of a cluster).
+                    self.end = self.pos
+                    return "end"
+                return self._bad()
+            eid, size, hl = el
+            if self.cluster_end is not None and eid not in more._CLUSTER_CHILDREN:
+                if self.cluster_end == -1 and eid in more._SEG_CHILDREN:
+                    self.cluster_end = None  # an unknown-size cluster ends where the next element starts
+                else:
+                    return self._bad()
+            if self.cluster_end is not None:
+                end = self.pos + hl + size
+                if size < 0 or (self.cluster_end != -1 and end > self.cluster_end):
+                    return self._bad()
+                if eid in (0xA3, 0xA0, 0xE7) and end > limit:
+                    self.horizon = size // max(1, self.grain) + 2
+                    return "need"
+                if eid == 0xE7:
+                    t = int.from_bytes(read(self.pos + hl, size), "big") if 0 < size <= 8 else -1
+                    if t < 0 or (self.ctime is not None and not
+                                 self.ctime <= t <= self.ctime + self.MAX_STEP * 10 ** 9 // self.scale):
+                        return self._bad()
+                    self.ctime = t
+                    self._checked(self.pos)
+                elif eid in (0xA3, 0xA0):
+                    if not self._block(self.pos + hl, size, eid == 0xA0):
+                        return self._bad()
+                    self._checked(self.pos)
+                self.pos = end
+                if self.pos == self.cluster_end:
+                    self.cluster_end = None
+                continue
+            if eid not in more._SEG_CHILDREN:
+                return self._bad()
+            if eid == 0x1F43B675:
+                self.cluster_end = self.pos + hl + size if size >= 0 else -1
+                if self.seg_end is not None and self.cluster_end > self.seg_end:
+                    return self._bad()
+                self._checked(self.pos)
+                self.pos += hl
+                continue
+            end = self.pos + hl + size
+            if size < 0 or (self.seg_end is not None and end > self.seg_end):
+                return self._bad()
+            if eid in (0x1654AE6B, 0x1549A966):  # the tracks, and the file's info (its time scale)
+                if end > limit:
+                    return "need"
+                body = read(self.pos + hl, min(size, 1 << 20))
+                if eid == 0x1654AE6B:
+                    self.tracks = more._mkv_tracks(body)
+                else:
+                    p = 0
+                    while p < len(body):
+                        e = more._vint(body, p, True)
+                        z = e and more._vint(body, p + e[1], False)
+                        if not z or z[0] < 0:
+                            break
+                        if e[0] == 0x2AD7B1 and 0 < z[0] <= 8:
+                            self.scale = int.from_bytes(body[p + e[1] + z[1]:p + e[1] + z[1] + z[0]], "big") or 1
+                        p += e[1] + z[1] + z[0]
+                self._checked(self.pos)
+            self.pos = end  # (other top-level elements are walked over: nothing inside them is checked)
+
+    def _block(self, at: int, size: int, group: bool) -> bool:
+        read = self.read
+        if group:  # a BlockGroup: its Block
+            p, end = at, at + size
+            while p < end:
+                b = more._element(read, p)
+                if not b or b[1] < 0 or p + b[2] + b[1] > end:
+                    return False
+                if b[0] == 0xA1:
+                    at, size = p + b[2], b[1]
+                    break
+                p += b[2] + b[1]
+            else:
+                return False
+        head = read(at, 12)
+        t = more._vint(head, 0, False)
+        if not t or t[1] + 3 > size or (self.tracks and t[0] not in self.tracks):
+            return False
+        codec, nsize, enc = self.tracks.get(t[0], (b"", 0, False))
+        flags = head[t[1] + 2]
+        check = more.VIDEO_FRAME_CHECKS.get(codec)
+        if (nsize or check) and not flags & 0x06 and not enc:
+            body = read(at + t[1] + 3, size - t[1] - 3)
+            if nsize:
+                return more.nal_chain_ok(body, nsize, codec == b"V_MPEGH/ISO/HEVC")
+            return check(body, self.states.setdefault(t[0], {})) is None
+        return True
+
+
 WALKERS = {"mp3": _Mp3, "ts": _Ts, "ogg": _Ogg, "flac": _Flac, "gzip": _Gzip, "zip": _Zip, "pdf": _Pdf,
-           "riff": _Avi, "gif": _Gif}
+           "riff": _Avi, "gif": _Gif, "mkv": _Mkv}
 
 
 # ------------------------------------------------------------------ the search
@@ -1197,7 +1375,7 @@ class _Rebuild:
             # 'bad'. For a stream without an end marker, stopping inside the
             # cluster that holds the last good header is the real end: the
             # file can't go on elsewhere from the middle of a cluster.
-            if not w.strong and self.expected is None and w.pos > w.unit and \
+            if not w.strong and not w.ends_known and self.expected is None and w.pos > w.unit and \
                     w.unit // self.cs == (w.pos + w.need - 1) // self.cs:
                 w.end = w.pos
                 return self._prefix(w.pos) + (True,)
@@ -1246,10 +1424,14 @@ class _Rebuild:
         for skip_soft in ((True, False) if self.soft is not None else (False,)):
             # Round robin over the slots: the k-th candidate for every slot
             # before the (k+1)-th for any, so a break in a later slot is found
-            # without first exhausting the earlier ones.
+            # without first exhausting the earlier ones. Within a round, slots
+            # where the path jumped come first: a file breaks where the clusters
+            # stop following on, and inside a stretch nothing checks (a video
+            # frame's data), a piece of another file could stand in for the
+            # file's own clusters there if those were tried first.
             state = {j: self.path[j - 1] for j in slots}
             taken = {j: set(self.path[:j]) for j in slots}
-            live = list(slots)
+            live = sorted(slots, key=lambda j: (self.path[j] == self.path[j - 1] + 1, j))
             for _k in range(MAX_SCAN):
                 if not live or self.trials >= MAX_TRIALS:
                     break
