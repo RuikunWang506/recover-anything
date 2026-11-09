@@ -259,7 +259,7 @@ def mixed_device(workdir: str, seed: int, cluster_size: int = 4096, size: int = 
 
 
 SINGLE_KINDS = ("mp3", "ts", "mts", "flac", "opus", "mp4", "jpg", "amr", "mpg", "doc",
-                "pdf", "docx", "wav", "avi", "raw", "gif", "heic")
+                "pdf", "docx", "wav", "avi", "raw", "gif", "heic", "webm", "mkv")
 
 
 def _one_kind_file(kind: str, rng, n: int):
@@ -301,6 +301,10 @@ def _one_kind_file(kind: str, rng, n: int):
         return "Pictures/anim%03d.gif" % n, F.make_gif(s, frames=rng.randint(1, 8))
     if kind == "heic":
         return "DCIM/100APPLE/IMG_%04d.HEIC" % n, F.make_heic(s, size=rng.randint(800_000, 2_500_000))
+    if kind == "webm":
+        return "Movies/screen%03d.webm" % n, F.make_mkv(s, clusters=rng.randint(3, 10), webm=True)
+    if kind == "mkv":
+        return "Videos/clip%03d.mkv" % n, F.make_mkv(s, clusters=rng.randint(3, 10))
     raise ValueError(kind)
 
 

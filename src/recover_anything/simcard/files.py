@@ -259,14 +259,213 @@ def _el(eid: int, payload: bytes) -> bytes:
     return eid.to_bytes((eid.bit_length() + 7) // 8, "big") + _ebml_size(len(payload)) + payload
 
 
+# ------------------------------------------------------------------ VP8 / VP9 frames (WebM)
+class _BitWriter:
+    def __init__(self):
+        self.bits: list = []
+
+    def put(self, v: int, n: int):
+        self.bits.extend((v >> i) & 1 for i in range(n - 1, -1, -1))
+
+    def done(self) -> bytes:
+        b = self.bits + [0] * (-len(self.bits) % 8)  # zero bits up to a byte
+        return bytes(sum(bit << (7 - j) for j, bit in enumerate(b[i:i + 8])) for i in range(0, len(b), 8))
+
+
+def _vp9_log2_cols(width: int) -> tuple:
+    """(fewest, most) tile columns (log2) for a picture this wide."""
+    sb = (width + 63) // 64
+    lo = 0
+    while (64 << lo) < sb:
+        lo += 1
+    hi = 0
+    while (sb >> (hi + 1)) >= 4:
+        hi += 1
+    return lo, hi
+
+
+def _vp9_dress(buf: bytearray, rng: random.Random, key: bool, width: int, height: int, hidden: bool = False):
+    """Make buf (noise) one VP9 frame of the same length, profile 0, with as
+    many tile columns as the width allows (libvpx's default): header, then a
+    compressed header and the tiles, each tile but the last after its size."""
+    bw = _BitWriter()
+    bw.put(2, 2)
+    bw.put(0, 3)  # profile 0, a new frame
+    bw.put(0 if key else 1, 1)
+    bw.put(0 if hidden else 1, 1)
+    bw.put(0, 1)  # error resilient mode
+    if key:
+        bw.put(0x498342, 24)
+        bw.put(2, 3)  # color space BT.709
+        bw.put(0, 1)
+        bw.put(width - 1, 16)
+        bw.put(height - 1, 16)
+        bw.put(0, 1)
+    else:
+        if hidden:
+            bw.put(0, 1)  # not intra-only
+        bw.put(0, 2)
+        bw.put(rng.choice((0x01, 0x04, 0x20, 0x00)), 8)  # references to refresh
+        for i in range(3):
+            bw.put(rng.randint(0, 7) if i else 0, 3)
+            bw.put(0, 1)
+        bw.put(1, 1)  # same size as the first reference
+        bw.put(0, 1)
+        bw.put(rng.randint(0, 1), 1)
+        switchable = rng.random() < 0.7
+        bw.put(1 if switchable else 0, 1)
+        if not switchable:
+            bw.put(rng.randint(0, 3), 2)
+    bw.put(1, 1)
+    bw.put(0, 1)
+    bw.put(rng.randint(0, 3), 2)
+    bw.put(rng.randint(0, 63), 6)  # loop filter
+    bw.put(rng.randint(0, 7), 3)
+    bw.put(1, 1)
+    bw.put(1 if key else 0, 1)
+    if key:
+        for v in (1, 0, -1, -1, 0, 0):
+            bw.put(1, 1)
+            bw.put(abs(v), 6)
+            bw.put(1 if v < 0 else 0, 1)
+    bw.put(rng.randint(20, 220), 8)  # quantizer
+    bw.put(0, 3)
+    bw.put(0, 1)  # no segmentation
+    lo, hi = _vp9_log2_cols(width)
+    bw.put((1 << (hi - lo)) - 1, hi - lo)  # one more column at a time, up to the most
+    bw.put(0, 1)  # one tile row
+    hsize = rng.randint(20, 120)
+    bw.put(hsize, 16)
+    head = bw.done()
+    buf[:len(head)] = head
+    p = len(head)
+    buf[p] &= 0x7F  # the compressed header's marker bit
+    p += hsize
+    tiles = 1 << hi
+    left = len(buf) - p - 4 * (tiles - 1)
+    cuts = sorted(rng.sample(range(1, left // 8), tiles - 1)) if tiles > 1 else []
+    lens = [(y - x) * 8 for x, y in zip([0] + cuts, cuts + [left // 8])]
+    lens[-1] += left - sum(lens)
+    for t, ln in enumerate(lens):
+        if t < tiles - 1:
+            buf[p:p + 4] = ln.to_bytes(4, "big")
+            p += 4
+        buf[p] &= 0x7F  # each tile's marker bit
+        p += ln
+    if buf[-1] & 0xE0 == 0xC0:
+        buf[-1] ^= 0x20  # a frame must not end like a superframe index
+
+
+def _vp9_superframe(buf: bytearray, rng: random.Random, width: int, height: int):
+    """A hidden frame (for later frames to refer to) and a shown one in one
+    block, with the index of their sizes at the end, as libvpx writes them."""
+    n = len(buf)
+    a = int((n - 10) * rng.uniform(0.3, 0.6))
+    b = n - 10 - a
+    first, second = bytearray(buf[:a]), bytearray(buf[a:a + b])
+    _vp9_dress(first, rng, False, width, height, hidden=True)
+    _vp9_dress(second, rng, False, width, height)
+    marker = 0xC0 | (3 << 3) | 1  # sizes in 4 bytes, 2 frames
+    buf[:] = first + second + bytes([marker]) + a.to_bytes(4, "little") + b.to_bytes(4, "little") + bytes([marker])
+
+
+class _BoolEncoder:
+    """VP8's boolean encoder (RFC 6386, section 7.3), probability 1/2."""
+
+    def __init__(self):
+        self.out = bytearray()
+        self.range, self.bottom, self.count = 255, 0, 24
+
+    def _carry(self):
+        i = len(self.out) - 1
+        while i >= 0 and self.out[i] == 255:
+            self.out[i] = 0
+            i -= 1
+        if i >= 0:
+            self.out[i] += 1
+
+    def put(self, v: int, n: int):
+        for k in range(n - 1, -1, -1):
+            split = 1 + (((self.range - 1) * 128) >> 8)
+            if (v >> k) & 1:
+                self.bottom += split
+                self.range -= split
+            else:
+                self.range = split
+            while self.range < 128:
+                self.range <<= 1
+                if self.bottom & (1 << 31):
+                    self._carry()
+                self.bottom = (self.bottom << 1) & 0xFFFFFFFF
+                self.count -= 1
+                if not self.count:
+                    self.out.append(self.bottom >> 24)
+                    self.bottom &= (1 << 24) - 1
+                    self.count = 8
+
+    def done(self) -> bytes:
+        c, v = self.count, self.bottom
+        if v & (1 << (32 - c)):
+            self._carry()
+        v = (v << (c & 7)) & 0xFFFFFFFF
+        for _ in range(c >> 3):
+            v = (v << 8) & 0xFFFFFFFF
+        for _ in range(4):
+            self.out.append(v >> 24)
+            v = (v << 8) & 0xFFFFFFFF
+        return bytes(self.out)
+
+
+def _vp8_dress(buf: bytearray, rng: random.Random, key: bool, width: int, height: int, parts_log2: int):
+    """Make buf (noise) one VP8 frame of the same length: its tag, a key
+    frame's start code and size, the header at the start of the first
+    partition, and the sizes of the other token partitions."""
+    n = len(buf)
+    hdr = 10 if key else 3
+    first = max(64, int(n * rng.uniform(0.15, 0.35)))
+    buf[0:3] = ((0 if key else 1) | (1 << 4) | (first << 5)).to_bytes(3, "little")
+    if key:
+        buf[3:10] = b"\x9d\x01\x2a" + width.to_bytes(2, "little") + height.to_bytes(2, "little")
+    e = _BoolEncoder()
+    if key:
+        e.put(0, 2)  # color space, clamping
+    e.put(0, 1)  # no segmentation
+    e.put(0, 1)
+    e.put(rng.randint(0, 63), 6)  # loop filter
+    e.put(rng.randint(0, 7), 3)
+    e.put(1, 1)
+    e.put(1 if key else 0, 1)
+    if key:
+        for v in (2, 0, -2, -2, 4, -2, 2, 4):
+            e.put(1, 1)
+            e.put(abs(v), 6)
+            e.put(1 if v < 0 else 0, 1)
+    e.put(parts_log2, 2)
+    head = e.done()
+    buf[hdr:hdr + len(head)] = head
+    parts = 1 << parts_log2
+    q = hdr + first
+    left = n - q - 3 * (parts - 1)
+    cuts = sorted(rng.sample(range(1, left), parts - 1)) if parts > 1 else []
+    lens = [y - x for x, y in zip([0] + cuts, cuts + [left])]
+    for i in range(parts - 1):
+        buf[q + 3 * i:q + 3 * i + 3] = lens[i].to_bytes(3, "little")
+
+
 def make_mkv(seed: int, clusters: int = 12, webm: bool = False) -> bytes:
     rng = _rng("mkv", seed)
+    # WebM video as browsers and phones write it: VP9 (or VP8) frames with
+    # real headers, written over the same noise so every card keeps its layout
+    side = _rng("mkv-vp", seed)
+    vp8 = webm and side.random() < 0.3
+    width, height = side.choice(((640, 360), (1280, 720), (1920, 1080)))
+    parts_log2 = side.choice((0, 2))
     doctype = b"webm" if webm else b"matroska"
     ebml = _el(0x1A45DFA3, _el(0x4286, b"\x01") + _el(0x4282, doctype) + _el(0x4287, b"\x04") + _el(0x4285, b"\x02"))
     info = _el(0x1549A966, _el(0x2AD7B1, struct.pack(">I", 1000000)) + _el(0x4D80, b"test"))
     avcc = bytes([1, 0x64, 0, 0x28, 0xFF, 0xE1]) + struct.pack(">H", 4) + b"\x67\x64\x00\x28" + b"\x01" \
         + struct.pack(">H", 4) + b"\x68\xee\x3c\x80"
-    track = _el(0xAE, _el(0xD7, b"\x01") + _el(0x83, b"\x01") + _el(0x86, b"V_VP9" if webm else b"V_MPEG4/ISO/AVC")
+    track = _el(0xAE, _el(0xD7, b"\x01") + _el(0x83, b"\x01") + _el(0x86, (b"V_VP8" if vp8 else b"V_VP9") if webm else b"V_MPEG4/ISO/AVC")
                 + (b"" if webm else _el(0x63A2, avcc)))
     tracks = _el(0x1654AE6B, track)
     body = [info, tracks]
@@ -275,7 +474,14 @@ def make_mkv(seed: int, clusters: int = 12, webm: bool = False) -> bytes:
         for f in range(25):
             size = rng.randint(30000, 90000) if f == 0 else rng.randint(1500, 9000)
             if webm:
-                frame = _noise(rng, size)
+                buf = bytearray(_noise(rng, size))
+                if vp8:
+                    _vp8_dress(buf, side, f == 0, width, height, parts_log2)
+                elif f % 8 == 7:
+                    _vp9_superframe(buf, side, width, height)
+                else:
+                    _vp9_dress(buf, side, f == 0, width, height)
+                frame = bytes(buf)
             else:  # H.264 in Matroska: NAL units with 4-byte lengths, slices of about 1-4 KB
                 parts, left = [], size
                 while left > 0:
