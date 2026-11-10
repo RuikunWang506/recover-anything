@@ -850,6 +850,21 @@ class Thumb:
                 return first, last
         return None
 
+    def reach(self, dec, m0: int, m1: int) -> int:
+        """How many blocks of MCUs m0..m1 the thumbnail shows (it doesn't reach
+        the picture's edges, nor a black bar where the shapes differ)."""
+        if self.expect is None:
+            self._build(dec)
+        exp = self.expect
+        n = 0
+        for m in range(max(0, m0), min(m1 + 1, dec.mcu)):
+            i0 = dec.block_index(m)
+            for v in range(dec.bv):
+                for hz in range(dec.bh):
+                    i = i0 + v * dec.bw + hz
+                    n += exp[i] == exp[i]
+        return n
+
     def worst(self, dec):
         """The largest window differences (for calibration): (mean, signed)."""
         u = sg = 0.0
