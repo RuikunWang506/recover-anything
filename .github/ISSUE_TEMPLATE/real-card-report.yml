@@ -1,0 +1,43 @@
+name: Real card report
+description: How recover-anything did on a real card, stick or disk. Good results help too.
+labels: ["real card"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying it on a real card. Please don't attach recovered files or an image of the card: they may hold your private photos. The triage output below holds no file names or contents, only the card's path, label and counts.
+  - type: textarea
+    id: triage
+    attributes:
+      label: Output of `recover-anything triage`
+      description: |
+        Mac: `sudo recover-anything triage /dev/rdiskN` (find N with `recover-anything devices`)
+        Linux: `sudo recover-anything triage /dev/sdX`
+        Windows, from an Administrator terminal: `recover-anything triage \\.\PhysicalDriveN`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened to the card
+      description: Deleted by mistake, formatted in the camera, new photos taken since, errors when reading it...
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Card and the device that wrote it
+      placeholder: SanDisk 64 GB SDXC, Canon EOS R6
+  - type: textarea
+    id: result
+    attributes:
+      label: What came back
+      description: The summary `recover-anything recover` printed at the end, and anything missing, broken or wrong.
+      render: text
+  - type: input
+    id: system
+    attributes:
+      label: Computer and version
+      description: Your system, and what `recover-anything --version` prints.
+      placeholder: macOS 15.4, recover-anything 0.1.0
