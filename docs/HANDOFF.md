@@ -146,7 +146,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 - [x] Clear the stuck `RACARD` and `RAINNER` disks (they were gone by 6 November). Until the test is fixed, running it on macOS 26 jams every disk-image operation on the Mac (`hdiutil`, `diskutil`, even app installs); deselect it locally.
 - [ ] After the restart, rerun `python -m pytest -q -rs tests/test_guard_real.py`.
   - If it fails on the detach every time, the nested FAT32 image hangs under FSKit. Consider an inner image with another filesystem (for example HFS+), still stored on the card.
-- [ ] Check whether CI's macOS job shows the same hang.
+- [x] Check whether CI's macOS job shows the same hang. It does, now and then (9 November 2026: "timeout for DiskArbitration expired" on the image stored on the card). The test now tries four times, waiting longer each time; a stuck image still fails it on a Mac you use, but on CI (thrown away after the run) it is only reported.
 
 ### 1. Test on a real card (before any launch)
 
@@ -173,17 +173,19 @@ Turn anything that goes wrong into an issue, and add a simulated scenario that r
 
 ### 2. Launch prep (needs your accounts)
 
-- [ ] Delete this file, or move it out of the repo, if you'd rather it not be public.
-- [ ] Make the repo public. Add a description, topics and a social preview.
+- [ ] Delete this file, or move it out of the repo, if you'd rather it not be public. (The repo is public now, and so is this file.)
+- [x] Make the repo public (9 November 2026).
+- [ ] Add a description, topics and a social preview.
   - Topics: `data-recovery`, `photo-recovery`, `sd-card`, `file-carving`, `forensics`, `claude-code`, `agent-skill`.
   - Social preview: `docs/before-after.jpg` works.
 - [ ] Publish to PyPI.
-  - Check that the name `recover-anything` is free.
-  - Set up PyPI Trusted Publishing for this repo.
-  - Add a release workflow (none exists yet) that builds and uploads on a `v*` tag, then tag `v0.1.0`.
-  - Switch the README quick start to `pipx install recover-anything`.
+  - [x] The name `recover-anything` is free (checked 11 November 2026).
+  - [x] Release workflow: `.github/workflows/release.yml` builds and uploads on a `v*` tag. It checks the tag matches the version in `pyproject.toml` and that the built wheel installs and runs. It stores no password or token: PyPI trusts the workflow itself.
+  - [ ] Tell PyPI to trust it: on pypi.org, under Your account, Publishing, add a pending publisher with owner `RuikunWang506`, repository `recover-anything`, workflow `release.yml`, environment `pypi`.
+  - [ ] Tag a commit whose tests passed and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
+  - [ ] Switch the README quick start to `pipx install recover-anything` (it installs from GitHub until then, which works now that the repo is public).
 - [ ] Add a short demo GIF of a recovery at the top of the README (for example with vhs or asciinema). This is the biggest lever for stars.
-- [ ] Add issue templates: "Real card report", which asks for `triage` output (it contains no file contents), and "Bug".
+- [x] Issue templates: "Real card report", which asks for `triage` output (it holds no file names or contents), and "Bug" (`.github/ISSUE_TEMPLATE/`).
 - [ ] Launch posts: Show HN, r/photography, r/datarecovery and r/ClaudeAI, plus awesome lists for Claude Code skills and forensics.
 
 ### 3. Roadmap

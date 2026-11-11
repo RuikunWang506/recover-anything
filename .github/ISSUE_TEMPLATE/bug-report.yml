@@ -1,0 +1,30 @@
+name: Bug
+description: Something broke, refused when it shouldn't have, or said something wrong.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: command
+    attributes:
+      label: What you ran
+      description: The full command.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: What it printed
+      description: The output, or the error. Leave out anything private, such as file names you'd rather not share.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+  - type: input
+    id: system
+    attributes:
+      label: Computer and version
+      description: Your system, and what `recover-anything --version` prints.
+      placeholder: Windows 11, recover-anything 0.1.0
