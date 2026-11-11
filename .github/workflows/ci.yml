@@ -30,3 +30,19 @@ jobs:
         run: cat "$GITHUB_WORKSPACE/guard-diag.txt" || echo "no details recorded"
       - name: selftest (quick)
         run: recover-anything selftest --quick
+
+  package:
+    # What a release would upload: it builds, and the wheel installs and runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build
+      - run: python -m build
+      - name: the wheel installs and runs
+        run: |
+          python -m pip install dist/*.whl
+          recover-anything --version
+          recover-anything --help
