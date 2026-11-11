@@ -31,6 +31,8 @@ QUICK_BYTES = 4096
 FULL_TRIALS = 16
 ACCEPT_SCORE = 2.5     # seam roughness / normal roughness that is always fine
 LONE_SCORE = 10.0      # a lone (or clearly best) clean candidate is accepted up to this
+UNSEEN_NOTE = ("rebuilt from %d pieces, but one of them lies at the edge of the picture, where its "
+               "thumbnail can't confirm it; check that it opens")
 GOOD_ENOUGH = 1.4
 
 
@@ -80,8 +82,11 @@ class _Assembler:
             c = n
 
     def run(self, start: int, expected_size: int | None = None):
-        """Returns (clusters, length, status, note)."""
+        """Returns (clusters, length, status, note). An "unverified" picture
+        is whole and matches its thumbnail, but for the piece starting at
+        clusters[self.unseen_at], which lies where the thumbnail can't show."""
         cs = self.cs
+        self.unseen_at = None
         try:
             h = jpeg.parse_header(self.src.read, self.g.offset(start))
         except jpeg.JpegError:
@@ -122,6 +127,9 @@ class _Assembler:
             if st == "done":
                 bad = self._unlike_thumb(thumb, dec, path)
                 if bad is None:
+                    self.unseen_at = self._unseen_piece(thumb, dec, path, states)
+                    if self.unseen_at is not None:
+                        return path, dec.end, "unverified", UNSEEN_NOTE % self._pieces(path)
                     return path, dec.end, "ok", "%d pieces" % self._pieces(path)
                 # Every block decodes, but an area of the picture isn't what its
                 # own thumbnail shows: a piece of another photo got in, somewhere
@@ -157,6 +165,26 @@ class _Assembler:
         dec.restore(states[good])
         end = dec.pos
         return path[:good + 1], end, "partial", "only the top part of the picture could be recovered"
+
+    def _unseen_piece(self, thumb, dec, path, states):
+        """The first piece the search placed (after a jump) that covers none of
+        the picture its thumbnail shows, or None: at the picture's edges, which
+        the thumbnail doesn't reach, nothing but the decoder checks a piece, and
+        another photo's data decodes there as well as its own."""
+        if thumb is None:
+            return None
+        for j in range(1, len(path)):
+            if path[j] == path[j - 1] + 1:
+                continue
+            end = j
+            while end + 1 < len(path) and path[end + 1] == path[end] + 1:
+                end += 1
+            if j - 1 not in states:
+                return j  # (where it begins can't be told: don't vouch for it)
+            m1 = states[end][5] if end in states else dec.mcu
+            if not thumb.reach(dec, states[j - 1][5], m1):
+                return j
+        return None
 
     def _unlike_thumb(self, thumb, dec, path):
         """The MCUs of the first area where a rebuilt picture doesn't match its
@@ -477,6 +505,10 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
         for r in broken:
             for c in heads[id(r)][1:]:
                 claimed[c] = id(r)
+        # A photo finished but for a piece at its edge (see _unseen_piece): the
+        # clusters before that piece matched its thumbnail, so they are its own.
+        # They are taken out of the other photos' way, and kept for it.
+        trusted: dict[int, int] = {}  # cluster -> whose
         asm = _Assembler(src, g, blocked)
         todo = sorted(broken, key=lambda r: r.start)
         done = [0]
@@ -494,19 +526,38 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
                 progress_made = False
                 for r in list(todo):
                     head = heads[id(r)]
+                    kept = [c for c, who in trusted.items() if who == id(r)]
                     for c in head:
                         if c == head[0] or not owned[c]:
                             blocked[c] = 0  # its own first piece, minus what other photos have since proved theirs
+                    for c in kept:
+                        blocked[c] = 0
                     try:
                         out = asm.run(head[0], r.expected_size)
                     except Exception:
                         out = None  # never let one file stop the run
                     for c in head:
                         blocked[c] = 1 if owned[c] or (strict and c in claimed) else 0
+                    for c in kept:
+                        blocked[c] = 1
                     if out is None:
                         continue
                     clusters, length, status, note = out
-                    if status == "ok" or (status == "partial" and r.status == "partial" and length > r.size):
+                    if status == "unverified" and asm.unseen_at is not None:
+                        for c in clusters[:asm.unseen_at]:
+                            if not owned[c]:
+                                owned[c] = blocked[c] = 1
+                                trusted[c] = id(r)
+                        for c in clusters[asm.unseen_at:]:
+                            if not owned[c]:
+                                claimed.setdefault(c, id(r))  # (likely its own too: kept from others half the time)
+                    if status == "ok":
+                        for c in kept:
+                            del trusted[c]
+                            if c not in clusters:
+                                owned[c] = blocked[c] = 0  # (it was proven with other pieces after all)
+                    if status == "ok" or (status == "unverified" and r.status in ("partial", "corrupt")) or \
+                            (status == "partial" and r.status == "partial" and length > r.size):
                         r.extents = _extents(g, clusters, length)
                         r.status = status
                         r.note = note
