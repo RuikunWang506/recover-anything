@@ -11,8 +11,7 @@ Status on 5 November 2026. This picks up where the cloud build session left off.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
 - **Not done yet:**
   - It has never been run on a physical card.
-  - It isn't on PyPI.
-  - The repo is still private, so the README's `pipx install git+https://…` line only works for you.
+  - It isn't on PyPI yet. The repo is public (since 9 November 2026), the release workflow is ready, and the first release waits on PyPI trusting it and the `v0.1.0` tag (Launch prep, below).
 
 ## Pick it up on your computer
 
@@ -183,7 +182,7 @@ Turn anything that goes wrong into an issue, and add a simulated scenario that r
   - [x] Release workflow: `.github/workflows/release.yml` builds and uploads on a `v*` tag. It checks the tag matches the version in `pyproject.toml` and that the built wheel installs and runs. It stores no password or token: PyPI trusts the workflow itself.
   - [ ] Tell PyPI to trust it: on pypi.org, under Your account, Publishing, add a pending publisher with owner `RuikunWang506`, repository `recover-anything`, workflow `release.yml`, environment `pypi`.
   - [ ] Tag a commit whose tests passed and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
-  - [ ] Switch the README quick start to `pipx install recover-anything` (it installs from GitHub until then, which works now that the repo is public).
+  - [x] Switch the README quick start, and the skill's install line, to `pipx install recover-anything` (done just before the first tag, so the PyPI page shows it).
 - [ ] Add a short demo GIF of a recovery at the top of the README (for example with vhs or asciinema). This is the biggest lever for stars.
 - [x] Issue templates: "Real card report", which asks for `triage` output (it holds no file names or contents), and "Bug" (`.github/ISSUE_TEMPLATE/`).
 - [ ] Launch posts: Show HN, r/photography, r/datarecovery and r/ClaudeAI, plus awesome lists for Claude Code skills and forensics.
