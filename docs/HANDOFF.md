@@ -135,17 +135,13 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 
 ## Next steps
 
-### 0. Open item: macOS disk-image test leaves disks attached (found 5 November 2026)
+### 0. Closed: macOS disk-image test left disks attached (found 5 November, fixed 12 November 2026)
 
-- On a Mac running macOS 26, `test_mac_card_image_and_an_image_stored_on_it` left both test disks (`RACARD` and `RAINNER`) attached.
-  - `hdiutil detach -force` fails with "timeout for DiskArbitration expired".
-  - The FAT32 driver process (`com.apple.fskit.msdos`) for the inner image is frozen. That image file sits on the outer disk, so neither can detach.
-  - The old test ignored the detach result, so it still passed.
-- **Fixed in the test:** `_detach()` in `tests/test_guard_real.py` now retries once, then fails with a message naming every disk still attached. Two stubbed tests cover it.
-- [x] Clear the stuck `RACARD` and `RAINNER` disks (they were gone by 6 November). Until the test is fixed, running it on macOS 26 jams every disk-image operation on the Mac (`hdiutil`, `diskutil`, even app installs); deselect it locally.
-- [ ] After the restart, rerun `python -m pytest -q -rs tests/test_guard_real.py`.
-  - If it fails on the detach every time, the nested FAT32 image hangs under FSKit. Consider an inner image with another filesystem (for example HFS+), still stored on the card.
-- [x] Check whether CI's macOS job shows the same hang. It does, now and then (9 November 2026: "timeout for DiskArbitration expired" on the image stored on the card). The test now tries four times, waiting longer each time; a stuck image still fails it on a Mac you use, but on CI (thrown away after the run) it is only reported.
+- **What happened:** on macOS 26, `test_mac_card_image_and_an_image_stored_on_it` left both test disks (`RACARD` and `RAINNER`) attached, and after that every disk-image operation on the Mac hung (`hdiutil`, `diskutil`, even app installs) until the leftover processes were stopped.
+- **Why:** since macOS 15.4, FAT and exFAT volumes are served by FSKit, outside the kernel. The test stored a FAT image on the FAT card, so one FSKit volume sat on another, and the inner one's driver (`com.apple.fskit.msdos`) froze at the unmount. CI's macOS job hit the same hang now and then.
+- **Fix:** the image stored on the card is now HFS+, which the kernel serves itself. The card stays FAT32, as real cards are. The save guard's checks are the same: the card volume and the image stored on it are both refused. A stubbed test keeps the inner image from going back to a FAT filesystem.
+- **Checked on macOS 26.6:** five runs in a row detached both disks (the old test jammed on every run), and the full suite runs without skipping the test.
+- If it ever happens again: `hdiutil info` hangs, and `ps -Ao pid,stat,lstart,command | grep -E 'diskimages-helper|fskit.msdos'` shows the leftovers. Stop only those started by the test, then `hdiutil detach -force` the test's disk. `_detach()` still fails loudly on a Mac you use when a disk stays attached.
 
 ### 1. Test on a real card (before any launch)
 

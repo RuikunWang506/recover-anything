@@ -25,6 +25,17 @@ def _diag(*parts):
 
 
 # -------------------------------------------------------------------- macOS
+# The card is FAT32, as real cards are. Since macOS 15.4 FAT and exFAT volumes
+# are served by FSKit, outside the kernel. A second FSKit volume whose image
+# file sits on the first never lets go: its driver freezes at the unmount, both
+# disks stay attached, and every hdiutil and diskutil call on the Mac hangs
+# until those processes are stopped. So the image stored on the card must hold
+# a filesystem the kernel serves itself.
+CARD_FS = "MS-DOS FAT32"
+INNER_FS = "HFS+"
+FSKIT_FILESYSTEMS = ("MS-DOS", "FAT", "ExFAT")
+
+
 def _attach(dmg):
     r = _run("hdiutil", "attach", "-nobrowse", "-plist", str(dmg))
     assert r.returncode == 0, r.stderr
@@ -70,7 +81,7 @@ def _stuck_message(stuck):
 @pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("hdiutil"), reason="macOS only")
 def test_mac_card_image_and_an_image_stored_on_it(tmp_path):
     dmg = tmp_path / "card.dmg"
-    r = _run("hdiutil", "create", "-size", "64m", "-fs", "MS-DOS FAT32", "-volname", "RACARD", "-layout", "MBRSPUD",
+    r = _run("hdiutil", "create", "-size", "64m", "-fs", CARD_FS, "-volname", "RACARD", "-layout", "MBRSPUD",
              str(dmg))
     assert r.returncode == 0, r.stderr
     whole, mnt = _attach(dmg)
@@ -87,7 +98,7 @@ def test_mac_card_image_and_an_image_stored_on_it(tmp_path):
         assert ok, why
         # a disk image stored on the card, attached, used as the output
         inner = os.path.join(mnt, "inner.dmg")
-        r = _run("hdiutil", "create", "-size", "8m", "-fs", "MS-DOS", "-volname", "RAINNER", inner)
+        r = _run("hdiutil", "create", "-size", "16m", "-fs", INNER_FS, "-volname", "RAINNER", inner)
         assert r.returncode == 0, r.stderr
         iwhole, imnt = _attach(inner)
         attached.insert(0, iwhole)
@@ -104,6 +115,12 @@ def test_mac_card_image_and_an_image_stored_on_it(tmp_path):
     # there it is only reported (the save guard's checks above still count).
     if stuck and not os.environ.get("CI"):
         pytest.fail(_stuck_message(stuck))
+
+
+def test_the_image_stored_on_the_card_is_not_a_second_fskit_volume():
+    """A FAT image on the FAT card jammed every disk-image operation on the Mac."""
+    assert any(name.lower() in CARD_FS.lower() for name in FSKIT_FILESYSTEMS)      # the card stays FAT
+    assert not any(name.lower() in INNER_FS.lower() for name in FSKIT_FILESYSTEMS)
 
 
 class _Done:
