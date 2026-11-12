@@ -11,8 +11,8 @@ everything that can be got back, and never make it worse.
 
 The `recover-anything` command does the dangerous parts safely. It only ever opens
 the source read-only. If it's not installed:
-`pipx install git+https://github.com/RuikunWang506/recover-anything` (Python 3.9+, no
-other dependencies; `pip install` works too).
+`pipx install recover-anything` (Python 3.9+, no other dependencies;
+`pip install recover-anything` works too).
 
 ## The rules (never break these)
 
