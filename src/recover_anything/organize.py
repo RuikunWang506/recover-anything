@@ -86,6 +86,15 @@ def _write_one(reader, r, folder, name, seen):
     return dest, digest
 
 
+def _original_folder(r):
+    """Where the file was before it went to the card's trash, when the trash
+    recorded it; otherwise the folder it was found in."""
+    if r.meta.get("original_path"):
+        from .trash import split
+        return split(r.meta["original_path"])[0]
+    return r.path
+
+
 def plan_size(found) -> int:
     return sum(r.size for r in found if r.status in ("ok", "partial", "unverified", "corrupt"))
 
@@ -172,7 +181,8 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True, creat
                 "status": r.status,
                 "how": r.origin,
                 "original_name": r.name,
-                "original_folder": r.path,
+                "original_folder": _original_folder(r),
+                "trash_folder": r.path if r.meta.get("in_trash") else None,
                 "type": r.kind,
                 "bytes": r.size,
                 "sha256": r.meta.get("sha256"),

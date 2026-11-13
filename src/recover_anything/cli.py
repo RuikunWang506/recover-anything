@@ -243,6 +243,7 @@ def cmd_recover(a):
                           "files": len(w["written"]), "failed_to_save": len(w.get("failed", [])),
                           "seconds": round(res.seconds, 1), "image": res.image,
                           "visible_files_not_copied": getattr(res, "live_count", 0) if not a.include_live else 0,
+                          "from_card_trash": getattr(res, "trash_count", 0),
                           "warnings": res.warnings}, indent=1))
     else:
         print()

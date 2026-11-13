@@ -351,3 +351,57 @@ def single_kind(workdir: str, kind: str, seed: int, cluster_size: int = 4096, si
     sc.groups["fragmented"] = frag
     sc.groups["ever written"] = ever
     return sc
+
+
+def _win_trash_record(original: str, size: int, version: int = 2) -> bytes:
+    """A Windows Recycle Bin $I record: version, size, deletion time, path."""
+    import struct
+    when = 133650000000000000                    # a FILETIME in 2024
+    path = original.encode("utf-16-le") + b"\x00\x00"
+    if version == 1:
+        return struct.pack("<QQQ", 1, size, when) + path.ljust(520, b"\x00")
+    return struct.pack("<QQQI", 2, size, when, len(path) // 2) + path
+
+
+def trashed(workdir: str, fs: str = "FAT32", n: int = 24, size: int = 512 * 1024**2,
+            cluster_size: int = 4096) -> Scenario:
+    """Photos deleted from the card on a computer: moved (not copied) into the
+    trash folder on the card itself, the way macOS, Linux and Windows do it,
+    then some of each trash emptied. Every one of them should come back, under
+    its original name; the photos still in DCIM are not the user's loss."""
+    img = os.path.join(workdir, "trashed-%s.img" % fs.lower())
+    folder = "DCIM/100CANON"
+    sid = "$RECYCLE.BIN/S-1-5-21-3623811015-3361044348-30300820-1001"
+    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+        shots = _shoot(card, 1, n, folder=folder)
+        names = [nm for nm, _ in shots]
+
+        def move(name, to):
+            card.move("%s/%s" % (folder, name), to)
+        # macOS (Finder): /.Trashes/501/, same name
+        for name in names[0:5]:
+            move(name, ".Trashes/501/" + name)
+        card.write_file(".Trashes/501/.DS_Store", b"\x00\x00\x00\x01Bud1" + bytes(500), _when(1))
+        # Linux file manager: /.Trash-1000/files/ + info/NAME.trashinfo; one renamed on a clash
+        for k, name in enumerate(names[5:10]):
+            tname = name.replace(".JPG", ".2.JPG") if k == 4 else name
+            move(name, ".Trash-1000/files/" + tname)
+            card.write_file(".Trash-1000/info/%s.trashinfo" % tname,
+                            ("[Trash Info]\nPath=/media/me/CARD/%s/%s\nDeletionDate=2026-07-06T10:00:00\n"
+                             % (folder, name)).encode(), _when(1))
+        # Windows: $RECYCLE.BIN/<SID>/$R<id>.JPG + $I<id>.JPG with the original path
+        for k, name in enumerate(names[10:15]):
+            ident = "%06X" % (0xA1B2C0 + k)
+            data = dict(shots)[name]
+            move(name, "%s/$R%s.JPG" % (sid, ident))
+            card.write_file("%s/$I%s.JPG" % (sid, ident),
+                            _win_trash_record("E:\\DCIM\\100CANON\\" + name, len(data), version=1 if k == 0 else 2),
+                            _when(1))
+        # then each trash is partly emptied: those are ordinary deleted files now
+        card.delete(".Trashes/501/" + names[0])
+        card.delete(".Trash-1000/files/" + names[5])
+        card.delete(".Trash-1000/info/%s.trashinfo" % names[5])
+        card.delete("%s/$R%06X.JPG" % (sid, 0xA1B2C0 + 1))
+        card.delete("%s/$I%06X.JPG" % (sid, 0xA1B2C0 + 1))
+    truth = {_sha(d): nm for nm, d in shots[:15]}
+    return Scenario("trashed", "Deleted on a computer (moved to the trash on the card)", img, truth, fs=fs)

@@ -349,6 +349,27 @@ class Fat32Card:
         self._write_dir(d)
         self._write_fsinfo()
 
+    def move(self, path: str, new_path: str) -> None:
+        """Move or rename like an OS: the old entry is marked 0xE5, a new one in
+        the new folder points at the same clusters, and the data stays put
+        (what moving a file to the trash on the card does)."""
+        path, new_path = path.strip("/"), new_path.strip("/")
+        parent_path, _, name = path.rpartition("/")
+        d = self.dirs[parent_path] if parent_path else self.root
+        first, short = d.children.pop(name.lower())
+        e = bytes(d.entries[short])
+        start = (struct.unpack_from("<H", e, 20)[0] << 16) | struct.unpack_from("<H", e, 26)[0]
+        size = struct.unpack_from("<I", e, 28)[0]
+        for i in range(first, short + 1):
+            d.entries[i][0] = 0xE5
+        new_parent, _, new_name = new_path.rpartition("/")
+        d2 = self.mkdir(new_parent) if new_parent else self.root
+        self._add_entry(d2, new_name, e[11], start, size, _dt.datetime(2026, 1, 1))
+        d2.entries[-1][13:20] = e[13:20]   # keep the file's own times
+        d2.entries[-1][22:26] = e[22:26]
+        self._write_dir(d)
+        self._write_dir(d2)
+
     def allocated_clusters(self) -> set:
         return {c for c in range(2, len(self.fat)) if self.fat[c] != 0}
 

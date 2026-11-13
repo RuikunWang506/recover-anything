@@ -59,7 +59,8 @@ def triage(path: str) -> dict:
         info["size"] = src.size
         vols = find_volumes(src)
         info["volumes"] = []
-        live = deleted = 0
+        live = deleted = trashed = 0
+        from . import trash
         for v in vols:
             entry = {"offset": v.offset, "size": v.size, "filesystem": v.fs, "label": v.label, "note": v.note}
             fsr = None
@@ -72,6 +73,10 @@ def triage(path: str) -> dict:
                     for r in fsr.walk():
                         if r.deleted:
                             deleted += 1
+                        elif trash.bookkeeping(r.path, r.name):
+                            continue
+                        elif trash.kind(r.path, r.name):
+                            trashed += 1
                         else:
                             live += 1
                 except Exception:
@@ -84,6 +89,7 @@ def triage(path: str) -> dict:
             info["volumes"].append(entry)
         info["visible_files"] = live
         info["deleted_entries"] = deleted
+        info["in_card_trash"] = trashed
         present = max((v["data_present"] for v in info["volumes"]), default=0.0)
         info["data_present"] = present
         fss = {v["filesystem"] for v in info["volumes"]}
@@ -128,6 +134,16 @@ def triage(path: str) -> dict:
             "About %d%% of the space I sampled still holds data. Some files may still be recoverable." % pct)
         if deleted:
             info["summary"] += " The folder structure still lists %d deleted file(s) by name." % deleted
+    n = info.get("in_card_trash")
+    if n and info.get("verdict") == "recoverable":
+        info["summary"] += (" %d file(s) deleted on a computer are still whole in the card's hidden trash folder; "
+                            "'recover' copies them back." % n)
+    elif n and info.get("verdict") == "empty":
+        info["odds"] = "good"
+        info["verdict"] = "in-card-trash"
+        info["summary"] = ("%d file(s) deleted on a computer are still whole in the card's hidden trash folder; "
+                           "'recover' copies them back. The rest of the card looks blank, so other deleted files "
+                           "may be gone." % n)
     return info
 
 
@@ -143,6 +159,8 @@ def format_triage(t: dict) -> str:
             int(v.get("data_present", 0) * 100), (" - " + v["note"]) if v.get("note") else ""))
     if "visible_files" in t:
         lines.append("  %d visible files, %d deleted entries still listed" % (t["visible_files"], t["deleted_entries"]))
+        if t.get("in_card_trash"):
+            lines.append("  %d files in the card's trash folder (deleted on a computer, still whole)" % t["in_card_trash"])
     lines.append("")
     lines.append("Chances: %s" % t.get("odds", "unknown").upper())
     lines.append(t.get("summary", ""))
