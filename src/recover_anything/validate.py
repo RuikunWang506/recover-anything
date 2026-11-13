@@ -170,7 +170,7 @@ def layout_known(rec: Found) -> bool:
     and the filesystem still lists where it is. A deleted file's clusters can
     be reused and freed again without a trace, so for a file type without
     checksums nothing else can prove its contents."""
-    return bool(rec.meta.get("live")) and rec.meta.get("chain") in ("fat", "contiguous")
+    return bool(rec.meta.get("live")) and rec.meta.get("chain") in ("fat", "contiguous", "runlist")
 
 
 def _grid(rec: Found):

@@ -502,3 +502,73 @@ def unopenable(workdir: str, fs: str = "FAT32", damage: str = "boot", n: int = 1
             f.write(bytes(512))
     truth = {_sha(d): name for name, d in shots}
     return Scenario("unopenable-" + damage, "Card that needs formatting (%s damaged)" % damage, img, truth, fs=fs)
+
+
+def ntfs_drive(workdir: str, cluster_size: int = 4096, size: int = 64 * 1024**2) -> Scenario:
+    """An external NTFS drive used on Windows: photos and documents in
+    folders, some deleted for good (Shift+Delete), some sent to the Recycle
+    Bin and the bin then partly emptied, one deleted photo stored in two
+    pieces, one whose middle a new file later overwrote, and one whose record
+    and space a new file took over. The MFT is in three pieces.
+    truth: what must come back byte for byte; groups["folders"]: sha -> folder;
+    groups["partial"]: the overwritten photo, which must never count as recovered."""
+    from .ntfs import NtfsCard
+    img = os.path.join(workdir, "ntfs-%d.img" % cluster_size)
+    bin_ = "$RECYCLE.BIN/S-1-5-21-3623811015-3361044348-30300820-1001"
+    truth, folders = {}, {}
+
+    def keep(path, data):
+        folder, _, name = path.rpartition("/")
+        truth[_sha(data)] = name
+        folders[_sha(data)] = folder
+
+    with NtfsCard(img, size=size, cluster_size=cluster_size, mft_pieces=3) as v:
+        photos = {}
+        for i in range(1, 11):
+            folder = "Photos/2026 Lisbon" if i <= 5 else "Photos/Family"
+            path = "%s/IMG_%04d.JPG" % (folder, i)
+            data = make_photo(i, taken=_when(i), style=PHOTO_STYLE)
+            v.write_file(path, data, _when(i))
+            photos[i] = (path, data)
+        notes = ("Chapter 3: results\n" * 3000).encode()
+        v.write_file("Documents/Thesis/chapter3 notes.txt", notes, _when(12))
+        v.write_file("Documents/Thesis/outline.txt", b"1. intro\n2. methods\n", _when(12))   # small: kept in its record
+        v.write_file("Documents/scratch.tmp", b"y" * 40000, _when(13))
+        # a hole that the next photo fills before continuing elsewhere: two pieces
+        v.delete("Documents/scratch.tmp")
+        frag = make_photo(11, taken=_when(11), style=PHOTO_STYLE)
+        v.write_file("Photos/Family/IMG_0011.JPG", frag, _when(11))
+        # photo 10: deleted, then a new file takes its record and its space. NTFS hands a
+        # new file the lowest free record, so everything that creates records comes
+        # before the deletions below, or their names would be taken over too.
+        v.delete(photos[10][0])
+        v.write_file("Photos/Family/new video.part", bytes(len(photos[10][1])), _when(20))
+        # the Recycle Bin: the same record, renamed, plus a $I record
+        for k, i in enumerate((3, 7, 8)):
+            ident = "%06X" % (0xC0FFE0 + k)
+            path, data = photos[i]
+            v.move(path, "%s/$R%s.JPG" % (bin_, ident))
+            v.write_file("%s/$I%s.JPG" % (bin_, ident),
+                         _win_trash_record("E:\\" + path.replace("/", "\\"), len(data)), _when(14))
+            keep(path, data)
+        # the bin partly emptied: those records are deleted, still readable
+        v.delete("%s/$R%06X.JPG" % (bin_, 0xC0FFE0))
+        v.delete("%s/$I%06X.JPG" % (bin_, 0xC0FFE0))
+        # Shift+Delete
+        for i in (1, 2, 6):
+            v.delete(photos[i][0])
+            keep(*photos[i])
+        v.delete("Photos/Family/IMG_0011.JPG")
+        keep("Photos/Family/IMG_0011.JPG", frag)
+        v.delete("Documents/Thesis/chapter3 notes.txt")
+        keep("Documents/Thesis/chapter3 notes.txt", notes)
+        # photo 9: deleted, then a new file's data lands in its middle (no new record)
+        v.delete(photos[9][0])
+        runs = next(r["runs"] for r in v.records.values() if r.get("name") == "IMG_0009.JPG")
+        lcn, n = runs[0]
+        v._take(lcn + n // 2, 6)
+        v.f.seek(v.cluster_offset(lcn + n // 2))
+        v.f.write(bytes(range(256)) * (6 * cluster_size // 256))
+    sc = Scenario("ntfs", "External NTFS drive", img, truth, fs="NTFS")
+    sc.groups = {"folders": folders, "partial": {_sha(photos[9][1])}, "gone": {_sha(photos[10][1])}}
+    return sc

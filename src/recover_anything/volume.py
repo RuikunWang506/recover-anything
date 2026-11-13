@@ -167,6 +167,9 @@ def open_filesystem(src, vol: Volume):
         if vol.from_backup:
             return exfatfs.ExfatVolume(_Patched(src, vol.offset, 12), vol.offset)
         return exfatfs.ExfatVolume(src, vol.offset)
+    if vol.fs == "NTFS":
+        from .fs.ntfs import NtfsVolume
+        return NtfsVolume(src, vol.offset)
     _ = SubSource
     return None
 
