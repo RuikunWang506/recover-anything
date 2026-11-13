@@ -130,7 +130,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
    - macOS outputs when `diskutil` doesn't answer.
    - FUSE folders that don't name where they store files.
    - ZFS without `zpool` available.
-9. **No names on NTFS, APFS or ext4.** Their files are carved without names.
+9. **No names on APFS or ext4.** Their files are carved without names. NTFS names and folders come back from the MFT (`fs/ntfs.py`); tested on a simulated NTFS volume only, not yet on one made by Windows.
 10. **The reviewers' reproducer scripts lived in the cloud session and aren't in the repo.** Their cases are covered by the tests in the table above.
 
 ## Next steps
@@ -191,7 +191,6 @@ Turn anything that goes wrong into an issue, and add a simulated scenario that r
 - Faster checking, for example an optional native JPEG decoder used only when installed, keeping zero required dependencies.
 - Better photo rebuilding (see limitation 3).
 - RAW reassembly, and reassembly for videos whose index is gone.
-- NTFS undelete with names.
 - Phone backups and chat apps; an MCP server; a small desktop app.
 
 ## Debugging recipes

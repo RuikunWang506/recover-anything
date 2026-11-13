@@ -130,8 +130,8 @@ Everything has `--json` for agents and scripts.
 
 ## What's supported
 
-- **Filesystems with names and folders:** FAT12, FAT16, FAT32, exFAT (SD, SDHC and SDXC cards, USB sticks, most cameras and drones).
-- **Anything else** (NTFS, HFS+, ext4, a wiped or unknown card, a card reformatted with different settings): carving still finds the files, without names. A damaged FAT32 or exFAT boot sector is read from its backup copy, and an image cut short by read errors is used as far as it goes. When the computer can't open a card at all ("this card needs to be formatted"), every file still listed on it is copied, not just the deleted ones.
+- **Filesystems with names and folders:** FAT12, FAT16, FAT32, exFAT (SD, SDHC and SDXC cards, USB sticks, most cameras and drones), and NTFS (external drives, big USB sticks, Windows data drives). On NTFS a deleted file keeps a record of where all its pieces are, so it comes back whole, named and in its folder, even when it was stored in pieces, as long as no new file has taken over that record or its space.
+- **Anything else** (HFS+, ext4, a wiped or unknown card, a card reformatted with different settings): carving still finds the files, without names. A damaged FAT32 or exFAT boot sector is read from its backup copy, and an image cut short by read errors is used as far as it goes. When the computer can't open a card at all ("this card needs to be formatted"), every file still listed on it is copied, not just the deleted ones.
 - **File types:**
   - Photos: JPEG, HEIC/HEIF, AVIF, PNG, GIF, WebP, BMP, Photoshop (PSD/PSB), RAW (CR2, CR3, NEF, ARW, DNG, ORF, RW2, PEF).
   - Videos: MP4, MOV, M4V, 3GP, AVI, MKV, WebM, dashcam and camcorder clips (TS, MTS/M2TS, MPG/VOB/MOD).
@@ -149,13 +149,12 @@ Everything has `--json` for agents and scripts.
 - Progressive JPEGs (rare from cameras) are recovered when stored in one piece, but not reassembled.
 - Fragment reassembly needs the card's current filesystem layout; files left over from an earlier format with different settings are recovered when they're in one piece.
 - Some files can't be checked by their contents: a RAW's sensor data, WAV, AMR and M4A audio, BMP pictures, old Office files (`.doc`, `.xls`), camcorder MPEG (`.MOD`, `.MPG`), and video in a codec the checks don't read (they read H.264, HEVC and Motion-JPEG, plus VP8, VP9 and AV1 in MKV and WebM). A deleted one is saved and labeled rather than called recovered.
-- NTFS/APFS/ext4 file names aren't recovered yet (their files are still carved).
+- APFS and ext4 file names aren't recovered yet (their files are still carved). On NTFS, a new file soon takes over a deleted file's record, name and all: the sooner you stop using the drive, the more names survive. Files Windows compressed or encrypted aren't read.
 - It's pure Python. Full block-by-block checking runs at roughly 1.5 MB/s per CPU core, spread across your cores. Above 8 GB of photos it checks structure plus a random sample by default, and goes full depth if the sample finds anything. `--deep` forces a full check; `--fast` skips it.
 
 ## Roadmap
 
 - RAW reassembly; reassembly for videos without a surviving index
-- NTFS undelete with names
 - Phone backups (iPhone/Android) and chat apps
 - An MCP server, and a small desktop app for people who will never open a terminal
 

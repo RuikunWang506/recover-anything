@@ -497,7 +497,7 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
     prog("Searching every sector for photos, videos and documents")
     claimed = carver.Claimed()
     for r in all_found:
-        if r.meta.get("live") and r.meta.get("chain") in ("fat", "contiguous"):
+        if r.meta.get("live") and r.meta.get("chain") in ("fat", "contiguous", "runlist"):
             for o, n in r.extents:
                 claimed.add(o, o + n)
     known = {r.start for r in all_found if r.status != "lost" and r.extents}

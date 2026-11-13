@@ -474,7 +474,7 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
                 blocked[c0:c1 + 1] = b"\x01" * (c1 - c0 + 1)
 
         for r in mine:
-            if r.status == "ok" or (r.meta.get("live") and r.meta.get("chain") == "fat"):
+            if r.status == "ok" or (r.meta.get("live") and r.meta.get("chain") in ("fat", "runlist")):
                 own(r)
         for off, _kind in getattr(vr, "headers", []):
             if off < g.data_offset or (off - g.data_offset) % cs:
