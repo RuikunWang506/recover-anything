@@ -1,15 +1,15 @@
 # Handoff: Recover Anything
 
-Status on 5 November 2026. This picks up where the cloud build session left off. The project rules and the code map are in `CLAUDE.md`, so they aren't repeated here.
+Status on 13 November 2026. It began as the handoff from the cloud build session. The project rules and the code map are in `CLAUDE.md`, so they aren't repeated here.
 
 ## Where things stand
 
-- **Repo:** github.com/RuikunWang506/recover-anything, branch `main`, **private**.
-- **Size:** about 8,000 lines of Python in `src/` and 79 tests.
-- **CI:** green on all four jobs (Ubuntu with Python 3.9, Ubuntu, macOS and Windows with 3.13).
+- **Repo:** github.com/RuikunWang506/recover-anything, branch `main`, public since 9 November 2026. Changes reach `main` through pull requests, which need all five CI jobs to pass.
+- **Size:** about 14,300 lines of Python in `src/` and 192 tests.
+- **CI:** green on all five jobs: the tests on Ubuntu with Python 3.9 and on Ubuntu, macOS and Windows with 3.13, plus a job that builds the package and runs the installed wheel.
 - **Self-test:** every file recovered byte for byte on all 7 simulated cards: FAT32 and exFAT; deleted, formatted, formatted then reused, and heavily fragmented.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
-- **Released:** version 0.1.0 is on PyPI (12 November 2026), so `pipx install recover-anything` works. The repo is public (since 9 November 2026).
+- **Released:** version 0.1.0 is on PyPI (12 November 2026), so `pipx install recover-anything` works. Its release page on GitHub went up on 13 November.
 - **Not done yet:**
   - It has never been run on a physical card.
 
@@ -170,27 +170,28 @@ Turn anything that goes wrong into an issue, and add a simulated scenario that r
 
 - [ ] Delete this file, or move it out of the repo, if you'd rather it not be public. (The repo is public now, and so is this file.)
 - [x] Make the repo public (9 November 2026).
-- [ ] Add a description, topics and a social preview.
-  - Topics: `data-recovery`, `photo-recovery`, `sd-card`, `file-carving`, `forensics`, `claude-code`, `agent-skill`.
-  - Social preview: `docs/before-after.jpg` works.
+- [x] Add a description, a homepage link (the PyPI page) and topics (13 November 2026).
+  - Topics: `data-recovery`, `photo-recovery`, `file-recovery`, `undelete`, `sd-card`, `file-carving`, `forensics`, `digital-forensics`, `fat32`, `exfat`, `python`, `cli`, `claude-code`, `agent-skill`.
+- [ ] Add a social preview: on GitHub, under the repo's Settings, General, Social preview. `docs/before-after.jpg` works. It can only be uploaded on the website.
 - [x] Publish to PyPI: version 0.1.0 went up on 12 November 2026.
   - [x] The name `recover-anything` is free (checked 11 November 2026).
   - [x] Release workflow: `.github/workflows/release.yml` builds and uploads on a `v*` tag. It checks the tag matches the version in `pyproject.toml` and that the built wheel installs and runs. It stores no password or token: PyPI trusts the workflow itself.
   - [x] Tell PyPI to trust it: on pypi.org, under Your account, Publishing, a publisher with owner `RuikunWang506`, repository `recover-anything`, workflow `release.yml`, environment `pypi`.
   - [x] Tag a commit whose tests passed and push the tag: `v0.1.0` is on the merge of pull request 4.
   - [x] Switch the README quick start, and the skill's install line, to `pipx install recover-anything` (done just before the first tag, so the PyPI page shows it).
-  - For the next release: raise `version` in `pyproject.toml`, merge that, then tag the merged commit `vX.Y.Z` and push the tag. PyPI never takes the same version twice.
+  - [x] Release page on GitHub for `v0.1.0`, with notes (13 November 2026).
+  - For the next release: raise `version` in `pyproject.toml`, merge that, then tag the merged commit `vX.Y.Z` and push the tag. PyPI never takes the same version twice. Then add a release page with `gh release create vX.Y.Z --verify-tag`.
 - [ ] Add a short demo GIF of a recovery at the top of the README (for example with vhs or asciinema). This is the biggest lever for stars.
 - [x] Issue templates: "Real card report", which asks for `triage` output (it holds no file names or contents), and "Bug" (`.github/ISSUE_TEMPLATE/`).
-- [ ] Launch posts: Show HN, r/photography, r/datarecovery and r/ClaudeAI, plus awesome lists for Claude Code skills and forensics.
+- [ ] Launch posts: Show HN, r/photography, r/datarecovery and r/ClaudeAI, plus awesome lists for Claude Code skills and forensics. Drafts exist outside the repo; none is posted. Post after the real-card test (step 1).
 
 ### 3. Roadmap
 
 - Proving MP3 joins after a format, where the clusters between pieces could be other songs': a constant-bitrate song's padding pattern (which frames carry the extra byte) continues across a join; a VBR song's Xing table of contents says roughly where each percent of it lies.
 - Faster checking, for example an optional native JPEG decoder used only when installed, keeping zero required dependencies.
 - Better photo rebuilding (see limitation 3).
-- HEIC and RAW reassembly, and reassembly for videos whose index is gone.
-- NTFS undelete with names, and AVCHD (`.MTS`).
+- RAW reassembly, and reassembly for videos whose index is gone.
+- NTFS undelete with names.
 - Phone backups and chat apps; an MCP server; a small desktop app.
 
 ## Debugging recipes
