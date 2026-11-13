@@ -107,6 +107,9 @@ def _mark_trash(src, recs: list[Found]) -> None:
         if not k:
             continue
         r.meta["in_trash"] = k
+        if k == "android":
+            r.meta["trash_name"], r.name = r.name, trash.android_name(r.name)
+            r.meta["original_path"] = "/".join(x for x in ((r.path or "").strip("/"), r.name) if x)
         if not r.extents:
             continue
         if not r.deleted:
