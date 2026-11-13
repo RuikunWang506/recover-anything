@@ -405,3 +405,47 @@ def trashed(workdir: str, fs: str = "FAT32", n: int = 24, size: int = 512 * 1024
         card.delete("%s/$I%06X.JPG" % (sid, 0xA1B2C0 + 1))
     truth = {_sha(d): nm for nm, d in shots[:15]}
     return Scenario("trashed", "Deleted on a computer (moved to the trash on the card)", img, truth, fs=fs)
+
+
+def make_appledouble(name: str) -> bytes:
+    """The hidden ._NAME a Mac writes next to each file it copies onto FAT or
+    exFAT: an AppleDouble header and Finder metadata, 4096 bytes."""
+    import struct
+    head = struct.pack(">II16sH", 0x00051607, 0x00020000, b"Mac OS X        ", 2)
+    head += struct.pack(">III", 9, 50, 3698) + struct.pack(">III", 2, 3748, 286)
+    body = bytearray(4096)
+    body[:len(head)] = head
+    body[50:54] = b"ATTR"
+    q = b"0083;6728d1a0;Image Capture;" + name.encode()
+    body[120:120 + len(q)] = q
+    return bytes(body)
+
+
+def mac_copied(workdir: str, fs: str = "FAT32", n: int = 12, size: int = 512 * 1024**2,
+               cluster_size: int = 4096) -> Scenario:
+    """Photos a Mac copied onto the card (each with its hidden ._ companion),
+    with the system's own files a Mac and Windows leave on a card, then all
+    the photos deleted together with their companions. The companions and the
+    system files are not the owner's: they must not be saved, counted, or
+    reported as lost."""
+    img = os.path.join(workdir, "mac-copied-%s.img" % fs.lower())
+    folder = "DCIM/100CANON"
+    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+        card.write_file(".fseventsd/fseventsd-uuid", b"5F2D8C3A-0B6E-4F4C-9A61-3B1E2D7C9A10", _when(0))
+        card.write_file(".Spotlight-V100/VolumeConfiguration.plist", b"<?xml version=\"1.0\"?><plist/>", _when(0))
+        card.write_file("System Volume Information/IndexerVolumeGuid",
+                        "{2B8A6E44-1C1F-4D21-9D6E-7A1D4C3E5B10}".encode("utf-16-le"), _when(0))
+        shots = []
+        for i in range(1, n + 1):
+            name = "IMG_%04d.JPG" % i
+            data = make_photo(i, taken=_when(i), style=PHOTO_STYLE)
+            card.write_file("%s/%s" % (folder, name), data, _when(i))
+            card.write_file("%s/._%s" % (folder, name), make_appledouble(name), _when(i))
+            shots.append((name, data))
+        card.write_file(folder + "/.DS_Store", b"\x00\x00\x00\x01Bud1" + bytes(6138), _when(n))
+        for name, _ in shots:
+            card.delete("%s/%s" % (folder, name))
+            card.delete("%s/._%s" % (folder, name))
+        card.delete(folder + "/.DS_Store")
+    truth = {_sha(d): nm for nm, d in shots}
+    return Scenario("mac-copied", "Copied on a Mac, then deleted", img, truth, fs=fs)

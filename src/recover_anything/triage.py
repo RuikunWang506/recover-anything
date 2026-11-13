@@ -61,6 +61,7 @@ def triage(path: str) -> dict:
         info["volumes"] = []
         live = deleted = trashed = 0
         from . import trash
+        from .clutter import is_clutter
         for v in vols:
             entry = {"offset": v.offset, "size": v.size, "filesystem": v.fs, "label": v.label, "note": v.note}
             fsr = None
@@ -71,6 +72,8 @@ def triage(path: str) -> dict:
             if fsr is not None:
                 try:
                     for r in fsr.walk():
+                        if is_clutter(r.path, r.name):
+                            continue
                         if r.deleted:
                             deleted += 1
                         elif trash.bookkeeping(r.path, r.name):
