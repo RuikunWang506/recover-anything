@@ -52,6 +52,8 @@ sudo recover-anything triage /dev/rdisk4
 ```
 Relay the verdict in plain words: what it is, the odds, and the don'ts. If the verdict
 is `ssd-trim`, `encrypted` or `empty`, go to step 5 (hunt) instead of promising a scan.
+If triage reports files in the card's trash folder (verdict `in-card-trash` when the rest
+of the card is blank), they were deleted on a computer but are still whole: recover them.
 
 ### 3. Recover
 ```
@@ -67,7 +69,9 @@ sudo recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
 
 It finds files three ways, in order: deleted entries the filesystem still lists (original
 names), folders that survived a format (original names again), and signature carving
-of every cluster. Fragmented JPEGs are rebuilt piece by piece and verified by decoding
+of every cluster. Files deleted on a computer that still sit in the card's hidden trash
+folder (`.Trashes`, `.Trash-1000`, `$RECYCLE.BIN`) are copied back by default, under the
+names the trash recorded. Fragmented JPEGs are rebuilt piece by piece and verified by decoding
 them; fragmented MP4/MOV videos are rebuilt from their own frame index; music, voice
 memos, dashcam and camcorder clips are rebuilt frame by frame. Besides photos and videos
 it finds audio, old and new Office files, PDFs, archives and SQLite databases. Every file

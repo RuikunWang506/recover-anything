@@ -273,6 +273,23 @@ class ExfatCard:
         self._flush_bitmap()
         self._write_dir(d)
 
+    def move(self, path: str, new_path: str, t=None) -> None:
+        """Move or rename like an OS: the old entry set is marked unused, a new
+        one in the new folder points at the same clusters, the data stays put."""
+        path, new_path = path.strip("/"), new_path.strip("/")
+        parent_path, _, name = path.rpartition("/")
+        d = self.dirs[parent_path] if parent_path else self.root
+        first, count = d.children.pop(name.lower())
+        s = d.entries[first + 1]
+        fc, length = struct.unpack_from("<IQ", s, 20)
+        contiguous = bool(s[1] & 2)
+        for k in range(count):
+            d.entries[first + k][0] &= 0x7F
+        self._write_dir(d)
+        new_parent, _, new_name = new_path.rpartition("/")
+        d2 = self.mkdir(new_parent, t) if new_parent else self.root
+        self._add_set(d2, new_name, 0x20, fc, length, contiguous, t or _dt.datetime(2026, 1, 1, 12, 0, 0))
+
     def close(self):
         self.f.flush()
         os.fsync(self.f.fileno())

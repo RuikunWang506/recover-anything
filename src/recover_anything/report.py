@@ -51,7 +51,10 @@ def summarize(res, written) -> dict:
     reassembled = 0
     named = 0
     unconfirmed = 0
+    trashed = 0
     for r in written:
+        if r.meta.get("trash"):
+            trashed += 1
         if r.status in ("partial", "corrupt"):
             partial += 1
             continue
@@ -64,7 +67,7 @@ def summarize(res, written) -> dict:
             named += 1
     lost = [r for r in res.found if r.status == "lost" and r.name]
     return {"counts": counts, "partial": partial, "reassembled": reassembled, "named": named, "lost": lost,
-            "total": sum(counts.values()), "unconfirmed": unconfirmed}
+            "total": sum(counts.values()), "unconfirmed": unconfirmed, "trashed": trashed}
 
 
 def headline(s: dict) -> str:
@@ -134,6 +137,8 @@ def write_html(res, written, out_dir: str) -> str:
         stats.append((s["named"], "kept their original names"))
     if s["reassembled"]:
         stats.append((s["reassembled"], "rebuilt from scattered pieces"))
+    if s["trashed"]:
+        stats.append((s["trashed"], "were in the card's trash folder"))
     if s["partial"]:
         stats.append((s["partial"], "partly recovered"))
     out.append("<div class='stats'>" + "".join("<div class='stat'><b>%d</b><span>%s</span></div>" % (n, e(t))
@@ -167,6 +172,8 @@ def write_html(res, written, out_dir: str) -> str:
                 chip = "<span class='chip bad'>damaged</span>"
             elif r.status == "unverified":
                 chip = "<span class='chip warn'>not checked</span>"
+            elif r.meta.get("trash"):
+                chip = "<span class='chip ok'>was in the card's trash</span>"
             elif r.meta.get("check") == "structure":
                 chip = "<span class='chip'>structure checked</span>"
             img = ("<img loading='lazy' alt='' src='%s'>" % src) if src else "<div class='ph'>%s</div>" % e(
@@ -222,6 +229,8 @@ def text_summary(res, written, out_dir: str) -> str:
         lines.append("  %d kept their original names." % s["named"])
     if s["reassembled"]:
         lines.append("  %d were rebuilt from scattered pieces." % s["reassembled"])
+    if s["trashed"]:
+        lines.append("  %d were still whole in the card's hidden trash folder (deleted on a computer)." % s["trashed"])
     if s["unconfirmed"]:
         lines.append("  %d could not be fully checked; open them to make sure they look right." % s["unconfirmed"])
     if s["partial"]:

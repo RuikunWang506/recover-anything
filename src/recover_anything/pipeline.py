@@ -78,9 +78,59 @@ def _fix_high_word(src, fsr, rec: Found, want: str) -> bool:
     return False
 
 
+def _read_head(src, r: Found, limit: int = 65536) -> bytes:
+    out, want = [], min(limit, r.expected_size or limit)
+    for o, n in r.extents:
+        if want <= 0:
+            break
+        out.append(src.read(o, min(n, want)))
+        want -= min(n, want)
+    return b"".join(out)
+
+
+def _mark_trash(src, recs: list[Found]) -> None:
+    """Files a computer moved into the trash folder on the card are files the
+    user deleted, though their clusters are still in use: hand them back by
+    default, under their original names when the trash recorded them."""
+    from . import trash
+    place: dict = {}
+    for r in sorted(recs, key=lambda r: not r.deleted):          # a visible record wins
+        folder, name = (r.path or "").strip("/").lower(), (r.name or "").lower()
+        place[(folder, name)] = r
+        if name.startswith("_") and folder.startswith("$recycle.bin"):
+            place[(folder, "$" + name[1:])] = r                   # deleted short name: first letter lost
+    for r in recs:
+        if trash.bookkeeping(r.path, r.name):
+            r.meta["trash_record"] = True
+            continue
+        k = trash.kind(r.path, r.name)
+        if not k:
+            continue
+        r.meta["in_trash"] = k
+        if not r.extents:
+            continue
+        if not r.deleted:
+            r.meta["trash"] = k
+        comp = trash.companion(r.path, r.name)
+        rec = place.get((comp[0].lower(), comp[1].lower())) if comp else None
+        if rec is None or not rec.extents:
+            continue
+        try:
+            orig = trash.original_path(_read_head(src, rec))
+        except Exception:
+            orig = None
+        if orig:
+            folder, name = trash.split(orig)
+            if name:
+                r.meta["trash_name"], r.name = r.name, name
+                r.meta["original_path"] = orig
+
+
 def _dedupe_starts(recs: list[Found]) -> None:
     """Before checking: a deleted entry pointing at a cluster that a still-
-    visible file now starts at was overwritten by it."""
+    visible file now starts at was overwritten by it, unless the visible file
+    is the same file moved into the card's trash folder."""
+    from . import trash
     by_start: dict[int, list[Found]] = {}
     for r in recs:
         if r.status != "lost" and r.extents:
@@ -89,8 +139,20 @@ def _dedupe_starts(recs: list[Found]) -> None:
         live = [r for r in group if r.meta.get("live")]
         if live and len(group) > 1:
             for other in group:
-                if other not in live:
-                    other.status = "lost"
+                if other in live:
+                    continue
+                moved = live[0].meta.get("trash") and other.expected_size == live[0].expected_size
+                other.status = "lost"
+                if moved:
+                    # the entry it left behind: the trashed file is this one
+                    other.meta["moved_to_trash"] = True
+                    other.note = "moved to the trash folder on the card"
+                    if other.name and "original_path" not in live[0].meta and \
+                            live[0].meta.get("in_trash") == "windows":
+                        live[0].meta["trash_name"], live[0].name = live[0].name, other.name
+                        live[0].meta["original_path"] = "/".join(x for x in ((other.path or "").strip("/"),
+                                                                             other.name) if x)
+                else:
                     other.note = "its space was reused by %s" % (live[0].name or "another file")
 
 
@@ -116,12 +178,24 @@ def _dedupe_after_check(recs: list[Found]) -> None:
                     bool(r.meta.get("was_deleted", r.deleted)), gap)
         group.sort(key=key)
         keep = group[0]
+        from . import trash
+        if any(r.meta.get("in_trash") for r in group):
+            # One file moved into the card's trash and then deleted from it
+            # leaves two entries for the same data: the same file, not a loss.
+            for other in group[1:]:
+                if other.expected_size == keep.expected_size:
+                    other.meta["moved_to_trash"] = True
+                    if other.name and keep.meta.get("in_trash") == "windows" and \
+                            "original_path" not in keep.meta and not other.meta.get("in_trash"):
+                        keep.meta["trash_name"], keep.name = keep.name, other.name
         if keep.meta.get("size_mismatch") and keep.meta.get("actual_len"):
             keep.extents = _trim(keep.extents, keep.meta["actual_len"])
             keep.note = "the name may belong to an earlier file stored in the same place"
         for other in group[1:]:
             other.status = "lost"
             other.note = "its space was reused by %s" % (keep.name or "another file")
+            if other.meta.get("moved_to_trash"):
+                other.note = "the same file, moved to the trash folder on the card"
 
 
 def _trim(extents, length):
@@ -397,6 +471,10 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
                 _identify_record(src, fsr, r)
             except Exception as e:
                 r.kind, r.note = "other", "could not be identified (%s)" % e
+        try:
+            _mark_trash(src, recs)
+        except Exception as e:
+            res.warnings.append("Could not read the trash folder on the card (%s)." % e)
         _dedupe_starts(recs)
         all_found += recs
     if not res.volumes:
@@ -469,10 +547,14 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
     except Exception:
         pass
     _mark_unreadable(all_found, bad)
-    res.found = [r for r in all_found if r.status != "embedded" and (include_live or not r.meta.get("live"))]
+    res.found = [r for r in all_found if r.status != "embedded" and not r.meta.get("moved_to_trash")
+                 and not r.meta.get("trash_record")
+                 and (include_live or not r.meta.get("live") or r.meta.get("trash"))]
     if kinds:  # --only: the files the folders name are filtered too, not just carved ones
         res.found = [r for r in res.found if carver.group_of(r.kind, r.ext) in kinds]
-    res.live_count = sum(1 for r in all_found if r.meta.get("live"))
+    res.live_count = sum(1 for r in all_found if r.meta.get("live") and not r.meta.get("trash")
+                         and not r.meta.get("trash_record"))
+    res.trash_count = sum(1 for r in res.found if r.meta.get("trash") and r.status != "lost")
     res.bad_ranges = bad
     res.seconds = time.time() - t0
     res._src = src
