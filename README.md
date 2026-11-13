@@ -131,7 +131,7 @@ Everything has `--json` for agents and scripts.
 ## What's supported
 
 - **Filesystems with names and folders:** FAT12, FAT16, FAT32, exFAT (SD, SDHC and SDXC cards, USB sticks, most cameras and drones).
-- **Anything else** (NTFS, HFS+, ext4, a wiped or unknown card, a card reformatted with different settings): carving still finds the files, without names. A damaged FAT32 or exFAT boot sector is read from its backup copy, and an image cut short by read errors is used as far as it goes.
+- **Anything else** (NTFS, HFS+, ext4, a wiped or unknown card, a card reformatted with different settings): carving still finds the files, without names. A damaged FAT32 or exFAT boot sector is read from its backup copy, and an image cut short by read errors is used as far as it goes. When the computer can't open a card at all ("this card needs to be formatted"), every file still listed on it is copied, not just the deleted ones.
 - **File types:**
   - Photos: JPEG, HEIC/HEIF, AVIF, PNG, GIF, WebP, BMP, Photoshop (PSD/PSB), RAW (CR2, CR3, NEF, ARW, DNG, ORF, RW2, PEF).
   - Videos: MP4, MOV, M4V, 3GP, AVI, MKV, WebM, dashcam and camcorder clips (TS, MTS/M2TS, MPG/VOB/MOD).

@@ -52,9 +52,12 @@ def summarize(res, written) -> dict:
     named = 0
     unconfirmed = 0
     trashed = 0
+    unreadable = 0
     for r in written:
         if r.meta.get("trash"):
             trashed += 1
+        if r.meta.get("card_unreadable"):
+            unreadable += 1
         if r.status in ("partial", "corrupt"):
             partial += 1
             continue
@@ -67,7 +70,8 @@ def summarize(res, written) -> dict:
             named += 1
     lost = [r for r in res.found if r.status == "lost" and r.name]
     return {"counts": counts, "partial": partial, "reassembled": reassembled, "named": named, "lost": lost,
-            "total": sum(counts.values()), "unconfirmed": unconfirmed, "trashed": trashed}
+            "total": sum(counts.values()), "unconfirmed": unconfirmed, "trashed": trashed,
+            "unreadable": unreadable}
 
 
 def headline(s: dict) -> str:
@@ -231,6 +235,9 @@ def text_summary(res, written, out_dir: str) -> str:
         lines.append("  %d were rebuilt from scattered pieces." % s["reassembled"])
     if s["trashed"]:
         lines.append("  %d were still whole in the card's hidden trash folder (deleted on a computer)." % s["trashed"])
+    if s["unreadable"]:
+        lines.append("  %d were never deleted: the computer can't open the card because its start is damaged, "
+                     "so they were copied too." % s["unreadable"])
     if s["unconfirmed"]:
         lines.append("  %d could not be fully checked; open them to make sure they look right." % s["unconfirmed"])
     if s["partial"]:

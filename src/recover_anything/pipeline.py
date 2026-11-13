@@ -471,6 +471,10 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
         from .clutter import is_clutter
         for r in recs:
             r.volume = vr
+            if getattr(vol, "os_cannot_open", False) and not r.deleted:
+                # Listed on the card, but the computer can't open the card:
+                # to the owner these files are lost too.
+                r.meta["card_unreadable"] = True
             if is_clutter(r.path, r.name):
                 # the system's own files (a Mac's ._ companions, .DS_Store...)
                 r.meta["clutter"] = True
@@ -558,10 +562,12 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
     _mark_unreadable(all_found, bad)
     res.found = [r for r in all_found if r.status != "embedded" and not r.meta.get("moved_to_trash")
                  and not r.meta.get("trash_record") and not r.meta.get("clutter")
-                 and (include_live or not r.meta.get("live") or r.meta.get("trash"))]
+                 and (include_live or not r.meta.get("live") or r.meta.get("trash")
+                      or r.meta.get("card_unreadable"))]
     if kinds:  # --only: the files the folders name are filtered too, not just carved ones
         res.found = [r for r in res.found if carver.group_of(r.kind, r.ext) in kinds]
     res.live_count = sum(1 for r in all_found if r.meta.get("live") and not r.meta.get("trash")
+                         and not r.meta.get("card_unreadable")
                          and not r.meta.get("trash_record") and not r.meta.get("clutter"))
     res.trash_count = sum(1 for r in res.found if r.meta.get("trash") and r.status != "lost")
     res.bad_ranges = bad

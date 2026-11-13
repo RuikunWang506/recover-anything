@@ -17,6 +17,9 @@ class Volume:
     label: str = ""
     note: str = ""
     from_backup: bool = False
+    # Found only by working around damage (backup boot sector, no partition
+    # table): the computer can't open it, so none of its files are visible.
+    os_cannot_open: bool = False
 
 
 ENCRYPTED = {"BitLocker", "LUKS", "APFS (encrypted?)"}
@@ -109,7 +112,7 @@ def find_volumes(src) -> list[Volume]:
                 fs2, label2, boff = _backup_boot(src, off)
                 if fs2 != "unknown":
                     vols.append(Volume(off, size, fs2, label2, "main boot sector is damaged; using the backup copy",
-                                       from_backup=True))
+                                       from_backup=True, os_cannot_open=True))
                     continue
                 if fs == "damaged":
                     vols.append(Volume(off, size, "unknown", "", "the filesystem is damaged; searching the raw data"))
@@ -120,14 +123,16 @@ def find_volumes(src) -> list[Volume]:
     if fs in ("unknown", "damaged"):
         fs2, label2, _ = _backup_boot(src, 0)
         if fs2 != "unknown":
-            return [Volume(0, src.size, fs2, label2, "main boot sector is damaged; using the backup copy", True)]
+            return [Volume(0, src.size, fs2, label2, "main boot sector is damaged; using the backup copy", True,
+                           os_cannot_open=True)]
         # A card wiped of its partition table often still has a boot sector at
         # the usual SD alignment.
         for guess in (4 << 20, 8 << 20, 1 << 20, 32256, 16 << 20):
             if guess < src.size:
                 g, gl = identify(src, guess)
                 if g not in ("unknown", "damaged"):
-                    return [Volume(guess, src.size - guess, g, gl, "partition table missing; found the filesystem anyway")]
+                    return [Volume(guess, src.size - guess, g, gl, "partition table missing; found the filesystem anyway",
+                                   os_cannot_open=True)]
         if fs == "damaged":
             return [Volume(0, src.size, "unknown", "", "the filesystem is damaged; searching the raw data")]
     return [Volume(0, src.size, fs, label)]

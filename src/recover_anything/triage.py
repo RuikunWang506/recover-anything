@@ -59,7 +59,7 @@ def triage(path: str) -> dict:
         info["size"] = src.size
         vols = find_volumes(src)
         info["volumes"] = []
-        live = deleted = trashed = 0
+        live = deleted = trashed = unopenable = 0
         from . import trash
         from .clutter import is_clutter
         for v in vols:
@@ -80,6 +80,8 @@ def triage(path: str) -> dict:
                             continue
                         elif trash.kind(r.path, r.name):
                             trashed += 1
+                        elif v.os_cannot_open:
+                            unopenable += 1
                         else:
                             live += 1
                 except Exception:
@@ -93,6 +95,7 @@ def triage(path: str) -> dict:
         info["visible_files"] = live
         info["deleted_entries"] = deleted
         info["in_card_trash"] = trashed
+        info["listed_but_unopenable"] = unopenable
         present = max((v["data_present"] for v in info["volumes"]), default=0.0)
         info["data_present"] = present
         fss = {v["filesystem"] for v in info["volumes"]}
@@ -147,6 +150,15 @@ def triage(path: str) -> dict:
         info["summary"] = ("%d file(s) deleted on a computer are still whole in the card's hidden trash folder; "
                            "'recover' copies them back. The rest of the card looks blank, so other deleted files "
                            "may be gone." % n)
+    k = info.get("listed_but_unopenable")
+    if k and info.get("verdict") in ("recoverable", "empty", "in-card-trash"):
+        info["odds"] = "good"
+        if info["verdict"] == "empty":
+            info["verdict"] = "card-unopenable"
+            info["summary"] = ""
+        info["summary"] = ("The computer can't open this card because its start is damaged, but %d file(s) are "
+                           "still listed on it and look whole: 'recover' copies them all. Don't format it, and "
+                           "don't let the computer 'repair' it. %s" % (k, info["summary"])).strip()
     return info
 
 
@@ -162,6 +174,8 @@ def format_triage(t: dict) -> str:
             int(v.get("data_present", 0) * 100), (" - " + v["note"]) if v.get("note") else ""))
     if "visible_files" in t:
         lines.append("  %d visible files, %d deleted entries still listed" % (t["visible_files"], t["deleted_entries"]))
+        if t.get("listed_but_unopenable"):
+            lines.append("  %d files still listed, on a card the computer can't open" % t["listed_but_unopenable"])
         if t.get("in_card_trash"):
             lines.append("  %d files in the card's trash folder (deleted on a computer, still whole)" % t["in_card_trash"])
     lines.append("")
