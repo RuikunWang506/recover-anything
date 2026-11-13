@@ -70,8 +70,8 @@ sudo recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
 It finds files three ways, in order: deleted entries the filesystem still lists (original
 names), folders that survived a format (original names again), and signature carving
 of every cluster. Files deleted on a computer that still sit in the card's hidden trash
-folder (`.Trashes`, `.Trash-1000`, `$RECYCLE.BIN`) are copied back by default, under the
-names the trash recorded. Fragmented JPEGs are rebuilt piece by piece and verified by decoding
+folder (`.Trashes`, `.Trash-1000`, `$RECYCLE.BIN`), or that a phone's gallery keeps for
+30 days (`.trashed-…` files), are copied back by default, under their original names. Fragmented JPEGs are rebuilt piece by piece and verified by decoding
 them; fragmented MP4/MOV videos are rebuilt from their own frame index; music, voice
 memos, dashcam and camcorder clips are rebuilt frame by frame. Besides photos and videos
 it finds audio, old and new Office files, PDFs, archives and SQLite databases. Every file

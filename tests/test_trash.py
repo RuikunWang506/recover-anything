@@ -71,3 +71,28 @@ def test_original_paths_from_windows_and_linux_records():
     # a deleted record whose space was reused: not mistaken for a path
     assert trash.original_path(b"\xff\xd8\xff\xe1" + bytes(600)) is None
     assert trash.original_path(bytes(600)) is None
+
+
+@pytest.mark.parametrize("fs", ["exFAT", "FAT32"])
+def test_photos_in_androids_trash_come_back_under_their_names(tmp_path, fs):
+    """Android 11+ keeps a deleted photo for 30 days as .trashed-<expiry>-NAME
+    in the same folder, then deletes it for good."""
+    sc = scenarios.android_trashed(str(tmp_path), fs=fs)
+    res = scan(sc.image, workers=1)
+    w = organize.write_all(res, str(tmp_path / "out"))
+    got = {}
+    for r in w["written"]:
+        got[hashlib.sha256(open(r.meta["written_to"], "rb").read()).hexdigest()] = \
+            os.path.basename(r.meta["written_to"])
+    assert {sha: got.get(sha) for sha in sc.truth} == sc.truth
+    assert set(got) == set(sc.truth)
+    assert [r.name for r in res.found if r.status == "lost"] == []
+    assert res.trash_count == 5 and res.live_count == 8
+
+
+def test_android_trash_names():
+    assert trash.kind("DCIM/Camera", ".trashed-1786000000-IMG_20260704_093000.jpg") == "android"
+    assert trash.android_name(".trashed-1786000000-IMG_20260704_093000.jpg") == "IMG_20260704_093000.jpg"
+    assert trash.android_name(".trashed-1786000000-my-trip-photo.jpg") == "my-trip-photo.jpg"
+    assert trash.kind("DCIM/Camera", ".pending-1786000000-IMG_20260704_093000.jpg") is None
+    assert trash.kind("DCIM/Camera", "trashed-1786000000-IMG.jpg") is None

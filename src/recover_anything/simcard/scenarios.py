@@ -449,3 +449,28 @@ def mac_copied(workdir: str, fs: str = "FAT32", n: int = 12, size: int = 512 * 1
         card.delete(folder + "/.DS_Store")
     truth = {_sha(d): nm for nm, d in shots}
     return Scenario("mac-copied", "Copied on a Mac, then deleted", img, truth, fs=fs)
+
+
+def android_trashed(workdir: str, fs: str = "exFAT", n: int = 16, size: int = 512 * 1024**2,
+                    cluster_size: int = 4096) -> Scenario:
+    """A phone's SD card: photos deleted in the Gallery or Google Photos are
+    renamed in place to .trashed-<expiry>-NAME and kept for 30 days; after
+    that the phone deletes them for good. Both kinds should come back under
+    their original names."""
+    img = os.path.join(workdir, "android-trashed-%s.img" % fs.lower())
+    folder = "DCIM/Camera"
+    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+        shots = []
+        for i in range(1, n + 1):
+            t = _when(i)
+            name = "IMG_%s.jpg" % t.strftime("%Y%m%d_%H%M%S")
+            data = make_photo(i, taken=t, style=PHOTO_STYLE)
+            card.write_file("%s/%s" % (folder, name), data, t)
+            shots.append((name, data))
+        expiry = 1786000000                       # 30 days after deletion, in seconds since 1970
+        for k, (name, _) in enumerate(shots[:8]):
+            card.move("%s/%s" % (folder, name), "%s/.trashed-%d-%s" % (folder, expiry + k, name))
+        for k, (name, _) in enumerate(shots[:3]):  # 30 days later: gone for good
+            card.delete("%s/.trashed-%d-%s" % (folder, expiry + k, name))
+    truth = {_sha(d): nm for nm, d in shots[:8]}
+    return Scenario("android-trashed", "Deleted in a phone's gallery (Android trash)", img, truth, fs=fs)
