@@ -353,6 +353,14 @@ def single_kind(workdir: str, kind: str, seed: int, cluster_size: int = 4096, si
     return sc
 
 
+# The scenarios below test logic, not scale: 96 MB cards. Windows writes a card
+# image out in full, and CI's Windows machine has little disk to spare. FAT32
+# needs at least 65,525 clusters, so 1 KB ones; the simulated exFAT card keeps
+# each folder in one cluster, so 4 KB ones (about 128 entries).
+def _small_clusters(fs: str) -> int:
+    return 4096 if fs == "exFAT" else 1024
+
+
 def _win_trash_record(original: str, size: int, version: int = 2) -> bytes:
     """A Windows Recycle Bin $I record: version, size, deletion time, path."""
     import struct
@@ -363,8 +371,8 @@ def _win_trash_record(original: str, size: int, version: int = 2) -> bytes:
     return struct.pack("<QQQI", 2, size, when, len(path) // 2) + path
 
 
-def trashed(workdir: str, fs: str = "FAT32", n: int = 24, size: int = 512 * 1024**2,
-            cluster_size: int = 4096) -> Scenario:
+def trashed(workdir: str, fs: str = "FAT32", n: int = 24, size: int = 96 * 1024**2,
+            cluster_size: int = 0) -> Scenario:
     """Photos deleted from the card on a computer: moved (not copied) into the
     trash folder on the card itself, the way macOS, Linux and Windows do it,
     then some of each trash emptied. Every one of them should come back, under
@@ -372,7 +380,7 @@ def trashed(workdir: str, fs: str = "FAT32", n: int = 24, size: int = 512 * 1024
     img = os.path.join(workdir, "trashed-%s.img" % fs.lower())
     folder = "DCIM/100CANON"
     sid = "$RECYCLE.BIN/S-1-5-21-3623811015-3361044348-30300820-1001"
-    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+    with _card(img, fs, size=size, cluster_size=cluster_size or _small_clusters(fs)) as card:
         shots = _shoot(card, 1, n, folder=folder)
         names = [nm for nm, _ in shots]
 
@@ -421,8 +429,8 @@ def make_appledouble(name: str) -> bytes:
     return bytes(body)
 
 
-def mac_copied(workdir: str, fs: str = "FAT32", n: int = 12, size: int = 512 * 1024**2,
-               cluster_size: int = 4096) -> Scenario:
+def mac_copied(workdir: str, fs: str = "FAT32", n: int = 12, size: int = 96 * 1024**2,
+               cluster_size: int = 0) -> Scenario:
     """Photos a Mac copied onto the card (each with its hidden ._ companion),
     with the system's own files a Mac and Windows leave on a card, then all
     the photos deleted together with their companions. The companions and the
@@ -430,7 +438,7 @@ def mac_copied(workdir: str, fs: str = "FAT32", n: int = 12, size: int = 512 * 1
     reported as lost."""
     img = os.path.join(workdir, "mac-copied-%s.img" % fs.lower())
     folder = "DCIM/100CANON"
-    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+    with _card(img, fs, size=size, cluster_size=cluster_size or _small_clusters(fs)) as card:
         card.write_file(".fseventsd/fseventsd-uuid", b"5F2D8C3A-0B6E-4F4C-9A61-3B1E2D7C9A10", _when(0))
         card.write_file(".Spotlight-V100/VolumeConfiguration.plist", b"<?xml version=\"1.0\"?><plist/>", _when(0))
         card.write_file("System Volume Information/IndexerVolumeGuid",
@@ -451,15 +459,15 @@ def mac_copied(workdir: str, fs: str = "FAT32", n: int = 12, size: int = 512 * 1
     return Scenario("mac-copied", "Copied on a Mac, then deleted", img, truth, fs=fs)
 
 
-def android_trashed(workdir: str, fs: str = "exFAT", n: int = 16, size: int = 512 * 1024**2,
-                    cluster_size: int = 4096) -> Scenario:
+def android_trashed(workdir: str, fs: str = "exFAT", n: int = 16, size: int = 96 * 1024**2,
+                    cluster_size: int = 0) -> Scenario:
     """A phone's SD card: photos deleted in the Gallery or Google Photos are
     renamed in place to .trashed-<expiry>-NAME and kept for 30 days; after
     that the phone deletes them for good. Both kinds should come back under
     their original names."""
     img = os.path.join(workdir, "android-trashed-%s.img" % fs.lower())
     folder = "DCIM/Camera"
-    with _card(img, fs, size=size, cluster_size=cluster_size) as card:
+    with _card(img, fs, size=size, cluster_size=cluster_size or _small_clusters(fs)) as card:
         shots = []
         for i in range(1, n + 1):
             t = _when(i)
