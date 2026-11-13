@@ -54,6 +54,10 @@ Relay the verdict in plain words: what it is, the odds, and the don'ts. If the v
 is `ssd-trim`, `encrypted` or `empty`, go to step 5 (hunt) instead of promising a scan.
 If triage reports files in the card's trash folder (verdict `in-card-trash` when the rest
 of the card is blank), they were deleted on a computer but are still whole: recover them.
+If it says the computer can't open the card (verdict `card-unopenable`, or files "still
+listed, on a card the computer can't open"), the classic "this card needs to be
+formatted": the files are whole, and `recover` copies all of them, not just deleted ones.
+Make sure the person doesn't format it or let the computer repair it.
 
 ### 3. Recover
 ```

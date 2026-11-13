@@ -482,3 +482,23 @@ def android_trashed(workdir: str, fs: str = "exFAT", n: int = 16, size: int = 96
             card.delete("%s/.trashed-%d-%s" % (folder, expiry + k, name))
     truth = {_sha(d): nm for nm, d in shots[:8]}
     return Scenario("android-trashed", "Deleted in a phone's gallery (Android trash)", img, truth, fs=fs)
+
+
+def unopenable(workdir: str, fs: str = "FAT32", damage: str = "boot", n: int = 10, size: int = 96 * 1024**2,
+               cluster_size: int = 0) -> Scenario:
+    """'This card needs to be formatted': nothing was deleted, but the start of
+    the card is damaged, so no computer can open it. damage='boot' wipes the
+    main boot sector (the backup copy survives), damage='mbr' wipes the
+    partition table. Every photo is still listed and whole."""
+    import struct
+    img = os.path.join(workdir, "unopenable-%s-%s.img" % (damage, fs.lower()))
+    with _card(img, fs, size=size, cluster_size=cluster_size or _small_clusters(fs)) as card:
+        shots = _shoot(card, 1, n)
+    if damage in ("boot", "mbr"):
+        with open(img, "r+b") as f:
+            mbr = f.read(512)
+            lba = struct.unpack_from("<I", mbr, 446 + 8)[0] if mbr[510:512] == b"\x55\xaa" else 0
+            f.seek(lba * 512 if damage == "boot" else 0)
+            f.write(bytes(512))
+    truth = {_sha(d): name for name, d in shots}
+    return Scenario("unopenable-" + damage, "Card that needs formatting (%s damaged)" % damage, img, truth, fs=fs)
