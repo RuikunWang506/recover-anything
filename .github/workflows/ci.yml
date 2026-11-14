@@ -30,6 +30,11 @@ jobs:
         run: cat "$GITHUB_WORKSPACE/guard-diag.txt" || echo "no details recorded"
       - name: selftest (quick)
         run: recover-anything selftest --quick
+      - name: NTFS reader on a real NTFS volume (mkntfs, ntfs-3g)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get install -y -qq ntfs-3g
+          sudo -E env "PATH=$PATH" python -m pytest -q -rs tests/test_ntfs_real.py
 
   package:
     # What a release would upload: it builds, and the wheel installs and runs.
