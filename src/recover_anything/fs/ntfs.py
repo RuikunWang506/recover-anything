@@ -13,6 +13,12 @@ indexes (a deleted file is removed from its folder's index at once).
 Not read: compressed, encrypted and sparse files (their bytes on disk aren't
 the file), and data stored inside a record across a sector's last two bytes
 (NTFS swaps those for a check value on disk).
+
+Not trusted: a record whose sectors don't all carry the same check value (torn
+by a power cut mid-write: its list of pieces may be the old file's); pieces
+past a file's valid data length (Windows shows zeros there, the disk holds
+older data); a list of pieces that overlaps itself or the MFT or is larger
+than the volume; extension records that don't match their base record.
 """
 from __future__ import annotations
 
@@ -73,7 +79,8 @@ def fixup(rec: bytearray, bps: int = STRIDE) -> bool:
     if len(rec) < 48:
         return False
     usa_off, usa_n = struct.unpack_from("<HH", rec, 4)
-    if usa_n < 2 or usa_off + 2 * usa_n > len(rec) or (usa_n - 1) * bps > len(rec):
+    # one check value per 512 bytes of the record: fewer would leave sectors unchecked
+    if usa_n != len(rec) // bps + 1 or usa_off + 2 * usa_n > len(rec):
         return False
     usn = rec[usa_off:usa_off + 2]
     for i in range(1, usa_n):
@@ -85,13 +92,14 @@ def fixup(rec: bytearray, bps: int = STRIDE) -> bool:
 
 
 class _Rec:
-    __slots__ = ("num", "seq", "in_use", "is_dir", "base", "names", "data", "data_flags", "si_mtime",
-                 "abs_off", "fixed", "resident")
+    __slots__ = ("num", "seq", "in_use", "is_dir", "base", "base_seq", "names", "data", "data_flags", "si_mtime",
+                 "abs_off", "fixed", "resident", "valid")
 
     def __init__(self, num):
-        self.num, self.seq, self.in_use, self.is_dir, self.base = num, 0, False, False, 0
+        self.num, self.seq, self.in_use, self.is_dir, self.base, self.base_seq = num, 0, False, False, 0, 0
         self.names = []          # (namespace, name, parent number, parent sequence)
         self.data = []           # (start vcn, runs, real size or None) for the unnamed $DATA
+        self.valid = None        # the unnamed $DATA's valid (initialized) length
         self.data_flags = 0
         self.si_mtime = None
         self.abs_off = 0
@@ -126,11 +134,13 @@ class NtfsVolume:
         self.label = ""
         self.dir_clusters = ()
         rec0 = self._read_record_at(self.cluster_offset(self.mft_lcn))
-        if rec0 is None or not rec0.data:
+        if rec0 is None or not rec0.fixed or not rec0.data:
             raise ValueError("the MFT's own record is unreadable")
-        self.mft_extents = self._extents(rec0, limit=None)
+        self.mft_extents = self._extents(rec0, limit=None, check_mft=False)
         self._records = None
         self._bitmap = None
+        self.bitmap_known = True
+        self.warnings = []
 
     # ------------------------------------------------------------ geometry
     def cluster_offset(self, c: int) -> int:
@@ -140,23 +150,38 @@ class NtfsVolume:
         return [(self.cluster_offset(c), size or self.cluster_size)]
 
     def _bitmap_bytes(self) -> bytes:
+        """$Bitmap's bytes, or b"" when it can't be read: then nothing is
+        known about which clusters are in use, and deleted files are treated
+        as possibly overwritten."""
         if self._bitmap is None:
             self._bitmap = b""
-            recs = self.records()
-            r = recs.get(6)
-            if r is not None and r.data:
+            try:
+                r = self.records().get(6)
+                if r is None or not r.data:
+                    raise ValueError("its record is missing")
                 ext = self._extents(r)
-                self._bitmap = b"".join(self.src.read(o, n) for o, n in ext)
+                bm = b"".join(self.src.read(o, n) for o, n in ext)
+                if len(bm) * 8 < self.cluster_count:
+                    raise ValueError("it is shorter than the volume")
+                self._bitmap = bm
+            except Exception as e:
+                self.bitmap_known = False
+                self.warnings.append("This drive's map of used space ($Bitmap) can't be read (%s); deleted files "
+                                     "may have been partly overwritten." % e)
         return self._bitmap
 
     def allocated_map(self) -> bytearray:
         """One byte per cluster number: 1 if $Bitmap says it is in use."""
         bm, n = self._bitmap_bytes(), self.cluster_count
-        out = bytearray(n)
-        for i in range(min(n, len(bm) * 8)):
-            if bm[i >> 3] & (1 << (i & 7)):
-                out[i] = 1
-        return out
+        out = bytearray(len(bm) * 8)
+        for byte_i, b in enumerate(bm):           # only set bits: free space costs little
+            if b:
+                base = byte_i * 8
+                for k in range(8):
+                    if b >> k & 1:
+                        out[base + k] = 1
+        out = out[:n]
+        return out + bytearray(n - len(out))
 
     def is_allocated(self, c: int) -> bool:
         bm = self._bitmap_bytes()
@@ -174,14 +199,21 @@ class NtfsVolume:
         try:
             self._parse(raw, r)
         except (struct.error, ValueError, IndexError):
-            return None
+            if fixed:
+                return None
+            r.data, r.resident = [], None        # a torn record: keep what parsed, trust no pieces
+        if not fixed:
+            # Torn by a power cut mid-write: some sectors are the old version,
+            # so the list of pieces may be the old file's. Keep the name only.
+            r.data, r.resident, r.valid = [], None, None
         return r
 
     def _parse(self, raw: bytearray, r: _Rec) -> None:
         r.seq = struct.unpack_from("<H", raw, 16)[0]
         attr_off, flags = struct.unpack_from("<HH", raw, 20)
         used = struct.unpack_from("<I", raw, 24)[0]
-        r.base = struct.unpack_from("<Q", raw, 32)[0] & 0xFFFFFFFFFFFF
+        base = struct.unpack_from("<Q", raw, 32)[0]
+        r.base, r.base_seq = base & 0xFFFFFFFFFFFF, base >> 48
         r.in_use, r.is_dir = bool(flags & F_IN_USE), bool(flags & F_DIR)
         limit = min(len(raw), max(used, attr_off))
         pos = attr_off
@@ -208,11 +240,13 @@ class NtfsVolume:
             else:
                 start_vcn = struct.unpack_from("<Q", raw, pos + 16)[0]
                 run_off = struct.unpack_from("<H", raw, pos + 32)[0]
-                real = struct.unpack_from("<Q", raw, pos + 48)[0]
+                real, init = struct.unpack_from("<QQ", raw, pos + 48)
                 if atype == T_DATA and name_len == 0:
                     r.data_flags |= aflags
                     runs = decode_runlist(raw, pos + run_off, pos + alen)
                     r.data.append((start_vcn, runs, real if start_vcn == 0 else None))
+                    if start_vcn == 0:
+                        r.valid = init
             pos += alen
 
     def records(self) -> dict:
@@ -231,31 +265,62 @@ class NtfsVolume:
                     out[num] = r
                 num += 1
         for r in list(out.values()):
-            if r.base and r.base in out and r.data and r.base != r.num:
-                out[r.base].data.extend(d for d in r.data if d[1] is not None)
+            if not (r.base and r.data and r.fixed and r.base != r.num):
+                continue
+            b = out.get(r.base)
+            if b is None or not b.fixed or b.resident is not None:
+                continue
+            # The same file: both in use with the sequence number the
+            # extension names, or both freed (freeing bumps the base's number).
+            # A base record reused by a new file must not take a deleted
+            # file's leftover pieces.
+            if r.in_use and b.in_use and b.seq == r.base_seq:
+                pass
+            elif not r.in_use and not b.in_use and b.seq in (r.base_seq, (r.base_seq + 1) & 0xFFFF):
+                pass
+            else:
+                continue
+            b.data.extend(d for d in r.data if d[1] is not None)
         self._records = out
         return out
 
-    def _extents(self, r: _Rec, limit="real"):
+    def _extents(self, r: _Rec, limit="real", check_mft: bool = True):
         """Absolute (offset, length) pieces of a record's unnamed $DATA, cut to
-        its real size. Raises ValueError for a sparse run."""
+        its real size. Raises ValueError for a sparse run, and for a list of
+        pieces that can't be a file's: overlapping itself or the MFT, or
+        larger than the volume."""
         pieces = sorted((d for d in r.data if d[1] is not None), key=lambda d: d[0])
         real = next((d[2] for d in r.data if d[0] == 0 and d[2] is not None), None)
-        out, vcn = [], 0
+        if real is not None and real > self.cluster_count * self.cluster_size:
+            raise ValueError("it is larger than the drive")
+        out, vcn, spans = [], 0, []
         for start, runs, _ in pieces:
             if start != vcn:
                 raise ValueError("a piece of the runlist is missing")
             for lcn, length in runs:
                 if lcn is None:
                     raise ValueError("sparse")
-                if lcn < 0 or lcn + length > self.cluster_count:
+                if lcn < 0 or length <= 0 or lcn + length > self.cluster_count:
                     raise ValueError("runlist points outside the volume")
+                spans.append((lcn, lcn + length))
+                if vcn + length > self.cluster_count:
+                    raise ValueError("it is larger than the drive")
                 o = self.cluster_offset(lcn)
                 if out and out[-1][0] + out[-1][1] == o:
                     out[-1] = (out[-1][0], out[-1][1] + length * self.cluster_size)
                 else:
                     out.append((o, length * self.cluster_size))
                 vcn += length
+        spans.sort()
+        for (a0, a1), (b0, _) in zip(spans, spans[1:]):
+            if b0 < a1:
+                raise ValueError("its pieces overlap")
+        if check_mft:
+            for o, n in getattr(self, "mft_extents", ()):
+                m0 = (o - self.offset) // self.cluster_size
+                m1 = m0 + (n + self.cluster_size - 1) // self.cluster_size
+                if any(a < m1 and m0 < b for a, b in spans):
+                    raise ValueError("its pieces overlap the file table")
         if limit is None or real is None:
             return out
         cut, rem = [], real
@@ -290,8 +355,11 @@ class NtfsVolume:
                 return None
             seen.add(pnum)
             p = recs.get(pnum)
-            # a deleted folder's record gets a new sequence number when freed
-            if p is None or not p.is_dir or p.seq not in (pseq, (pseq + 1) & 0xFFFF):
+            # A deleted folder's record gets a new sequence number when freed;
+            # an in-use record with a newer number is a different folder.
+            if p is None or not p.is_dir:
+                return None
+            if p.seq != pseq and not (not p.in_use and p.seq == (pseq + 1) & 0xFFFF):
                 return None
             pname = self._best_name(p)
             if pname is None:
@@ -303,7 +371,7 @@ class NtfsVolume:
         cur, seen = r, set()
         while True:
             best = self._best_name(cur)
-            if best is None or best[2] == ROOT or best[2] in seen:
+            if best is None or best[2] == ROOT or best[2] in seen or len(seen) > 64:
                 return False
             seen.add(best[2])
             p = recs.get(best[2])
@@ -317,15 +385,20 @@ class NtfsVolume:
         recs = self.records()
         for num in sorted(recs):
             r = recs[num]
-            if num < FIRST_USER_RECORD or r.is_dir or r.base or not r.data:
+            # a torn record lost its pieces but is still listed, as damaged
+            if num < FIRST_USER_RECORD or r.is_dir or r.base or (not r.data and r.fixed):
                 continue
             best = self._best_name(r)
             if best is None:
                 continue
-            path = self._path(recs, r)
-            if path is not None and (path == "$Extend" or path.startswith("$Extend/")):
-                continue
-            rec = self._record(recs, r, best[1], path)
+            try:
+                path = self._path(recs, r)
+                if path is not None and (path == "$Extend" or path.startswith("$Extend/")):
+                    continue
+                rec = self._record(recs, r, best[1], path)
+            except Exception as e:                # one bad record never ends the listing
+                rec = Found(kind="?", ext="", extents=[], origin="filesystem", name=best[1], path=None,
+                            deleted=not r.in_use, status="lost", note="its record can't be read (%s)" % e)
             if rec is not None:
                 yield rec
 
@@ -338,6 +411,10 @@ class NtfsVolume:
         rec.meta["mft_record"] = r.num
         if path is None:
             rec.meta["folder_unknown"] = True
+        if not r.fixed:
+            rec.note = "its record in the file table was half-written (a power cut?); its pieces can't be trusted"
+            rec.status = "lost"
+            return rec
         if r.data_flags & (A_COMPRESSED | A_ENCRYPTED):
             rec.note = "compressed or encrypted by Windows; its bytes can't be read directly"
             rec.status = "lost"
@@ -360,18 +437,43 @@ class NtfsVolume:
                         else "its list of pieces is damaged (%s)" % e)
             rec.status = "lost"
             return rec
+        real = sum(n for _, n in rec.extents)
+        if r.valid is not None and r.valid < real:
+            # Only the first part was ever written (a copy or download cut
+            # short): Windows shows zeros after it, the disk holds older data.
+            # Save what was written, and don't count the layout as known.
+            if r.valid <= 0:
+                rec.status = "lost"
+                rec.note = "none of its data was ever written"
+                rec.extents = []
+                return rec
+            cut, rem = [], r.valid
+            for o, n in rec.extents:
+                if rem <= 0:
+                    break
+                cut.append((o, min(n, rem)))
+                rem -= n
+            rec.extents = cut
+            rec.meta["chain"] = "runlist-cut-short"
+            rec.meta["valid_length"] = r.valid
+            rec.note = "only the first %d of its %d bytes were ever written (a copy cut short?)" % (r.valid, real)
         rec.expected_size = sum(n for _, n in rec.extents)
         if not rec.extents:
             return None
         rec.meta["start_cluster"] = (rec.extents[0][0] - self.offset) // self.cluster_size
         if deleted:
-            reused = 0
+            if not self._bitmap_bytes() and not self.bitmap_known:
+                rec.meta["bitmap_unknown"] = True
+            reused, looked = 0, 0
             for o, n in rec.extents:
                 c0 = (o - self.offset) // self.cluster_size
                 for c in range(c0, c0 + (n + self.cluster_size - 1) // self.cluster_size):
+                    if looked >= 4096:            # bounded, as for FAT
+                        break
+                    looked += 1
                     if self.is_allocated(c):
                         reused += 1
-                if reused > 4096:
+                if looked >= 4096:
                     break
             if reused:
                 rec.meta["reused_clusters"] = reused

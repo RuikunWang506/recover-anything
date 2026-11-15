@@ -27,6 +27,8 @@ _LINUX = re.compile(r"^(\.trash-[^/]+|\.trash/[^/]+)/files(/|$)", re.I)
 _LINUX_TOP = re.compile(r"^(\.trash-[^/]+|\.trash/[^/]+)/files$", re.I)
 _WIN = re.compile(r"^\$recycle\.bin(/|$)", re.I)
 _WIN_OLD = re.compile(r"^recycle[dr](/|$)", re.I)
+# Windows 95-XP renamed a deleted file to D<drive letter><number>.<ext>
+_WIN_OLD_DATA = re.compile(r"^[D_][A-Z]\d+(\..*)?$", re.I)
 # A deleted FAT short name loses its first character; readers show "_".
 _WIN_DATA = re.compile(r"^[$_]R([A-Z0-9]{6})(\..*)?$", re.I)
 # Android's trash: the name only. A deleted FAT short name loses its first
@@ -51,7 +53,9 @@ def kind(path: Optional[str], name: Optional[str]) -> Optional[str]:
             return "windows"
         return "windows" if p.count("/") >= 2 else None   # inside a deleted folder
     if _WIN_OLD.match(p):
-        return None if n.upper() in ("INFO", "INFO2", "DESKTOP.INI") else "windows"
+        # only files named the way that Recycle Bin renamed them: a folder
+        # that merely happens to be called "Recycled" is not a trash
+        return "windows" if _WIN_OLD_DATA.match(n) else None
     return None
 
 

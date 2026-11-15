@@ -737,6 +737,10 @@ THUMB_SHIFT = 25.0
 THUMB_NOTE = ("every block decodes, but part of the picture doesn't match the small preview stored in it: "
               "part of it may be another photo's; check it")
 THUMB_FLAT = 12.0    # where the thumbnail varies less than this around a block, it shows a step in DC
+NO_PREVIEW_NOTE = ("every block decodes, but it has no preview to compare with, so a piece of another photo "
+                   "could hide in it; open it to make sure")
+PROGRESSIVE_NOTE = ("a progressive JPEG: its picture data can't be checked here, only its structure; "
+                    "open it to make sure")
 
 
 class Thumb:
@@ -894,11 +898,18 @@ def deep_check(data: bytes) -> tuple[bool, str]:
 
 
 def check(data: bytes, thumb: bool = False) -> tuple[str, str, int | None]:
-    """Classify an in-memory JPEG: ('ok'|'partial'|'corrupt', message, bad byte).
+    """Classify an in-memory JPEG: ('ok'|'partial'|'corrupt'|'unverified',
+    message, bad byte).
 
     'partial' means the beginning decodes but the data stops early (the top
     of the picture is viewable). 'corrupt' means bytes from somewhere else got
     mixed in at the returned position.
+
+    thumb=True for a photo whose layout isn't known (deleted, carved,
+    rebuilt): it is 'ok' only when every block decodes AND it matches its own
+    preview. Without a preview, or when it can't be decoded at all
+    (progressive), it is 'unverified': the decoder falls back into step after
+    damage, so another photo's data can decode cleanly.
     """
     try:
         h = parse_header(lambda o, n: data[o:o + n], 0)
@@ -907,11 +918,15 @@ def check(data: bytes, thumb: bool = False) -> tuple[str, str, int | None]:
     if not h.decodable:
         m = measure(lambda o, n: data[o:o + n], 0)
         if m.complete:
+            if thumb:
+                return "unverified", PROGRESSIVE_NOTE, None
             return "ok", "structure checked (progressive or unusual JPEG)", None
         return "partial", m.reason, m.break_pos
     try:
         d = Decoder(h)
     except JpegError as e:
+        if thumb:
+            return "unverified", "its picture data can't be decoded here (%s); open it to make sure" % e, None
         return "ok", "structure only (%s)" % e, None
     d.buf = data
     try:
@@ -923,15 +938,19 @@ def check(data: bytes, thumb: bool = False) -> tuple[str, str, int | None]:
         return "corrupt", msg, e.pos
     if st != "done":
         return "partial", "the file stops partway through the picture", len(data)
-    if thumb and h.thumb:
+    if thumb:
         # The decoder falls back into step after damage, so a run of another
         # photo's data can decode to the right number of blocks. The thumbnail
-        # shows what the picture should look like.
-        try:
-            t = Thumb(h, data[h.thumb[0]:h.thumb[0] + h.thumb[1]])
-        except Exception:
-            t = None  # no usable thumbnail
-        if t is not None and t.unlike(d) is not None:
+        # shows what the picture should look like; without one, nothing does.
+        t = None
+        if h.thumb:
+            try:
+                t = Thumb(h, data[h.thumb[0]:h.thumb[0] + h.thumb[1]])
+            except Exception:
+                t = None  # no usable thumbnail
+        if t is None:
+            return "unverified", NO_PREVIEW_NOTE, None
+        if t.unlike(d) is not None:
             return "unverified", THUMB_NOTE, None
     return "ok", "every block decoded", None
 

@@ -96,3 +96,31 @@ def test_android_trash_names():
     assert trash.android_name(".trashed-1786000000-my-trip-photo.jpg") == "my-trip-photo.jpg"
     assert trash.kind("DCIM/Camera", ".pending-1786000000-IMG_20260704_093000.jpg") is None
     assert trash.kind("DCIM/Camera", "trashed-1786000000-IMG.jpg") is None
+
+
+def test_a_folder_merely_called_recycled_is_not_a_trash():
+    assert trash.kind("RECYCLED", "Dc1.jpg") == "windows"              # Windows 95-XP Recycle Bin
+    assert trash.kind("RECYCLER/S-1-5-21-1-2-3-1001", "Dc12.JPG") == "windows"
+    assert trash.kind("Recycled", "holiday.jpg") is None               # someone's own folder
+    assert trash.kind("Recycler", "IMG_0001.JPG") is None
+
+
+def test_only_one_entry_is_taken_for_the_moved_copy():
+    """A file moved into the trash and emptied leaves one other entry for the
+    same data. A third, same-size entry at the same place is a different file
+    whose space was reused: it must still be reported, not hidden."""
+    from recover_anything.pipeline import _dedupe_after_check
+    from recover_anything.records import Found
+
+    def entry(name, path, in_trash):
+        r = Found(kind="jpeg", ext=".jpg", extents=[(1 << 20, 50000)], origin="filesystem", name=name, path=path,
+                  deleted=True, expected_size=50000, status="ok" if in_trash else "partial")
+        if in_trash:
+            r.meta["in_trash"] = "mac"
+        return r
+    trashed = entry("IMG_0001.JPG", ".Trashes/501", True)
+    left_behind = entry("IMG_0001.JPG", "DCIM/100CANON", False)
+    older = entry("IMG_0777.JPG", "DCIM/100CANON", False)
+    _dedupe_after_check([trashed, left_behind, older])
+    assert left_behind.meta.get("moved_to_trash")
+    assert not older.meta.get("moved_to_trash") and older.status == "lost"

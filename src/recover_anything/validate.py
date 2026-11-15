@@ -252,8 +252,9 @@ def _validate_one(src, rec: Found, deep: bool = True) -> None:
         rec.meta["check"] = "structure"
 
 
-DEEP_LIMIT = 8 << 30  # above this much JPEG data, 'auto' checks a sample first
+DEEP_LIMIT = 8 << 30  # above this much JPEG data still on the card, 'auto' checks a sample first
 SAMPLE = 300
+FAST_NOTE = "fast mode: only its structure was checked; open it to make sure"
 
 
 def _check_jpegs(src, jpegs, workers, progress, deep, done0=0, total=None):
@@ -287,19 +288,34 @@ def validate_all(src, recs: list[Found], workers: int | None = None, progress=No
     if not jpegs:
         return mode
     workers = workers if workers is not None else max(1, min(8, (os.cpu_count() or 2)))
-    if mode == "auto" and sum(r.size for r in jpegs) <= DEEP_LIMIT:
+    # A photo whose layout isn't known (deleted, carved, found in a lost
+    # folder) is always decoded to the end and compared with its preview: a
+    # structure check can't see another photo's cluster inside it (rule 3).
+    # Sampling and --fast only ever apply to photos still on the card.
+    unknown = [r for r in jpegs if not layout_known(r)]
+    known = [r for r in jpegs if layout_known(r)]
+    if unknown:
+        _check_jpegs(src, unknown, workers, progress, mode != "fast", total=len(jpegs))
+        if mode == "fast":
+            for r in unknown:
+                if r.status == "ok":
+                    r.status, r.note = "unverified", FAST_NOTE
+    done = len(unknown)
+    if not known:
+        return "deep" if mode != "fast" else "fast"
+    if mode == "auto" and sum(r.size for r in known) <= DEEP_LIMIT:
         mode = "deep"
     if mode in ("deep", "fast"):
-        _check_jpegs(src, jpegs, workers, progress, mode == "deep")
+        _check_jpegs(src, known, workers, progress, mode == "deep", done0=done, total=len(jpegs))
         return mode
     import random
-    _check_jpegs(src, jpegs, workers, progress, False)
-    fine = [r for r in jpegs if r.status == "ok"]
+    _check_jpegs(src, known, workers, progress, False, done0=done, total=len(jpegs))
+    fine = [r for r in known if r.status == "ok"]
     sample = random.Random(1).sample(fine, min(SAMPLE, len(fine)))
-    before = {id(r) for r in sample}
     _check_jpegs(src, sample, workers, None, True)
-    if any(r.status != "ok" for r in sample if id(r) in before):
-        rest_ok = [r for r in fine if r not in sample]
+    if any(r.status != "ok" for r in sample):
+        picked = {id(r) for r in sample}
+        rest_ok = [r for r in fine if id(r) not in picked]
         _check_jpegs(src, rest_ok, workers, progress, True)
         return "deep"
     return "sampled"

@@ -110,7 +110,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 ## Known limitations and open problems
 
 1. **Only simulated hardware so far.** Everything has run on card images, loop devices and CI disk images. Raw device reads on a real Mac and a real Windows PC are untested. So are permission prompts, failing cards and USB readers.
-2. **Speed.** Decoding is pure Python, at roughly 1.5 MB/s per core across all cores. Above 8 GB of photos it checks structure plus a random sample (`validate.py`: `DEEP_LIMIT`, `SAMPLE`). A big card can take hours.
+2. **Speed.** Decoding is pure Python, at roughly 1.5 MB/s per core across all cores. Deleted and rebuilt photos are always decoded in full; above 8 GB of photos still on the card, those are checked by structure plus a random sample (`validate.py`: `DEEP_LIMIT`, `SAMPLE`). A big card can take hours.
 3. **Photo rebuilding is the hard part, and the moat.**
    - How it works (`reassemble.py`): it walks forward, skipping clusters owned by verified files. At a decode error it searches candidates, scored by DC brightness jumps across the seam (`seam_score`).
    - Why it's hard: when two photos come from the same camera with the same tables and no restart markers, another photo's data decodes without error. Only the seam score can tell them apart, and it is weak.

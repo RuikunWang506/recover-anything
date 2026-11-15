@@ -68,8 +68,8 @@ sudo recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
 - `--only photos,videos` narrows it. `--include-live` also copies files still visible.
 - `--json` gives machine-readable output if you want to parse results.
 - Reading the card runs at the card's speed. Checking photos block by block is CPU work
-  (about 1.5 MB/s per core, spread over all cores); above 8 GB of photos it checks a
-  random sample in full and the rest by structure, unless you pass `--deep`.
+  (about 1.5 MB/s per core, spread over all cores). Deleted and rebuilt photos are always
+  checked in full; `--fast` skips that and labels them to open and check instead.
 
 It finds files three ways, in order: deleted entries the filesystem still lists (original
 names), folders that survived a format (original names again), and signature carving

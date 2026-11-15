@@ -43,3 +43,21 @@ def test_what_counts_as_clutter():
     for path, name in (("DCIM/100CANON", "IMG_0001.JPG"), ("DCIM/100CANON", "Thumbs.db"),
                        ("Documents", "_notes.txt"), ("Documents", ".hidden_but_mine.txt")):
         assert not is_clutter(path, name), (path, name)
+
+
+def test_nothing_is_carved_out_of_the_systems_own_visible_files(tmp_path):
+    """A Mac's .fseventsd logs are gzip files. Skipping them as clutter must
+    not leave their clusters looking free, or the carver hands them back."""
+    import datetime as dt
+    import gzip
+
+    from recover_anything.simcard.fat32 import Fat32Card
+    img = str(tmp_path / "card.img")
+    log = gzip.compress(b"".join(b"/Volumes/CARD/DCIM/IMG_%04d.JPG\x00" % i + bytes([i % 251] * 12)
+                                 for i in range(400)), mtime=0)
+    with Fat32Card(img, size=96 * 1024**2, cluster_size=1024) as c:
+        c.write_file(".fseventsd/0000000000a1b2c3", log, dt.datetime(2026, 1, 1))
+        c.write_file(".fseventsd/fseventsd-uuid", b"5F2D8C3A-0B6E-4F4C-9A61-3B1E2D7C9A10", dt.datetime(2026, 1, 1))
+    res = scan(img, workers=1)
+    w = organize.write_all(res, str(tmp_path / "out"))
+    assert w["written"] == []

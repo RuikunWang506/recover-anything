@@ -146,11 +146,11 @@ Everything has `--json` for agents and scripts.
 - Data that has been physically overwritten is gone. No software brings it back.
 - Deleted files on internal SSDs with TRIM, on modern phones and on encrypted volumes are usually erased or unreadable. `triage` says so and `hunt` is the realistic path.
 - Video reassembly covers MP4/MOV/M4V/3GP with H.264 or HEVC video (what cameras, phones and drones record), MKV and WebM, dashcam and camcorder clips (`.TS`, `.MTS`) and Motion-JPEG AVI. Clusters that fall entirely inside one large frame can't be checked on their own. When the evidence for one of them is ambiguous, the video is saved but labeled *not fully confirmed* instead of being called recovered.
-- Progressive JPEGs (rare from cameras) are recovered when stored in one piece, but not reassembled.
+- Progressive JPEGs (rare from cameras, common from messaging apps and the web) can't be decoded here, so a deleted one is saved and labeled to open and check, never called recovered, and isn't reassembled. The same goes for a deleted photo with no preview stored in it: nothing can show that every piece is its own.
 - Fragment reassembly needs the card's current filesystem layout; files left over from an earlier format with different settings are recovered when they're in one piece.
 - Some files can't be checked by their contents: a RAW's sensor data, WAV, AMR and M4A audio, BMP pictures, old Office files (`.doc`, `.xls`), camcorder MPEG (`.MOD`, `.MPG`), and video in a codec the checks don't read (they read H.264, HEVC and Motion-JPEG, plus VP8, VP9 and AV1 in MKV and WebM). A deleted one is saved and labeled rather than called recovered.
 - APFS and ext4 file names aren't recovered yet (their files are still carved). On NTFS, a new file soon takes over a deleted file's record, name and all: the sooner you stop using the drive, the more names survive. Files Windows compressed or encrypted aren't read.
-- It's pure Python. Full block-by-block checking runs at roughly 1.5 MB/s per CPU core, spread across your cores. Above 8 GB of photos it checks structure plus a random sample by default, and goes full depth if the sample finds anything. `--deep` forces a full check; `--fast` skips it.
+- It's pure Python. Full block-by-block checking runs at roughly 1.5 MB/s per CPU core, spread across your cores. Every deleted or rebuilt photo is always checked in full. Photos still on the card are checked by structure plus a random sample when there are more than 8 GB of them (they're only copied with `--include-live`). `--deep` checks everything in full; `--fast` skips the full check and labels deleted photos to open and check.
 
 ## Roadmap
 
