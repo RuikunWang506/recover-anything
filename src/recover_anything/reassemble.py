@@ -125,6 +125,10 @@ class _Assembler:
                 path, buf = fixed
                 continue
             if st == "done":
+                if thumb is None:
+                    # Every block decodes, but with no preview nothing shows
+                    # that every piece is this photo's (rule 3).
+                    return path, dec.end, "unverified", jpeg.NO_PREVIEW_NOTE
                 bad = self._unlike_thumb(thumb, dec, path)
                 if bad is None:
                     self.unseen_at = self._unseen_piece(thumb, dec, path, states)
@@ -474,7 +478,13 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
                 blocked[c0:c1 + 1] = b"\x01" * (c1 - c0 + 1)
 
         for r in mine:
-            if r.status == "ok" or (r.meta.get("live") and r.meta.get("chain") in ("fat", "runlist")):
+            # A deleted photo that decoded to its last block where its folder
+            # entry says, but has no preview to prove it, is still almost
+            # certainly what those clusters hold: they fence other photos'
+            # searches, as before. (Steering a search never makes a file "ok".)
+            in_place = (r.kind == "jpeg" and r.status == "unverified" and r.note == jpeg.NO_PREVIEW_NOTE
+                        and r.origin in ("filesystem", "lost-folder"))
+            if r.status == "ok" or in_place or (r.meta.get("live") and r.meta.get("chain") in ("fat", "runlist")):
                 own(r)
         for off, _kind in getattr(vr, "headers", []):
             if off < g.data_offset or (off - g.data_offset) % cs:

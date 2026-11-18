@@ -185,12 +185,18 @@ def _dedupe_after_check(recs: list[Found]) -> None:
         if any(r.meta.get("in_trash") for r in group):
             # One file moved into the card's trash and then deleted from it
             # leaves two entries for the same data: the same file, not a loss.
-            for other in group[1:]:
-                if other.expected_size == keep.expected_size:
-                    other.meta["moved_to_trash"] = True
-                    if other.name and keep.meta.get("in_trash") == "windows" and \
-                            "original_path" not in keep.meta and not other.meta.get("in_trash"):
-                        keep.meta["trash_name"], keep.name = keep.name, other.name
+            # A move leaves exactly one other entry: the same size, with one of
+            # the two in a trash and the other not. Any further same-size
+            # entry is still a different file whose space was reused.
+            pair = [o for o in group[1:] if o.expected_size == keep.expected_size
+                    and bool(o.meta.get("in_trash")) != bool(keep.meta.get("in_trash"))]
+            pair.sort(key=lambda o: o.name != keep.name)          # the same name first (Mac, Linux)
+            if pair:
+                other = pair[0]
+                other.meta["moved_to_trash"] = True
+                if other.name and keep.meta.get("in_trash") == "windows" and \
+                        "original_path" not in keep.meta and not other.meta.get("in_trash"):
+                    keep.meta["trash_name"], keep.name = keep.name, other.name
         if keep.meta.get("size_mismatch") and keep.meta.get("actual_len"):
             keep.extents = _trim(keep.extents, keep.meta["actual_len"])
             keep.note = "the name may belong to an earlier file stored in the same place"
@@ -468,6 +474,7 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
                 recs.append(r)
         except Exception as e:
             res.warnings.append("Part of the lost-folder search failed (%s)." % e)
+        res.warnings.extend(getattr(fsr, "warnings", ()))   # e.g. an unreadable map of used space
         from .clutter import is_clutter
         for r in recs:
             r.volume = vr
@@ -476,8 +483,12 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
                 # to the owner these files are lost too.
                 r.meta["card_unreadable"] = True
             if is_clutter(r.path, r.name):
-                # the system's own files (a Mac's ._ companions, .DS_Store...)
+                # the system's own files (a Mac's ._ companions, .DS_Store...):
+                # never saved, but a visible one's clusters are still taken, so
+                # nothing is carved out of them (a Mac's .fseventsd logs are gzip)
                 r.meta["clutter"] = True
+                if not r.deleted:
+                    r.meta["live"] = True
                 r.status, r.kind = "lost", "other"
                 continue
             try:
@@ -530,11 +541,12 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
     res.check_mode = validate_all(src, to_check, workers=workers, progress=lambda d, t: prog("check", d, t),
                                   mode="fast" if fast else "deep" if deep else "auto")
     if res.check_mode == "sampled":
-        res.warnings.append("There was a lot to check, so photos were checked by structure, plus a full block-by-block "
-                            "check of a random sample (which found no problems). Run with --deep to check every block "
-                            "of every photo.")
+        res.warnings.append("There was a lot to check, so photos still on the card were checked by structure, plus a "
+                            "full block-by-block check of a random sample (which found no problems). Every deleted or "
+                            "rebuilt photo was checked block by block. Run with --deep to check every photo fully.")
     elif res.check_mode == "fast":
-        res.warnings.append("Fast mode: photos were checked by structure, not decoded block by block.")
+        res.warnings.append("Fast mode: photos were checked by structure, not decoded block by block, so deleted "
+                            "ones are labeled to open and check.")
     _dedupe_after_check(all_found)
     for r in all_found:
         if r.status == "ok" and r.meta.get("size_mismatch") and r.meta.get("actual_len"):

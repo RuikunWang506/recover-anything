@@ -74,8 +74,12 @@ def _mbr_parts(src) -> list[tuple[int, int, int]]:
 
 
 def _gpt_parts(src) -> list[tuple[int, int, int]]:
-    for sector in (512, 4096):
-        hdr = src.read(sector, sector)
+    # The primary header sits in the second sector; a copy sits in the last
+    # one, and every OS falls back to it when the primary is damaged.
+    places = [(sector, sector) for sector in (512, 4096)]
+    places += [(src.size - sector, sector) for sector in (512, 4096) if src.size >= 4 * sector]
+    for where, sector in places:
+        hdr = src.read(where, sector)
         if hdr[:8] != b"EFI PART":
             continue
         hsize = struct.unpack("<I", hdr[12:16])[0]
