@@ -40,4 +40,4 @@ body:
     attributes:
       label: Computer and version
       description: Your system, and what `recover-anything --version` prints.
-      placeholder: macOS 15.4, recover-anything 0.2.0
+      placeholder: macOS 15.4, recover-anything 0.2.1
