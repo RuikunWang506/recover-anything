@@ -1,15 +1,15 @@
 # Handoff: Recover Anything
 
-Status on 14 November 2026. It began as the handoff from the cloud build session. The project rules and the code map are in `CLAUDE.md`, so they aren't repeated here.
+Status on 18 November 2026. It began as the handoff from the cloud build session. The project rules and the code map are in `CLAUDE.md`, so they aren't repeated here.
 
 ## Where things stand
 
 - **Repo:** github.com/RuikunWang506/recover-anything, branch `main`, public since 9 November 2026. Changes reach `main` through pull requests, which need all five CI jobs to pass.
-- **Size:** about 15,500 lines of Python in `src/` and 215 tests.
+- **Size:** about 15,700 lines of Python in `src/` and 232 tests.
 - **CI:** green on all five jobs: the tests on Ubuntu with Python 3.9 and on Ubuntu, macOS and Windows with 3.13, plus a job that builds the package and runs the installed wheel. On the latest Ubuntu, a step also checks the NTFS reader on a real NTFS volume (`tests/test_ntfs_real.py`).
 - **Self-test:** every file recovered byte for byte on all 7 simulated cards: FAT32 and exFAT; deleted, formatted, formatted then reused, and heavily fragmented.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
-- **Released:** 0.1.0 (12 November 2026) and 0.2.0 (14 November 2026) on PyPI, each with a release page on GitHub. `pipx install recover-anything` gets the latest.
+- **Released:** 0.1.0 (12 November 2026) and 0.2.0 (18 November 2026) on PyPI, each with a release page on GitHub. `pipx install recover-anything` gets the latest.
 - **Not done yet:**
   - It has never been run on a physical card.
 
@@ -102,7 +102,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 - **Split MKV and WebM videos are rebuilt** (`reassemble_stream._Mkv`), element by element: each element header must follow the one before exactly, every block must belong to a track and its frame pass its codec's check, cluster times must go forward. A frame's data past what its check reads proves nothing about the clusters it fills, so a join only counts when a checked header falls in the cluster right after it (`tied`) and, as for MP3, where no other cluster could have come next (`first_choice`). A Matroska file gives its own length, so stopping short of it is a break, not its end (`ends_known`): the stream engine's "it stops inside a cluster, so that's its end" called 10 videos cut short recovered on the first try. A WebM written live (no length given) ends where its elements stop inside a cluster. When a check fails after a frame's data, the search now tries the slots where the path jumped first, within each round: another file's deleted clusters were standing in for a video's own last ones inside a frame. Every other stream kind's cards came out the same. The walker went through all 606 real WebM/MKV files to their ends. WebM-only cards: 87/112 recovered (9 of 34 split ones proven, 9 more saved byte for byte); MKV-only: 77/112 (2 of 37, 19 more). Mixed cards: split files 101/176 recovered on FAT32 (was 95) and 39/69 on exFAT (was 36), with HEIC and MP4 gaining too (each rebuilt video takes its clusters out of their way); 0 wrong.
 - On cards 1-4 holding only MP3s: 47/112 recovered as before, 33 saved byte for byte but labeled (was 27), 0 of 32 split ones proven (all after a format), 0 wrong. Mixed FAT32 cards 1-20: MP3 76/97 recovered (was 72), split files 94/176 (was 90), 0 wrong.
 
-## Added on 11-14 November 2026 (pull requests 6-13, released as 0.2.0)
+## Added on 11-18 November 2026 (pull requests 6-15, released as 0.2.0)
 
 - **Files still in a trash folder on the card come back** (`trash.py`). Deleting from a card in Finder, a Linux file manager or (for USB drives) Windows moves files into `.Trashes`, `.Trash-<uid>/files` or `$RECYCLE.BIN` on the card, whole. They were skipped as "still visible" and the entries they left behind reported as overwritten. They're copied by default now, with names from `.trashinfo` and `$I` records, and `triage` counts them.
 - **Android's gallery trash.** Android 11 and later keep a deleted photo for 30 days as `.trashed-<expiry>-NAME` in the same folder; handled like the trash folders, original name restored.
@@ -111,6 +111,10 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 - **NTFS names and folders** (`fs/ntfs.py`), from the MFT: a deleted file's record keeps its name, folder and the exact list of its pieces, so even a fragmented deleted file comes back whole. Checked on real NTFS volumes made by `mkntfs`/`ntfs-3g` as well as the simulator. NTFS hands a new file the lowest free record, so names are lost quickly once the drive is used again.
 - **The macOS disk-image test no longer jams the Mac:** the image stored on the test card is HFS+, not a second FAT volume (two FSKit volumes, one on the other, froze at the unmount).
 - **Test cards for these scenarios are 96 MB:** Windows CI writes card images out in full and ran out of disk with 512 MB ones.
+- **Four independent reviews before release** (pull request 15): correctness, coverage, measurement and code health. The plan they produced is kept outside the repo. Everything the correctness review found is fixed, each with a test that fails on the old code:
+  - NTFS reader: bytes past a file's valid data length aren't saved, and the layout doesn't count as known; a record torn by a power cut is listed as damaged and its pieces aren't used; leftover extension records are merged only when in-use state and sequence number agree; an unreadable `$Bitmap` is a warning, not the end of the listing; runlists that overlap, reach into the MFT or outgrow the volume are rejected; the reuse scan and parent-link checks are capped; a reused folder record no longer passes for the old folder.
+  - Deleted, carved and rebuilt photos are always decoded in full and compared with their preview, on big cards too; sampling and `--fast` apply only to photos still on the card. Without a preview, or when progressive, they're saved and labeled "open it to make sure". A photo that decoded in place still fences other photos' rebuild searches.
+  - System files' clusters stay taken (a Mac's `.fseventsd` logs were carved as documents); a damaged primary GPT header with an intact backup no longer counts as "can't open"; only one entry counts as a file's moved copy in a trash; a folder merely called `Recycled` isn't a trash.
 
 ## Tried and dropped
 
