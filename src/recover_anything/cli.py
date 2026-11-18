@@ -20,59 +20,110 @@ def _human(n: float) -> str:
 
 
 class Bar:
-    """Single-line progress on stderr; silent when not a terminal or in --json mode."""
+    """Progress on stderr. In a terminal: one line that updates in place. Not in
+    a terminal (an agent, a log): each stage's name, then a line every
+    HEARTBEAT seconds, so a long run never looks frozen. With --json: the
+    same as JSON lines."""
+    HEARTBEAT = 30.0
+    NAMES = {"scan": "Searching the card", "check": "Checking files", "reassemble": "Rebuilding fragments",
+             "write": "Saving files"}
 
-    def __init__(self, quiet=False):
-        self.quiet = quiet or not sys.stderr.isatty()
+    def __init__(self, as_json=False, out=None, clock=time.time):
+        self.out = out or sys.stderr
+        self.json = as_json
+        self.tty = not as_json and self.out.isatty()
+        self.clock = clock
+        self.t0 = clock()
         self.stage = None
+        self.described = False
+        self.stage_t0 = self.t0
         self.last = 0.0
+        self.beat = self.t0
+
+    def _left(self, done, total, now):
+        """Seconds left at the stage's pace so far, once it's clear enough."""
+        spent = now - self.stage_t0
+        if not done or not total or spent < 10 or done >= total:
+            return None
+        return spent * (total - done) / done
+
+    @staticmethod
+    def _clock(s):
+        s = int(s)
+        return "%d:%02d:%02d" % (s // 3600, s // 60 % 60, s % 60) if s >= 3600 else "%d:%02d" % (s // 60, s % 60)
+
+    def _emit(self, obj):
+        self.out.write(json.dumps(obj) + "\n")
+        self.out.flush()
 
     def __call__(self, stage, done=None, total=None):
-        names = {"scan": "Searching the card", "check": "Checking files", "reassemble": "Rebuilding fragments",
-                 "write": "Saving files"}
-        label = names.get(stage, stage)
-        if self.quiet:
-            if stage not in names and not self.quiet_logged(stage):
-                print("- " + label, file=sys.stderr)
+        label = self.NAMES.get(stage, stage)
+        now = self.clock()
+        if label != self.stage and stage in self.NAMES and self.described:
+            # the progress ticks of the stage a message just announced
+            self.stage, self.described = label, False
+        elif label != self.stage:
+            self.stage, self.stage_t0, self.beat = label, now, now
+            self.described = stage not in self.NAMES
+            if not self.tty:
+                if self.json:
+                    self._emit({"event": "stage", "stage": label, "elapsed": round(now - self.t0)})
+                else:
+                    self.out.write("- %s\n" % label)
+                    self.out.flush()
+        left = self._left(done, total, now)
+        if not self.tty:
+            if now - self.beat < self.HEARTBEAT:
+                return
+            self.beat = now
+            if self.json:
+                self._emit({"event": "progress", "stage": label, "done": done, "total": total,
+                            "elapsed": round(now - self.t0), "seconds_left": round(left) if left else None})
+                return
+            what = ("%d of %d (%d%%)" % (done, total, 100 * done // total)) if done is not None and total else \
+                "still working"
+            self.out.write("  [%s] %s: %s%s\n" % (self._clock(now - self.t0), label, what,
+                                                   (", about %s left" % self._clock(left)) if left else ""))
+            self.out.flush()
             return
-        now = time.time()
         if done is not None and total and now - self.last < 0.2 and done < total:
             return
         self.last = now
         pct = " %3d%%" % (100 * done // total) if done is not None and total else ""
-        sys.stderr.write("\r\033[K%s%s" % (label, pct))
+        eta = ("  (about %s left)" % self._clock(left)) if left else ""
+        self.out.write("\r\033[K%s%s%s" % (label, pct, eta))
         if done is None or (total and done >= total):
-            sys.stderr.write("\n")
-        sys.stderr.flush()
-
-    _logged: set = set()
-
-    def quiet_logged(self, stage):
-        if stage in self._logged:
-            return True
-        self._logged.add(stage)
-        return False
+            self.out.write("\n")
+        self.out.flush()
 
 
 # --------------------------------------------------------------- commands
 def cmd_devices(a):
-    from .devices import list_devices
+    from .devices import USB_CAMERA_ADVICE, list_devices, usb_cameras
     devs = list_devices()
+    cams = usb_cameras()
     if a.json:
-        print(json.dumps(devs, indent=1))
+        # a phone or camera plugged in by USB has no device path: it can't be read
+        print(json.dumps(devs + [{"path": None, "size": 0, "model": c["model"], "bus": "USB",
+                                  "kind": "phone-or-camera", "readable": False,
+                                  "advice": USB_CAMERA_ADVICE % c["model"]} for c in cams], indent=1))
         return 0
     if not devs:
         print("No disks found (or this system doesn't let me list them). You can still pass a device path or an "
               "image file directly.")
-        return 0
-    print("%-24s %10s  %-6s %-5s %-26s %s" % ("DEVICE", "SIZE", "BUS", "TYPE", "MODEL", "MOUNTED AT"))
-    for d in devs:
-        kind = "SSD" if d.get("ssd") and not d.get("removable") else ("card" if d.get("removable") else "disk")
-        flag = "  <- your system disk" if d.get("system_disk") else ""
-        print("%-24s %10s  %-6s %-5s %-26s %s%s" % (d["path"], _human(d["size"]), d.get("bus", "")[:6], kind,
-                                                    (d.get("model") or "")[:26], ", ".join(d.get("mounted_at") or []),
-                                                    flag))
-    print("\nMemory cards usually show up as 'card' with a size matching the card.")
+    else:
+        print("%-24s %10s  %-6s %-5s %-26s %s" % ("DEVICE", "SIZE", "BUS", "TYPE", "MODEL", "MOUNTED AT"))
+        for d in devs:
+            kind = "SSD" if d.get("ssd") and not d.get("removable") else ("card" if d.get("removable") else "disk")
+            flag = "  <- your system disk" if d.get("system_disk") else ""
+            print("%-24s %10s  %-6s %-5s %-26s %s%s" % (d["path"], _human(d["size"]), d.get("bus", "")[:6], kind,
+                                                        (d.get("model") or "")[:26],
+                                                        ", ".join(d.get("mounted_at") or []), flag))
+        print("\nMemory cards usually show up as 'card' with a size matching the card.")
+    for c in cams:
+        print("\n" + USB_CAMERA_ADVICE % c["model"])
+    if not cams:
+        print("A phone or camera plugged in by USB won't appear here: take its card out and use a card reader.")
     return 0
 
 
@@ -176,7 +227,7 @@ def cmd_recover(a):
     from .imaging import ImageError, identity, make_image, short_id
     from .organize import free_space, makedirs_tracked, plan_size, write_all
     from .pipeline import scan
-    from .report import text_summary, write_html
+    from .report import standing, text_summary, write_html
     from .source import Source
 
     src_path = normalize_source(a.source)
@@ -244,6 +295,9 @@ def cmd_recover(a):
                           "seconds": round(res.seconds, 1), "image": res.image,
                           "visible_files_not_copied": getattr(res, "live_count", 0) if not a.include_live else 0,
                           "from_card_trash": getattr(res, "trash_count", 0),
+                          "summary": w["manifest"]["summary"],
+                          "to_open_and_check": [{"file": os.path.relpath(r.meta["written_to"], out), "why": r.note}
+                                                for r in w["written"] if standing(r) == "open"],
                           "warnings": res.warnings}, indent=1))
     else:
         print()

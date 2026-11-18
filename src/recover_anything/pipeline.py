@@ -1,6 +1,7 @@
 """The recovery pipeline: filesystem pass -> carving -> validation -> reassembly."""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -48,6 +49,27 @@ class ScanResult:
     warnings: list = field(default_factory=list)
     seconds: float = 0.0
     bad_ranges: list = field(default_factory=list)
+
+
+DECODE_RATE = 1.5e6  # bytes of JPEG a core decodes per second (pure Python)
+
+
+def _check_label(recs, workers, fast: bool) -> str:
+    """The check stage's name, with a time estimate when it's long: decoding
+    photos is the slow part."""
+    label = "Checking every file it found"
+    jpeg_bytes = sum(r.size for r in recs if r.kind == "jpeg")
+    cores = workers if workers is not None else max(1, min(8, (os.cpu_count() or 2)))
+    secs = 0 if fast else jpeg_bytes / (DECODE_RATE * max(1, cores))
+    if secs >= 90:
+        label += " (up to about %s for %.1f GB of photos)" % (_minutes(secs), jpeg_bytes / 1e9)
+    return label
+
+
+def _minutes(secs: float) -> str:
+    if secs < 5400:
+        return "%d minutes" % max(2, round(secs / 60))
+    return "%.1f hours" % (secs / 3600)
 
 
 class Progress:
@@ -537,7 +559,7 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
         if not hasattr(r, "volume"):
             r.volume = _volume_at(res.volumes, r.start)
     to_check = [r for r in all_found if r.status != "lost" and r.kind != "other" and r.extents]
-    prog("Checking every file it found")
+    prog(_check_label(to_check, workers, fast))
     res.check_mode = validate_all(src, to_check, workers=workers, progress=lambda d, t: prog("check", d, t),
                                   mode="fast" if fast else "deep" if deep else "auto")
     if res.check_mode == "sampled":

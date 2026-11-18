@@ -11,6 +11,7 @@ import shutil
 
 from .carve import group_of
 from .exif import capture_time
+from .report import check_strength, standing, summary_block
 from .validate import ExtentReader
 
 FOLDER = {"photo": "Photos", "video": "Videos", "audio": "Audio", "document": "Documents"}
@@ -187,6 +188,8 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True, creat
                 "bytes": r.size,
                 "sha256": r.meta.get("sha256"),
                 "taken": r.meta.get("when"),
+                "standing": standing(r),
+                "check": check_strength(r),
                 "pieces": len(r.extents),
                 "source_offsets": [[o, n] for o, n in r.extents],
                 "note": r.note,
@@ -199,6 +202,7 @@ def write_all(res, out_dir: str, progress=None, keep_partial: bool = True, creat
         ],
     }
     manifest["could_not_save"] = [{"file": f, "reason": why} for f, why in failed]
+    manifest["summary"] = summary_block(res, written)
     with open(os.path.join(out_dir, "recovery.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     created.append(os.path.join(out_dir, "recovery.json"))

@@ -22,7 +22,16 @@ class Volume:
     os_cannot_open: bool = False
 
 
-ENCRYPTED = {"BitLocker", "LUKS", "APFS (encrypted?)"}
+# Volumes whose deleted data can't be carved without their key. "APFS
+# (encrypted?)" is an APFS container whose volumes couldn't be read: probably
+# encrypted, but the raw data is still searched.
+ENCRYPTED = {"BitLocker", "LUKS", "APFS (encrypted)", "Android phone storage"}
+APFS_UNSURE = "APFS (encrypted?)"
+# A card an Android phone "formatted as internal storage" (adoptable storage):
+# GPT partition types android_meta and android_expand, encrypted with a key
+# that stays on the phone.
+_ANDROID_EXPAND = bytes.fromhex("a41e3d19cab3e411b07510604b889dcf")   # 193D1EA4-B3CA-11E4-B075-10604B889DCF
+_ANDROID_META = bytes.fromhex("a210a719cab3e411b02610604b889dcf")     # 19A710A2-B3CA-11E4-B026-10604B889DCF
 
 
 def identify(src, off: int) -> tuple[str, str]:
@@ -42,7 +51,12 @@ def identify(src, off: int) -> tuple[str, str]:
     if bs[3:11] == b"NTFS    ":
         return "NTFS", ""
     if bs[32:36] == b"NXSB":
-        return "APFS", ""
+        from .fs import apfs
+        vols = apfs.volumes(src, off)
+        if not vols:
+            return APFS_UNSURE, ""
+        names = ", ".join(n for n, _ in vols if n)
+        return ("APFS (encrypted)" if all(enc for _, enc in vols) else "APFS"), names
     if bs[1024:1026] in (b"H+", b"HX"):
         return "HFS+", ""
     if len(bs) >= 1082 and bs[1080:1082] == b"\x53\xef":
@@ -101,7 +115,7 @@ def _gpt_parts(src) -> list[tuple[int, int, int]]:
             off = first * sector
             if last < first or off >= src.size:
                 continue
-            out.append((0xEE, off, min((last - first + 1) * sector, src.size - off)))
+            out.append((bytes(e[:16]), off, min((last - first + 1) * sector, src.size - off)))
         return out
     return []
 
@@ -110,7 +124,14 @@ def find_volumes(src) -> list[Volume]:
     parts = _gpt_parts(src) or [(t, o, s) for t, o, s in _mbr_parts(src) if t != 0xEE]
     vols = []
     if parts:
-        for _t, off, size in parts:
+        for t, off, size in parts:
+            if t == _ANDROID_META:
+                continue
+            if t == _ANDROID_EXPAND:
+                vols.append(Volume(off, size, "Android phone storage", "",
+                                   "an Android phone formatted this card as its own internal storage, which it "
+                                   "encrypts with a key that stays on the phone"))
+                continue
             fs, label = identify(src, off)
             if fs in ("unknown", "damaged"):
                 fs2, label2, boff = _backup_boot(src, off)
