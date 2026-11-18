@@ -3,6 +3,9 @@
 parse each system's own listing of USB devices (recorded shapes)."""
 import json
 import plistlib
+import sys
+
+import pytest
 
 from recover_anything import cli, devices
 
@@ -22,6 +25,7 @@ def test_mac_finds_a_ptp_camera_and_an_mtp_phone_but_not_a_webcam_or_a_card_read
     assert [c["model"] for c in found] == ["Canon Digital Camera", "Pixel 8"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="sysfs names hold ':', which Windows folders can't")
 def test_linux_reads_sysfs(tmp_path):
     def dev(name, product, *ifaces):
         (tmp_path / name).mkdir()
