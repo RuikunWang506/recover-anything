@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recover-anything"
-version = "0.1.0"
+version = "0.2.0"
 description = "Get back deleted and formatted photos, videos and files, safely. Rebuilds fragmented photos, keeps original names, never writes to the card. Built for AI agents and humans."
 readme = "README.md"
 requires-python = ">=3.9"
