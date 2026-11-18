@@ -9,7 +9,7 @@ Status on 18 November 2026. It began as the handoff from the cloud build session
 - **CI:** green on all five jobs: the tests on Ubuntu with Python 3.9 and on Ubuntu, macOS and Windows with 3.13, plus a job that builds the package and runs the installed wheel. On the latest Ubuntu, a step also checks the NTFS reader on a real NTFS volume (`tests/test_ntfs_real.py`).
 - **Self-test:** every file recovered byte for byte on all 7 simulated cards: FAT32 and exFAT; deleted, formatted, formatted then reused, and heavily fragmented.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
-- **Released:** 0.1.0 (12 November 2026) and 0.2.0 (18 November 2026) on PyPI, each with a release page on GitHub. `pipx install recover-anything` gets the latest.
+- **Released:** 0.1.0 (12 November 2026), 0.2.0 and 0.2.1 (18 November 2026) on PyPI, each with a release page on GitHub. `pipx install recover-anything` gets the latest.
 - **Not done yet:**
   - It has never been run on a physical card.
 
@@ -116,7 +116,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
   - Deleted, carved and rebuilt photos are always decoded in full and compared with their preview, on big cards too; sampling and `--fast` apply only to photos still on the card. Without a preview, or when progressive, they're saved and labeled "open it to make sure". A photo that decoded in place still fences other photos' rebuild searches.
   - System files' clusters stay taken (a Mac's `.fseventsd` logs were carved as documents); a damaged primary GPT header with an intact backup no longer counts as "can't open"; only one entry counts as a file's moved copy in a trash; a folder merely called `Recycled` isn't a trash.
 
-## Added on 18 November 2026 (Phase 1 of the review plan: advice that sent people the wrong way)
+## Added on 18 November 2026 (Phase 1 of the review plan, pull request 17, released as 0.2.1: advice that sent people the wrong way)
 
 - **Triage no longer calls a formatted card erased.** A camera fills a card from its start, so 64 formatted photos on a 4 GB card missed all 256 random samples ("Chances: LOW … looks fully erased"), and the skill then skipped the scan. Triage now reads the first 64 MB of the data area in full and probes further out at doubling distances; data there gives the new `sparse` verdict ("GOOD … I found 64 file(s) starting there"). A blank card still says `empty`, and now tells you to run `recover` anyway.
 - **The report doesn't oversell** (`report.standing`). The headline counts only files whose check passed, then "N more saved that you should open to make sure"; badges come from the status first, so an unproven rebuild is amber "open it to check", not green "rebuilt from 3 pieces"; the terminal lists those files with the reason; `recovery.json` has a `summary` and each file's `standing` and `check`; `--json` adds both.
