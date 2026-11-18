@@ -45,12 +45,34 @@ def _human(n: int) -> str:
     return str(n)
 
 
+def standing(r) -> str:
+    """What a saved file can be called: 'checked' (recovered, and its own check
+    passed), 'whole' (never deleted, copied as it was; no check exists for its
+    type), 'open' (saved, but nothing proves every byte is its own: open it to
+    make sure), 'partial' or 'damaged'."""
+    if r.status == "partial":
+        return "partial"
+    if r.status == "corrupt":
+        return "damaged"
+    if r.status == "ok":
+        return "checked"
+    if r.kind == "other" and r.meta.get("live") and not r.deleted:
+        return "whole"
+    return "open"
+
+
+def check_strength(r) -> str:
+    """How strongly a file was checked: 'full' (every block decoded or every
+    checksum matched), 'structure' (its layout and headers only) or 'none'."""
+    return r.meta.get("check") or "none"
+
+
 def summarize(res, written) -> dict:
     counts = {"photo": 0, "video": 0, "audio": 0, "document": 0, "other": 0}
     partial = 0
     reassembled = 0
     named = 0
-    unconfirmed = 0
+    to_open = []
     trashed = 0
     unreadable = 0
     for r in written:
@@ -58,11 +80,13 @@ def summarize(res, written) -> dict:
             trashed += 1
         if r.meta.get("card_unreadable"):
             unreadable += 1
-        if r.status in ("partial", "corrupt"):
+        st = standing(r)
+        if st in ("partial", "damaged"):
             partial += 1
             continue
-        if r.status == "unverified" and r.kind != "other":
-            unconfirmed += 1
+        if st == "open":
+            to_open.append(r)
+            continue
         counts[group_of(r.kind, r.ext)] += 1
         if r.meta.get("reassembled_from"):
             reassembled += 1
@@ -70,8 +94,17 @@ def summarize(res, written) -> dict:
             named += 1
     lost = [r for r in res.found if r.status == "lost" and r.name]
     return {"counts": counts, "partial": partial, "reassembled": reassembled, "named": named, "lost": lost,
-            "total": sum(counts.values()), "unconfirmed": unconfirmed, "trashed": trashed,
+            "total": sum(counts.values()), "to_open": to_open, "unconfirmed": len(to_open), "trashed": trashed,
             "unreadable": unreadable}
+
+
+def summary_block(res, written) -> dict:
+    """The same counts for recovery.json and --json."""
+    s = summarize(res, written)
+    return {"recovered_and_checked": s["total"], "by_type": s["counts"], "saved_to_open_and_check": s["unconfirmed"],
+            "partly_recovered": s["partial"], "rebuilt_from_pieces": s["reassembled"],
+            "kept_original_names": s["named"], "from_card_trash": s["trashed"],
+            "listed_but_overwritten": len(s["lost"])}
 
 
 def headline(s: dict) -> str:
@@ -81,11 +114,16 @@ def headline(s: dict) -> str:
                            ("audio", "audio file", "audio files"), ("document", "document", "documents"), ("other", "other file", "other files")):
         if c[key]:
             parts.append("%d %s" % (c[key], one if c[key] == 1 else many))
+    n = s.get("unconfirmed", 0)
     if not parts:
+        if n:
+            return "%d file%s saved that you should open to make sure" % (n, "" if n == 1 else "s")
         return "Nothing recoverable was found"
-    if len(parts) > 1:
-        return ", ".join(parts[:-1]) + " and " + parts[-1] + " recovered"
-    return parts[0] + " recovered"
+    head = (", ".join(parts[:-1]) + " and " + parts[-1]) if len(parts) > 1 else parts[0]
+    head += " recovered"
+    if n:
+        head += "; %d more saved that you should open to make sure" % n
+    return head
 
 
 CSS = """
@@ -120,6 +158,31 @@ footer{margin-top:48px;color:var(--muted);font-size:13px}
 """
 
 
+def _chip(r, table: bool = False) -> str:
+    """The badge: the file's status first, then how it came back."""
+    e = html.escape
+    st = standing(r)
+    note = r.note or ""
+    if st == "partial":
+        return "<span class='chip warn' title='%s'>partial</span>" % e(note, quote=True)
+    if st == "damaged":
+        return "<span class='chip bad' title='%s'>damaged</span>" % e(note, quote=True)
+    if st == "open":
+        return "<span class='chip warn' title='%s'>open it to check</span>" % e(note, quote=True)
+    if st == "whole":
+        return "<span class='chip'>copied as it was</span>"
+    if r.meta.get("reassembled_from"):
+        return "<span class='chip ok'>rebuilt from %d pieces</span>" % r.meta["reassembled_from"]
+    if r.meta.get("trash"):
+        return "<span class='chip ok'>was in the card's trash</span>"
+    if table:
+        cls = "chip ok" if check_strength(r) == "full" else "chip"
+        return "<span class='%s'>%s</span>" % (cls, e(note or "checked"))
+    if check_strength(r) != "full":
+        return "<span class='chip'>%s</span>" % e(note or "structure checked")
+    return ""
+
+
 def write_html(res, written, out_dir: str) -> str:
     s = summarize(res, written)
     e = html.escape
@@ -143,6 +206,8 @@ def write_html(res, written, out_dir: str) -> str:
         stats.append((s["reassembled"], "rebuilt from scattered pieces"))
     if s["trashed"]:
         stats.append((s["trashed"], "were in the card's trash folder"))
+    if s["unconfirmed"]:
+        stats.append((s["unconfirmed"], "saved, but open them to make sure"))
     if s["partial"]:
         stats.append((s["partial"], "partly recovered"))
     out.append("<div class='stats'>" + "".join("<div class='stat'><b>%d</b><span>%s</span></div>" % (n, e(t))
@@ -167,19 +232,7 @@ def write_html(res, written, out_dir: str) -> str:
             rel = os.path.relpath(r.meta["written_to"], out_dir)
             src = _thumb(r.meta["written_to"], r.kind, r.status in ("partial", "corrupt")) if shown < MAX_THUMBS else None
             shown += 1
-            chip = ""
-            if r.meta.get("reassembled_from"):
-                chip = "<span class='chip ok'>rebuilt from %d pieces</span>" % r.meta["reassembled_from"]
-            elif r.status == "partial":
-                chip = "<span class='chip warn'>partial</span>"
-            elif r.status == "corrupt":
-                chip = "<span class='chip bad'>damaged</span>"
-            elif r.status == "unverified":
-                chip = "<span class='chip warn'>not checked</span>"
-            elif r.meta.get("trash"):
-                chip = "<span class='chip ok'>was in the card's trash</span>"
-            elif r.meta.get("check") == "structure":
-                chip = "<span class='chip'>structure checked</span>"
+            chip = _chip(r)
             img = ("<img loading='lazy' alt='' src='%s'>" % src) if src else "<div class='ph'>%s</div>" % e(
                 (r.ext or "").upper().lstrip("."))
             out.append("<figure><a href='%s'>%s%s</a><figcaption>%s</figcaption></figure>" % (
@@ -192,11 +245,7 @@ def write_html(res, written, out_dir: str) -> str:
                    "<tr><th>File</th><th>Size</th><th>Check</th></tr>" % len(others))
         for r in others:
             rel = os.path.relpath(r.meta["written_to"], out_dir)
-            if r.status == "ok":
-                chip = ("<span class='chip ok'>checksums verified</span>" if r.meta.get("check") == "full"
-                        else "<span class='chip'>structure checked</span>")
-            else:
-                chip = "<span class='chip warn'>not checked</span>"
+            chip = _chip(r, table=True)
             out.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (e(rel), _human(r.size), chip))
         out.append("</table></div>")
     if s["lost"]:
@@ -239,7 +288,14 @@ def text_summary(res, written, out_dir: str) -> str:
         lines.append("  %d were never deleted: the computer can't open the card because its start is damaged, "
                      "so they were copied too." % s["unreadable"])
     if s["unconfirmed"]:
-        lines.append("  %d could not be fully checked; open them to make sure they look right." % s["unconfirmed"])
+        lines.append("  %d were saved but couldn't be proven whole; open them to make sure they look right:"
+                     % s["unconfirmed"])
+        show = 20
+        for r in s["to_open"][:show]:
+            rel = os.path.relpath(r.meta["written_to"], out_dir) if r.meta.get("written_to") else (r.name or "?")
+            lines.append("    %s: %s" % (rel, r.note or "not checked"))
+        if len(s["to_open"]) > show:
+            lines.append("    ... and %d more (report.html lists them all)" % (len(s["to_open"]) - show))
     if s["partial"]:
         lines.append("  %d could only be partly recovered (in 'Partly recovered')." % s["partial"])
     if s["lost"]:

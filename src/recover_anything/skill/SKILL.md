@@ -38,7 +38,10 @@ the source read-only. If it's not installed:
 recover-anything devices
 ```
 Cards show up as removable with a size that matches the card. Confirm with the
-person ("the 64 GB SanDisk card?") before going further. Device paths:
+person ("the 64 GB SanDisk card?") before going further. A camera or phone plugged
+in by its USB cable is not a disk and can't be scanned (`devices` says so when it
+sees one): ask them to take the card out and use a card reader. A phone with no
+card slot keeps photos in its own storage, which can't be scanned; go to step 5. Device paths:
 Linux `/dev/sdb` or `/dev/mmcblk0`; macOS `/dev/rdisk4` (use the *r* form, it's
 faster); Windows `\\.\PhysicalDrive2`. Reading a raw device needs admin rights:
 `sudo` on macOS/Linux, an Administrator terminal on Windows. If triage says the card
@@ -51,7 +54,11 @@ the card's folder (`/Volumes/NO NAME` is refused for a reason).
 sudo recover-anything triage /dev/rdisk4
 ```
 Relay the verdict in plain words: what it is, the odds, and the don'ts. If the verdict
-is `ssd-trim`, `encrypted` or `empty`, go to step 5 (hunt) instead of promising a scan.
+is `ssd-trim`, `encrypted` or `erased` (the drive still lists deleted files but has
+already blanked them), go to step 5 (hunt) instead of promising a scan. `sparse` means
+most of the card is blank but data is still at its start, where cameras write first:
+recover. `empty` means even that is blank; on a memory card or USB stick, still run
+`recover` (it only reads), then hunt.
 If triage reports files in the card's trash folder (verdict `in-card-trash` when the rest
 of the card is blank), they were deleted on a computer but are still whole: recover them.
 If it says the computer can't open the card (verdict `card-unopenable`, or files "still
@@ -66,7 +73,12 @@ sudo recover-anything recover /dev/rdisk4 -o ~/Desktop/Recovered
 - It images the card first when there's room (safest for failing cards), then works
   from the copy. `--direct` reads the card directly (still read-only).
 - `--only photos,videos` narrows it. `--include-live` also copies files still visible.
-- `--json` gives machine-readable output if you want to parse results.
+- `--json` gives machine-readable output if you want to parse results: the result on
+  stdout (with a `summary` and a `to_open_and_check` list), progress as JSON lines on stderr.
+- A big card takes a long time (hours for hundreds of GB). Run it in the background and
+  read its progress: without a terminal it prints each stage and a line every 30 seconds
+  with how far it is and the time left. If it needs `sudo` and you can't enter a password,
+  give the person the exact command to run in their own terminal.
 - Reading the card runs at the card's speed. Checking photos block by block is CPU work
   (about 1.5 MB/s per core, spread over all cores). Deleted and rebuilt photos are always
   checked in full; `--fast` skips that and labels them to open and check instead.
@@ -84,7 +96,8 @@ is checked; anything not fully verified is labeled ("partial", "not checked").
 ### 4. Report back
 Open or point them to `report.html` in the output folder. Tell them the headline
 ("63 photos and 1 video came back, all with original names") and anything partial or
-lost, honestly. Then: check a few files, back the folder up somewhere else, and only
+lost, honestly. Files listed as "saved that you should open to make sure" are saved but
+not proven whole: name them and ask the person to open each one. Then: check a few files, back the folder up somewhere else, and only
 then format the card **in the camera**.
 
 ### 5. Hunt for other copies

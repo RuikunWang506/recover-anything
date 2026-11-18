@@ -69,7 +69,8 @@ Each card is a 4 GB SD card image with 32 KB clusters; each run takes 20 to 30 s
 - **Files still in the card's hidden trash come back too.** Deleting from a card on a Mac, a Linux PC or (for USB drives) Windows moves files into a hidden trash folder on the card itself, still whole. An Android phone's gallery keeps deleted photos on the card for 30 days, hidden under a new name. Recover Anything copies them back by default, under their original names, and `triage` tells you they're there.
 - **Original names survive a format.** A quick format wipes the file table but usually leaves folders like `DCIM/100CANON` sitting in the data area. Recover Anything finds them, so you get `IMG_0042.JPG` back instead of `f12345678.jpg`.
 - **Every file is checked, and the report says how.** Photos are decoded block by block. H.264/HEVC videos have every frame's position and header checked against their own index, and iPhone photos (HEIC) every tile's. PNG, ZIP and Office files have their checksums verified. PDF objects and compressed streams, AVI frames and GIF pictures are checked too. Formats whose contents can't be checked (a RAW's sensor data, WAV) only count as recovered if they were never deleted; otherwise they're saved and labeled. Anything incomplete or damaged goes to a separate *Partly recovered* folder with a label, rather than being dropped.
-- **Honest odds.** `triage` tells you up front when recovery is unlikely: internal SSDs with TRIM, encrypted volumes, cards that were fully erased.
+- **Honest odds.** `triage` tells you up front when recovery is unlikely: internal SSDs with TRIM, drives that already blanked the deleted files, encrypted volumes (APFS volumes are read for their own encryption flag; Android "phone storage" cards and VeraCrypt-style disks are recognized), cards that were fully erased. A formatted card whose photos sit at its start isn't called erased: triage reads the start of the card, where cameras write first. A phone or camera plugged in by USB isn't a disk; `devices` says to take the card out and use a card reader.
+- **The report doesn't oversell.** The headline counts only files whose check passed ("60 photos recovered; 2 more saved that you should open to make sure"), each badge comes from the file's status first, and the files to open are listed in the terminal, in `recovery.json` and in `--json`. Without a terminal, a long run prints a progress line every 30 seconds with the time left (JSON lines with `--json`).
 - **It looks everywhere else too.** When the bytes are gone, `hunt` searches the other places a copy can survive (see below).
 
 ## When an AI agent (or `rm -rf`) deleted your files
@@ -119,7 +120,7 @@ flowchart LR
 | Command | What it does |
 |---|---|
 | `recover-anything devices` | List disks and cards, mark which one is your system disk |
-| `recover-anything triage SOURCE` | Identify the filesystem, sample how much data is still there, give honest odds and the don'ts |
+| `recover-anything triage SOURCE` | Identify the filesystem, check how much data is still there (the start of the card in full, the rest by sampling), give honest odds and the don'ts |
 | `recover-anything image SOURCE card.img` | Make a read-only copy first (uses GNU ddrescue when installed, otherwise skips and logs unreadable sectors) |
 | `recover-anything recover SOURCE -o DIR` | Find, check, rebuild and save everything. `--only photos,videos`, `--include-live`, `--direct`, `--fast`, `--deep`, `--json` |
 | `recover-anything hunt [QUERY]` | Look for surviving copies elsewhere. `--project DIR`, `--save DIR`, `--json` |

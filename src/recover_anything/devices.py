@@ -920,3 +920,104 @@ def describe(path: str) -> dict | None:
 def mounts_of(path: str) -> list[str]:
     d = describe(path)
     return list(d.get("mounted_at") or []) if d else []
+
+
+# ------------------------------------------------- phones and cameras by USB
+# Most cameras and phones plugged in by USB don't show up as a disk: they talk
+# PTP (the still-image class, USB class 6) or MTP (Android; a vendor-specific
+# interface named "MTP"). Nothing can read their deleted files that way, so
+# say so instead of showing nothing.
+USB_CAMERA_ADVICE = (
+    "%s is plugged in as a phone or camera, not as a disk, so its deleted files can't be read this way. "
+    "If it has a memory card, take the card out and put it in a card reader, then run 'recover-anything devices' "
+    "again. A phone without a card slot keeps photos in its own storage, which no computer can scan: check its "
+    "trash (Google Photos or the gallery's Recently deleted, iCloud's Recently Deleted) and run "
+    "'recover-anything hunt' for copies on this computer.")
+
+
+def _is_mtp_ptp(cls, name: str) -> bool:
+    try:
+        cls = int(cls, 16) if isinstance(cls, str) else int(cls)
+    except (TypeError, ValueError):
+        cls = None
+    return cls == 6 or "MTP" in (name or "").upper().split()
+
+
+def _mac_usb_cameras(tree) -> list[dict]:
+    """From `ioreg -a -r -c IOUSBHostDevice -l`: devices with a PTP or MTP interface."""
+    out = []
+
+    def interfaces(n):
+        for c in n.get("IORegistryEntryChildren") or []:
+            if "bInterfaceClass" in c:
+                yield c
+            yield from interfaces(c)
+
+    for d in tree or []:
+        if any(_is_mtp_ptp(i.get("bInterfaceClass"), i.get("USB Interface Name") or i.get("kUSBString") or "")
+               for i in interfaces(d)):
+            name = d.get("USB Product Name") or d.get("kUSBProductString") or d.get("IORegistryEntryName") or "A device"
+            out.append({"model": name, "vendor": d.get("USB Vendor Name") or d.get("kUSBVendorString") or ""})
+    return out
+
+
+def _linux_usb_cameras(root: str = "/sys/bus/usb/devices") -> list[dict]:
+    """From sysfs: a USB device whose interface (DEV:CONFIG.N) is class 06 or named MTP."""
+    out, seen = [], set()
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for n in names:
+        if ":" not in n:
+            continue
+        p = os.path.join(root, n)
+
+        def rd(f, base=p):
+            try:
+                with open(os.path.join(base, f), encoding="utf-8", errors="replace") as fh:
+                    return fh.read().strip()
+            except OSError:
+                return ""
+        if not _is_mtp_ptp(rd("bInterfaceClass"), rd("interface")):
+            continue
+        dev = n.split(":")[0]
+        if dev in seen:
+            continue
+        seen.add(dev)
+        d = os.path.join(root, dev)
+        out.append({"model": rd("product", d) or "A device", "vendor": rd("manufacturer", d)})
+    return out
+
+
+def _win_usb_cameras(raw: str) -> list[dict]:
+    """From Get-PnpDevice -Class WPD (phones, media players and cameras). A USB
+    stick's volume is listed there too (SWD\\WPDBUSENUM\\..USBSTOR..): only
+    entries that are a USB device themselves are phones or cameras."""
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        return []
+    if isinstance(items, dict):
+        items = [items]
+    return [{"model": x.get("FriendlyName") or "A device", "vendor": x.get("Manufacturer") or ""}
+            for x in items or [] if isinstance(x, dict) and str(x.get("InstanceId") or "").upper().startswith("USB\\")]
+
+
+def usb_cameras() -> list[dict]:
+    """Phones and cameras connected by USB as MTP/PTP devices (not as disks)."""
+    try:
+        if sys.platform == "darwin":
+            raw = _run(["ioreg", "-a", "-r", "-c", "IOUSBHostDevice", "-l"])
+            return _mac_usb_cameras(plistlib.loads(raw.encode())) if raw.strip() else []
+        if sys.platform.startswith("linux"):
+            return _linux_usb_cameras()
+        if sys.platform == "win32":
+            return _win_usb_cameras(_run(["powershell", "-NoProfile", "-Command",
+                                          "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                                          "Get-PnpDevice -Class WPD -PresentOnly -ErrorAction SilentlyContinue | "
+                                          "Select-Object FriendlyName,Manufacturer,InstanceId | ConvertTo-Json -Compress"],
+                                         timeout=40))
+    except Exception:
+        pass
+    return []

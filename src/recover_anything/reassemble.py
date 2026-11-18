@@ -534,7 +534,11 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
                 for c in claimed:
                     blocked[c] = 1 if strict else 0
                 progress_made = False
-                for r in list(todo):
+                pass_list = list(todo)
+                for k, r in enumerate(pass_list):
+                    if progress:
+                        # every attempt counts: the slow ones are those that fail
+                        progress(k, len(pass_list))
                     head = heads[id(r)]
                     kept = [c for c, who in trusted.items() if who == id(r)]
                     for c in head:
@@ -588,8 +592,6 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
                             todo.remove(r)
                             progress_made = any_progress = True
                             done[0] += 1
-                            if progress:
-                                progress(done[0], len(broken))
                 idle = 0 if progress_made else idle + 1
                 if not todo or idle >= 2:
                     break
