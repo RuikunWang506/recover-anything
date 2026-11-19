@@ -9,7 +9,7 @@ Status on 19 November 2026. It began as the handoff from the cloud build session
 - **CI:** green on all five jobs: the tests on Ubuntu with Python 3.9 and on Ubuntu, macOS and Windows with 3.13, plus a job that builds the package and runs the installed wheel. On the latest Ubuntu, a step also checks the NTFS reader on a real NTFS volume (`tests/test_ntfs_real.py`).
 - **Self-test:** every file recovered byte for byte on all 7 simulated cards: FAT32 and exFAT; deleted, formatted, formatted then reused, and heavily fragmented.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
-- **Released:** 0.1.0 (12 November 2026), 0.2.0 and 0.2.1 (18 November 2026) on PyPI, each with a release page on GitHub. `pipx install recover-anything` gets the latest.
+- **Released:** 0.1.0 (12 November 2026), 0.2.0 and 0.2.1 (18 November 2026), and 0.2.2 (19 November 2026) on PyPI, each with a release page on GitHub. `pipx install recover-anything` gets the latest.
 - **Not done yet:**
   - It has never been run on a physical card.
 
@@ -124,7 +124,7 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 - **Odds that misled:** APFS volumes are read for their own encryption flag (`fs/apfs.py`; the test fixtures are real containers from `diskutil`: plain, encrypted, mixed), so only encrypted ones are called encrypted and skipped. Deleted files whose first clusters are blank give the `erased` verdict (TRIM on a USB SSD used to get "Good news"). Android "phone storage" cards (GPT `android_expand`) and filesystem-less disks of noise (VeraCrypt) are called encrypted; a disk of photos isn't, because photos start at cluster boundaries and their data has JPEG's byte stuffing (2 of 413 real JPEG blocks pass as noise; 90% is needed). An SSD over USB lowers "good" to "fair" with a warning when there's no deleted file to check.
 - **Long runs don't look frozen.** Without a terminal, each stage prints once and then a line every 30 seconds with done/total and the time left; `--json` prints the same as JSON lines on stderr. Rebuilding ticks on every attempt (it moved only on a success, so it sat at 75% for most of a run), and the check stage gives an estimate up front for big cards ("up to about 10 minutes for 3.6 GB of photos" on 4 cores).
 
-## Added on 19 November 2026 (Phase 2 begun: files marked recovered but wrong, and speed)
+## Added on 19 November 2026 (Phase 2 begun, pull request 19, released as 0.2.2: files marked recovered but wrong, and speed)
 
 - **Eight ways a file was marked recovered with the wrong bytes, all in 0.2.1, all fixed** (each with a test that fails on 0.2.1). Earlier checks used only seeds 1-4 per kind; `tools/eval_cards.py one KIND` on seeds 1-60 found these. On the 32 card sets checked for this change, 0.2.1 marks 7 files wrong; now 0.
   - **Dashcam recordings (TS):** a leftover packet of the deleted clip whose clusters a new one reuses lines up with it, and the walk stopping at the next leftover's clock jump counted as the end (`_unit_follows`); a 0x47 byte of another file where a packet would start, with a stream number (PID) the recording's tables never listed, passed because a new PID has no counter (`more.ts_pid_ok`).
