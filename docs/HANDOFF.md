@@ -1,11 +1,11 @@
 # Handoff: Recover Anything
 
-Status on 18 November 2026. It began as the handoff from the cloud build session. The project rules and the code map are in `CLAUDE.md`, so they aren't repeated here.
+Status on 19 November 2026. It began as the handoff from the cloud build session. The project rules and the code map are in `CLAUDE.md`, so they aren't repeated here.
 
 ## Where things stand
 
 - **Repo:** github.com/RuikunWang506/recover-anything, branch `main`, public since 9 November 2026. Changes reach `main` through pull requests, which need all five CI jobs to pass.
-- **Size:** about 16,200 lines of Python in `src/` and 256 tests.
+- **Size:** about 16,700 lines of Python in `src/` and 276 tests.
 - **CI:** green on all five jobs: the tests on Ubuntu with Python 3.9 and on Ubuntu, macOS and Windows with 3.13, plus a job that builds the package and runs the installed wheel. On the latest Ubuntu, a step also checks the NTFS reader on a real NTFS volume (`tests/test_ntfs_real.py`).
 - **Self-test:** every file recovered byte for byte on all 7 simulated cards: FAT32 and exFAT; deleted, formatted, formatted then reused, and heavily fragmented.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
@@ -123,6 +123,18 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
 - **Phones and cameras plugged in by USB** (PTP/MTP) are reported by `devices` with card-reader advice (`devices.usb_cameras`: IORegistry, sysfs, Windows WPD minus USB sticks' volumes). Parsers are tested on recorded shapes; no real phone or camera has been plugged in yet.
 - **Odds that misled:** APFS volumes are read for their own encryption flag (`fs/apfs.py`; the test fixtures are real containers from `diskutil`: plain, encrypted, mixed), so only encrypted ones are called encrypted and skipped. Deleted files whose first clusters are blank give the `erased` verdict (TRIM on a USB SSD used to get "Good news"). Android "phone storage" cards (GPT `android_expand`) and filesystem-less disks of noise (VeraCrypt) are called encrypted; a disk of photos isn't, because photos start at cluster boundaries and their data has JPEG's byte stuffing (2 of 413 real JPEG blocks pass as noise; 90% is needed). An SSD over USB lowers "good" to "fair" with a warning when there's no deleted file to check.
 - **Long runs don't look frozen.** Without a terminal, each stage prints once and then a line every 30 seconds with done/total and the time left; `--json` prints the same as JSON lines on stderr. Rebuilding ticks on every attempt (it moved only on a success, so it sat at 75% for most of a run), and the check stage gives an estimate up front for big cards ("up to about 10 minutes for 3.6 GB of photos" on 4 cores).
+
+## Added on 19 November 2026 (Phase 2 begun: files marked recovered but wrong, and speed)
+
+- **Eight ways a file was marked recovered with the wrong bytes, all in 0.2.1, all fixed** (each with a test that fails on 0.2.1). Earlier checks used only seeds 1-4 per kind; `tools/eval_cards.py one KIND` on seeds 1-60 found these. On the 32 card sets checked for this change, 0.2.1 marks 7 files wrong; now 0.
+  - **Dashcam recordings (TS):** a leftover packet of the deleted clip whose clusters a new one reuses lines up with it, and the walk stopping at the next leftover's clock jump counted as the end (`_unit_follows`); a 0x47 byte of another file where a packet would start, with a stream number (PID) the recording's tables never listed, passed because a new PID has no counter (`more.ts_pid_ok`).
+  - **MP3, cut short:** a frame whose header fit in its cluster but whose side information ran into the next one (another file's) failed the reservoir check on those bytes, and the stop counted as "ends inside a cluster" (`_Walker.reach`). The same, from the other side: a frame of the same kind right where the walk stopped, turned away only by the reservoir (as files read straight from the card already required).
+  - **MP3, missing its tag:** sound that ends exactly at a cluster boundary, where its Info header says, may have lost the 128-byte ID3v1 tag that followed (`more.mp3_tag_may_follow`).
+  - **MP3, another song inside:** a song with no tag and no Info frame starting at a cluster boundary lines up frame for frame with one whose frame ended exactly there, and its frames passed every check up to the very length the first song's header gave. A frame at a cluster boundary that points 0 bytes back is now treated as a possible join (`more.mp3_unmarked_start`); this costs 6 of 97 songs on mixed cards 1-20 (saved, labelled "check that it plays"). A Xing or Info frame after the first is another song's start (`more.mp3_info_frame`).
+  - **FLAC:** after the last frame nothing confirms where its checksum closes, and over a few kB of another file's frames it closes somewhere by chance (1 byte in 65,536). Its subframes now give its exact length (`more.flac_frame_len`, checked on every frame of real files from Apple's encoder); a frame past the stream's total length is another file's.
+  - **AVI:** index entries pointing at no chunk passed; the start of another video, read where this one's index went on elsewhere, did too (`checks.avi_index_bad`).
+- **2.1 measured properly: carving the next recording after a broken one** gives MP3 cards +48 and TS cards +64 recovered (seeds 1-8 and 41-46), FLAC +2 and AVI +1 from the end fixes. An earlier "no gain" came from comparing a tree with itself: `tools/eval_cards.py` puts its own `src` first, whatever `PYTHONPATH` says, so compare against another tree with that tree's own copy of the tool.
+- **2.2: the video and stream rebuilders find the next usable cluster with one search** (`reassemble_stream.ClusterKinds`: what each cluster holds, judged once per scan; joined with the clusters in use when a rebuild starts). They stepped through free clusters one at a time, again for every video and trial: mixed card 1 (512 MB) went from 118 s to 12 s, card 3 from 25 s to 3 s, with identical results on 11 cards.
 
 ## Tried and dropped
 

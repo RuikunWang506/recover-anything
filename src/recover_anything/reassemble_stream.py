@@ -15,6 +15,7 @@ the folder entry); otherwise it is saved as "check that it plays".
 """
 from __future__ import annotations
 
+import re
 import struct
 import zlib
 
@@ -1309,9 +1310,78 @@ WALKERS = {"mp3": _Mp3, "ts": _Ts, "ogg": _Ogg, "flac": _Flac, "gzip": _Gzip, "z
 
 
 # ------------------------------------------------------------------ the search
+EMPTY, PICTURE, OTHER = 1, 2, 3
+
+
+class ClusterKinds:
+    """What each cluster holds, judged once per scan for every rebuild (the
+    card doesn't change): EMPTY (all zeros), PICTURE (JPEG picture data:
+    every 0xFF in it is followed by 0x00 or a restart marker, the most common
+    leftover on a card, and never a recording's or a video's) or OTHER.
+
+    `unusable(any_cluster)` maps the clusters a file can't continue in, so a
+    rebuilder finds the next candidate with one `find` over that map joined
+    with the clusters in use. It used to step through every free cluster one
+    at a time, again for every video and every trial: 266 of the 284 seconds
+    a 512 MB card took, on long stretches of empty space and photos."""
+
+    CHUNK = 1 << 20
+
+    def __init__(self, src, geom):
+        self.src, self.g = src, geom
+        self.k = bytearray(geom.last_cluster + 1)
+        self._unusable: dict = {}
+
+    def unusable(self, any_cluster: bool = False) -> bytearray:
+        """1 for every cluster that can't hold a recording's or video's data
+        (an empty one; JPEG picture data too, unless `any_cluster`)."""
+        m = self._unusable.get(any_cluster)
+        if m is None:
+            g, cs, k = self.g, self.g.cluster_size, self.k
+            per = max(1, self.CHUNK // cs)
+            for c0 in range(g.first_cluster, g.last_cluster + 1, per):
+                n = min(per, g.last_cluster + 1 - c0)
+                if all(k[c0:c0 + n]):
+                    continue
+                data = self.src.read(g.offset(c0), n * cs)
+                for i in range(n):
+                    if not k[c0 + i]:
+                        k[c0 + i] = self.judge(data[i * cs:(i + 1) * cs])
+            bad = (EMPTY,) if any_cluster else (EMPTY, PICTURE)
+            m = bytearray(1 if v in bad or not v else 0 for v in k)
+            self._unusable[any_cluster] = m
+        return m
+
+    def __call__(self, c: int) -> int:
+        v = self.k[c]
+        if not v:
+            v = self.judge(self.src.read(self.g.offset(c), self.g.cluster_size))
+            self.k[c] = v
+        return v
+
+    _LOOSE_FF = re.compile(rb"\xff(?=[^\x00\xd0-\xd7])")  # a 0xFF that JPEG picture data can't hold
+
+    @classmethod
+    def judge(cls, data: bytes) -> int:
+        """JPEG picture data: at least 6 0xFF bytes, each followed by 0x00 or a
+        restart marker, but for at most one (it may end the cluster)."""
+        if data.count(0) == len(data):
+            return EMPTY
+        if data.count(b"\xff") < 6:
+            return OTHER
+        loose = 1 if data[-1:] == b"\xff" else 0
+        for _ in cls._LOOSE_FF.finditer(data):
+            loose += 1
+            if loose > 1:
+                return OTHER
+        return PICTURE
+
+
 class _Rebuild:
-    def __init__(self, src, geom, blocked: bytearray, kind: str, start: int, expected=None, soft=None):
+    def __init__(self, src, geom, blocked: bytearray, kind: str, start: int, expected=None, soft=None,
+                 kinds=None):
         self.src, self.g, self.blocked, self.kind = src, geom, blocked, kind
+        self.kinds = kinds or ClusterKinds(src, geom)
         self.soft = soft  # clusters of files saved but not proven: tried only after the free ones
         self.trials = 0
         self.cs, self.lastc = geom.cluster_size, geom.last_cluster
@@ -1322,38 +1392,23 @@ class _Rebuild:
         self.w.grain = self.cs
         self.pieces_tried = 0
         self.ambiguous = False
-        self._plaus: dict = {}
+        self.any_cluster = getattr(self.w, "any_cluster", False)
+        from .reassemble import _or
+        # (the clusters in use don't change during one rebuild)
+        self.free = _or(blocked, self.kinds.unusable(self.any_cluster))
+        self.free_soft = _or(self.free, soft) if soft is not None else self.free
 
     def limit(self):
         n = len(self.path) * self.cs
         return min(n, self.expected) if self.expected else n
 
     def next_free(self, c, taken, skip_soft=False):
+        m = self.free_soft if skip_soft else self.free
         while True:
-            n = self.blocked.find(0, c + 1, self.lastc + 1)
-            if n < 0:
-                return None
-            if n not in taken and self.plausible(n) and not (skip_soft and self.soft is not None and self.soft[n]):
-                return n
+            n = m.find(0, c + 1, self.lastc + 1)
+            if n < 0 or n not in taken:
+                return None if n < 0 else n
             c = n
-
-    def plausible(self, c) -> bool:
-        """Could this cluster be part of a recording or archive? An empty one
-        can't, and neither can JPEG picture data (every 0xFF in it is followed
-        by 0x00 or a restart marker), the most common leftover on a card."""
-        v = self._plaus.get(c)
-        if v is None:
-            data = self.src.read(self.g.offset(c), self.cs)
-            if data.count(0) == len(data):
-                v = False
-            elif getattr(self.w, "any_cluster", False):
-                v = True
-            else:
-                ffs = data.count(b"\xff")
-                ok_pairs = data.count(b"\xff\x00") + sum(data.count(bytes([0xFF, m])) for m in range(0xD0, 0xD8))
-                v = not (ffs >= 6 and ok_pairs >= ffs - 1)
-            self._plaus[c] = v
-        return v
 
     def _prefix(self, n):
         return self.path[:(n + self.cs - 1) // self.cs], n
@@ -1504,8 +1559,9 @@ def rb_start_marked(src, geom, clusters, length, kind) -> bool:
     return w.start_marked
 
 
-def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=None, soft=None) -> int:
+def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=None, soft=None, kinds=None) -> int:
     from .reassemble import own_clusters
+    kinds = kinds or ClusterKinds(src, geom)
     done = 0
     for r in records:
         start = geom.cluster_at(r.start)
@@ -1514,7 +1570,7 @@ def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=Non
         rb = None
         try:
             with own_clusters(geom, soft, r):
-                rb = _Rebuild(src, geom, blocked, r.kind, start, r.expected_size, soft)
+                rb = _Rebuild(src, geom, blocked, r.kind, start, r.expected_size, soft, kinds)
                 out = rb.run()
         except Exception:
             out = None
