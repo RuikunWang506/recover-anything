@@ -86,7 +86,10 @@ def identify(head: bytes):
 
 
 def measure(src, kind: str, start: int, limit: int):
-    """Return (length, complete, ext, reason, break_pos) for a file at `start`."""
+    """Return (length, complete, ext, reason, break_pos, jpeg header) for a
+    file at `start`. For a stream, `measure.last` is then where its last
+    checked frame or packet starts (None otherwise)."""
+    measure.last = None
     read = src.read
     mx = dict((k, m) for k, _, m, _ in FORMATS)[kind]
     limit = min(limit, mx)
@@ -98,6 +101,7 @@ def measure(src, kind: str, start: int, limit: int):
           "tiff": others.measure_tiff, "riff": others.measure_riff, "pdf": others.measure_pdf,
           "zip": others.measure_zip}.get(kind) or more.KINDS[kind][1]
     r = fn(read, start, limit)
+    measure.last = r.last
     return r.end, r.complete, r.ext, r.reason, r.break_pos, None
 
 
@@ -202,7 +206,11 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
     # files' data; it doesn't count as "a file starts here" for rebuilding.
     sure = [(off, kind) for off, kind, weak in found if not weak]
     starts = [h[0] for h in headers]
-    inside: dict = {}  # stream kind -> end of the last one measured
+    # stream kind -> how far the last one measured certainly reaches: its end,
+    # or, when it stopped early, the start of its last checked frame. A
+    # recording broken by fragmentation ends inside a frame that runs on into
+    # the next file, so the next recording's header may lie inside that frame.
+    inside: dict = {}
     known_spans = list(inside_known)
     ks = [k[0] for k in known_spans]
     for idx, (off, kind) in enumerate(headers):
@@ -227,7 +235,8 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
         if length <= 0:
             continue
         if kind in more.STREAMS:
-            inside[kind] = off + length
+            last = getattr(measure, "last", None)
+            inside[kind] = off + last if not complete and last is not None and kind != "pdf" else off + length
         if kinds and group_of(kind, ext) not in kinds:
             continue
         if kind != "jpeg" and not complete and length < 4096:
