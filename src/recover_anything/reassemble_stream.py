@@ -15,6 +15,7 @@ the folder entry); otherwise it is saved as "check that it plays".
 """
 from __future__ import annotations
 
+import re
 import struct
 import zlib
 
@@ -62,6 +63,7 @@ class _Walker:
     first_choice = False  # a tie only counts where the join is the first cluster the file could go on in
     ends_known = False  # it decides where it ends itself: no "it stops inside a cluster, so that's its end"
     weak = ()       # (start, end) stretches nothing checks: a join inside one proves nothing
+    reach = None    # after 'bad': the end of the bytes read to decide it, when past pos + need
 
     def __init__(self, read, expected=None):
         self.read, self.expected = read, expected
@@ -145,13 +147,19 @@ class _Mp3(_Walker):
                 self.end = self.pos
                 return "end"
             f = more.mp3_frame(head[:4])
+            self.reach = None
             if f is None or (self.key is not None and f[1] != self.key):
                 self.unit = self.last if self.last is not None else self.pos
                 return "bad"
             n, k = f
-            if self.pos + 40 > limit:
+            if self.pos + 42 > limit:
                 return "need"
-            side = more.mp3_side(read(self.pos, 40), n)
+            h42 = read(self.pos, 42)
+            if self.key is not None and more.mp3_info_frame(h42):
+                self.unit = self.last
+                self.reach = self.pos + 42
+                return "bad"  # another song's first frame
+            side = more.mp3_side(h42, n)
             mdb = None
             if side is not None:
                 res = more.Reservoir()
@@ -159,6 +167,7 @@ class _Mp3(_Walker):
                 verdict = res.step(side)
                 if verdict == "bad":
                     self.unit = self.last if self.last is not None else self.pos
+                    self.reach = self.pos + more.mp3_side_end(head)  # (what failed may lie past this cluster)
                     return "bad"  # a frame of another recording: its data can't be where it points
                 mdb = side[0]
             else:
@@ -201,6 +210,7 @@ class _Ts(_Walker):
         self.stride, self.off = lay
         self.need = self.off + 4
         self.pos, self.cc, self.firsts = 0, {}, []
+        self.seen, self.pmts, self.listed = set(), set(), set()
         self.start_marked = False
         self.clock = more.TsClock()
         self.n = 0
@@ -232,6 +242,9 @@ class _Ts(_Walker):
             pid = ((p[1] & 0x1F) << 8) | p[2] if len(p) >= 4 else 0
             afc, c = ((p[3] >> 4) & 3, p[3] & 15) if len(p) >= 4 else (0, 0)
             bad = len(p) < 4 or p[0] != 0x47 or p[1] & 0x80 or afc == 0
+            if not bad and not more.ts_pid_ok(read(self.pos + off, stride - off), self.n, self.seen, self.pmts,
+                                              self.listed):
+                bad = True
             if not bad and pid != 0x1FFF and afc & 1:
                 prev = self.cc.get(pid)
                 disc = afc & 2 and len(p) >= 6 and p[4] > 0 and p[5] & 0x80
@@ -326,6 +339,7 @@ class _Flac(_Walker):
         self.min_fs = int.from_bytes(info[4:7], "big")
         self.max_fs = int.from_bytes(info[7:10], "big") or (1 << 20)
         self.total = ((info[13] & 15) << 32) | int.from_bytes(info[14:18], "big")
+        self.bps = more.flac_bps(info)
         self.pos, self.samples, self.index = pos, 0, 0
         self.hdr = None  # (block size, header length, variable) of the frame at pos
         self.crc, self.i, self.seek = 0, 0, 0  # checksum so far, how far it got, where to look for the next header
@@ -342,23 +356,26 @@ class _Flac(_Walker):
                 var = h16[1:2] == b"\xf9"
                 if hd is None or hd[1] != (self.samples if var else self.index):
                     return "bad"
+                if self.total and self.samples + hd[0] > self.total:
+                    return "bad"  # past the end the file gives: another file's frame (as more.measure_flac)
                 self.hdr, self.crc, self.i, self.seek = (hd[0], hd[2], var), 0, 0, hd[2] + 2
             bs, hlen, var = self.hdr
-            last = self.total and self.samples + bs >= self.total
+            last = self.total and self.samples + bs == self.total
             avail = min(limit - self.pos, self.max_fs + 2 + 16)
             data = read(self.pos, avail)
             if last:
-                # nothing follows the last frame: find where its checksum closes
-                crc, i = self.crc, self.i
-                lo = max(hlen + 3, self.min_fs)
-                for b in data[i:]:
+                # Nothing follows the last frame: its subframes give its length,
+                # and its checksum must close exactly there (as more.measure_flac).
+                n = more.flac_frame_len(data, hlen, bs, self.bps)
+                if n is None:
+                    return "bad" if avail >= self.max_fs + 2 else "need"
+                crc = 0
+                for b in data[:n]:
                     crc = ((crc << 8) & 0xFFFF) ^ tab[(crc >> 8) ^ b]
-                    i += 1
-                    if crc == 0 and i >= lo:
-                        self.end = self.pos + i
-                        return "end"
-                self.crc, self.i = crc, i
-                return "bad" if i >= self.max_fs + 2 else "need"
+                if crc:
+                    return "bad"
+                self.end = self.pos + n
+                return "end"
             # Otherwise the frame ends right before the next frame's header:
             # look for that first (fast), check the checksum only there.
             sync = b"\xff\xf9" if var else b"\xff\xf8"
@@ -899,6 +916,8 @@ class _Avi(_Walker):
                     self._streams(read(body + 4, size - 4))
                 elif h[8:12] == b"movi":
                     self.movi = body
+                elif h[8:12] == b"rec ":
+                    self.chunks[self.pos] = (fourcc, size)  # (the index lists these groups too)
                 self.pos = body + 4  # walk into the list
                 continue
             kind = fourcc[2:4]
@@ -953,16 +972,8 @@ class _Avi(_Walker):
             p += 8 + size + (size & 1)
 
     def _index(self, idx: bytes) -> bool:
-        base = None
-        for k in range(0, len(idx) - 15, 16):
-            ck, _flags, off, size = struct.unpack("<4sIII", idx[k:k + 16])
-            if base is None:  # offsets count from the 'movi' fourcc (or just after it), or from the start
-                base = next((b for b in (self.movi or 0, (self.movi or 0) + 4, 0) if b + off in self.chunks), None)
-                if base is None:
-                    return False
-            if self.chunks.get(base + off, (ck, size)) != (ck, size):
-                return False
-        return True
+        from .formats.checks import avi_index_bad
+        return avi_index_bad(idx, self.chunks, self.movi or 0, True) is None
 
     def proven_end(self):
         return self.end is not None
@@ -1299,9 +1310,78 @@ WALKERS = {"mp3": _Mp3, "ts": _Ts, "ogg": _Ogg, "flac": _Flac, "gzip": _Gzip, "z
 
 
 # ------------------------------------------------------------------ the search
+EMPTY, PICTURE, OTHER = 1, 2, 3
+
+
+class ClusterKinds:
+    """What each cluster holds, judged once per scan for every rebuild (the
+    card doesn't change): EMPTY (all zeros), PICTURE (JPEG picture data:
+    every 0xFF in it is followed by 0x00 or a restart marker, the most common
+    leftover on a card, and never a recording's or a video's) or OTHER.
+
+    `unusable(any_cluster)` maps the clusters a file can't continue in, so a
+    rebuilder finds the next candidate with one `find` over that map joined
+    with the clusters in use. It used to step through every free cluster one
+    at a time, again for every video and every trial: 266 of the 284 seconds
+    a 512 MB card took, on long stretches of empty space and photos."""
+
+    CHUNK = 1 << 20
+
+    def __init__(self, src, geom):
+        self.src, self.g = src, geom
+        self.k = bytearray(geom.last_cluster + 1)
+        self._unusable: dict = {}
+
+    def unusable(self, any_cluster: bool = False) -> bytearray:
+        """1 for every cluster that can't hold a recording's or video's data
+        (an empty one; JPEG picture data too, unless `any_cluster`)."""
+        m = self._unusable.get(any_cluster)
+        if m is None:
+            g, cs, k = self.g, self.g.cluster_size, self.k
+            per = max(1, self.CHUNK // cs)
+            for c0 in range(g.first_cluster, g.last_cluster + 1, per):
+                n = min(per, g.last_cluster + 1 - c0)
+                if all(k[c0:c0 + n]):
+                    continue
+                data = self.src.read(g.offset(c0), n * cs)
+                for i in range(n):
+                    if not k[c0 + i]:
+                        k[c0 + i] = self.judge(data[i * cs:(i + 1) * cs])
+            bad = (EMPTY,) if any_cluster else (EMPTY, PICTURE)
+            m = bytearray(1 if v in bad or not v else 0 for v in k)
+            self._unusable[any_cluster] = m
+        return m
+
+    def __call__(self, c: int) -> int:
+        v = self.k[c]
+        if not v:
+            v = self.judge(self.src.read(self.g.offset(c), self.g.cluster_size))
+            self.k[c] = v
+        return v
+
+    _LOOSE_FF = re.compile(rb"\xff(?=[^\x00\xd0-\xd7])")  # a 0xFF that JPEG picture data can't hold
+
+    @classmethod
+    def judge(cls, data: bytes) -> int:
+        """JPEG picture data: at least 6 0xFF bytes, each followed by 0x00 or a
+        restart marker, but for at most one (it may end the cluster)."""
+        if data.count(0) == len(data):
+            return EMPTY
+        if data.count(b"\xff") < 6:
+            return OTHER
+        loose = 1 if data[-1:] == b"\xff" else 0
+        for _ in cls._LOOSE_FF.finditer(data):
+            loose += 1
+            if loose > 1:
+                return OTHER
+        return PICTURE
+
+
 class _Rebuild:
-    def __init__(self, src, geom, blocked: bytearray, kind: str, start: int, expected=None, soft=None):
+    def __init__(self, src, geom, blocked: bytearray, kind: str, start: int, expected=None, soft=None,
+                 kinds=None):
         self.src, self.g, self.blocked, self.kind = src, geom, blocked, kind
+        self.kinds = kinds or ClusterKinds(src, geom)
         self.soft = soft  # clusters of files saved but not proven: tried only after the free ones
         self.trials = 0
         self.cs, self.lastc = geom.cluster_size, geom.last_cluster
@@ -1312,38 +1392,23 @@ class _Rebuild:
         self.w.grain = self.cs
         self.pieces_tried = 0
         self.ambiguous = False
-        self._plaus: dict = {}
+        self.any_cluster = getattr(self.w, "any_cluster", False)
+        from .reassemble import _or
+        # (the clusters in use don't change during one rebuild)
+        self.free = _or(blocked, self.kinds.unusable(self.any_cluster))
+        self.free_soft = _or(self.free, soft) if soft is not None else self.free
 
     def limit(self):
         n = len(self.path) * self.cs
         return min(n, self.expected) if self.expected else n
 
     def next_free(self, c, taken, skip_soft=False):
+        m = self.free_soft if skip_soft else self.free
         while True:
-            n = self.blocked.find(0, c + 1, self.lastc + 1)
-            if n < 0:
-                return None
-            if n not in taken and self.plausible(n) and not (skip_soft and self.soft is not None and self.soft[n]):
-                return n
+            n = m.find(0, c + 1, self.lastc + 1)
+            if n < 0 or n not in taken:
+                return None if n < 0 else n
             c = n
-
-    def plausible(self, c) -> bool:
-        """Could this cluster be part of a recording or archive? An empty one
-        can't, and neither can JPEG picture data (every 0xFF in it is followed
-        by 0x00 or a restart marker), the most common leftover on a card."""
-        v = self._plaus.get(c)
-        if v is None:
-            data = self.src.read(self.g.offset(c), self.cs)
-            if data.count(0) == len(data):
-                v = False
-            elif getattr(self.w, "any_cluster", False):
-                v = True
-            else:
-                ffs = data.count(b"\xff")
-                ok_pairs = data.count(b"\xff\x00") + sum(data.count(bytes([0xFF, m])) for m in range(0xD0, 0xD8))
-                v = not (ffs >= 6 and ok_pairs >= ffs - 1)
-            self._plaus[c] = v
-        return v
 
     def _prefix(self, n):
         return self.path[:(n + self.cs - 1) // self.cs], n
@@ -1374,9 +1439,13 @@ class _Rebuild:
                 continue
             # 'bad'. For a stream without an end marker, stopping inside the
             # cluster that holds the last good header is the real end: the
-            # file can't go on elsewhere from the middle of a cluster.
+            # file can't go on elsewhere from the middle of a cluster. Only if
+            # everything read to call the next unit bad is in that cluster too:
+            # an MP3 frame whose header fits but whose side information runs
+            # into the next cluster failed on bytes that may be another file's.
+            seen = max(w.pos + w.need, w.reach or 0)
             if not w.strong and not w.ends_known and self.expected is None and w.pos > w.unit and \
-                    w.unit // self.cs == (w.pos + w.need - 1) // self.cs:
+                    w.unit // self.cs == (seen - 1) // self.cs:
                 w.end = w.pos
                 return self._prefix(w.pos) + (True,)
             self.pieces_tried += 1
@@ -1490,8 +1559,9 @@ def rb_start_marked(src, geom, clusters, length, kind) -> bool:
     return w.start_marked
 
 
-def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=None, soft=None) -> int:
+def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=None, soft=None, kinds=None) -> int:
     from .reassemble import own_clusters
+    kinds = kinds or ClusterKinds(src, geom)
     done = 0
     for r in records:
         start = geom.cluster_at(r.start)
@@ -1500,7 +1570,7 @@ def reassemble_streams(src, geom, blocked: bytearray, records, own, progress=Non
         rb = None
         try:
             with own_clusters(geom, soft, r):
-                rb = _Rebuild(src, geom, blocked, r.kind, start, r.expected_size, soft)
+                rb = _Rebuild(src, geom, blocked, r.kind, start, r.expected_size, soft, kinds)
                 out = rb.run()
         except Exception:
             out = None
@@ -1529,6 +1599,31 @@ def _first_choice(rb, clusters) -> bool:
         if clusters[i] != clusters[i - 1] + 1 and clusters[i] != rb.next_free(clusters[i - 1], set(clusters[:i])):
             return False
     return True
+
+
+def _unit_follows(src, geom, clusters, length: int, kind: str) -> bool:
+    """Right where the walk stopped, inside the same cluster, another packet
+    (or MP3 frame) of this kind starts. Those are leftovers of an older recording in the same
+    place: a dashcam reuses the clusters of the clip it deleted, so the two
+    line up packet for packet, and the walk stopped only at a check one of
+    them failed (a clock jump). That says nothing about where this recording
+    ends: leftover packets just before it may have passed (as the checker of
+    files read straight from the card already knows: `more.validate_ts`)."""
+    cs = geom.cluster_size
+    i, at = divmod(length, cs)
+    if not at or i >= len(clusters):
+        return False
+    tail = src.read(geom.offset(clusters[i]) + at, min(8, cs - at))
+    if kind == "ts":
+        lay = more._ts_layout(_Path(src, geom, clusters).read(0, 1024))
+        off = lay[1] if lay else 0
+        return tail[off:off + 1] == b"\x47"
+    if kind == "ps":
+        return tail[:4] == b"\x00\x00\x01\xba"
+    if kind == "mp3":  # a frame of the same kind that only the reservoir turned away (as more.validate_mp3)
+        f, first = more.mp3_frame(tail[:4]), more._mp3_first(_Path(src, geom, clusters).read)
+        return f is not None and first is not None and f[1] == first[1]
+    return False
 
 
 def _settle(src, geom, blocked, r, rb, out, start, was, own) -> bool:
@@ -1581,10 +1676,18 @@ def _settle(src, geom, blocked, r, rb, out, start, was, own) -> bool:
         # the last frame's body runs into a cluster nothing else confirms
         r.status = "unverified"
         r.note = "rebuilt from %d pieces, but its last frame can't be confirmed; check that it plays" % pieces
+    elif r.kind == "mp3" and more.mp3_unmarked_start(_Path(src, geom, clusters).read, length, 0, cs):
+        r.status, r.note = "unverified", more.UNMARKED
     elif sized:
         r.status, r.note = "ok", "every piece checked"
+    elif r.kind == "mp3" and more.mp3_tag_may_follow(_Path(src, geom, clusters).read, length, length % cs == 0):
+        r.status, r.note = "unverified", more.TAG_MAY_FOLLOW
     elif r.origin == "carved" and not rb_start_marked(src, geom, clusters, length, r.kind):
         r.status, r.note = "unverified", more.NO_START
+    elif _unit_follows(src, geom, clusters, length, r.kind):
+        r.status, r.note = "unverified", ("every frame checked, but another recording's data follows it in "
+                                          "the same place, so its last moments may belong to that one; "
+                                          "check that it plays")
     else:
         r.status, r.note = "ok", "every frame checked; it ends inside a cluster, so nothing is missing"
     if pieces > 1:

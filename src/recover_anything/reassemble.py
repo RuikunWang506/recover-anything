@@ -604,16 +604,18 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
         # its clusters out of the others' way, so try again while that helps.
         pending_v = sorted(videos, key=lambda r: r.start)
         pending_s = sorted(streams, key=lambda r: r.start)
+        from .reassemble_stream import ClusterKinds
+        kinds = ClusterKinds(src, g)  # (each cluster judged once, for every rebuild in every round)
         for _round in range(3):
             soft = soft_map(g, mine, len(blocked))
             gained = 0
             if pending_v:
                 from .reassemble_video import reassemble_videos
-                gained += reassemble_videos(src, g, blocked, pending_v, own, soft=soft)
+                gained += reassemble_videos(src, g, blocked, pending_v, own, soft=soft, kinds=kinds)
                 pending_v = [r for r in pending_v if r.status != "ok"]
             if pending_s:
                 from .reassemble_stream import reassemble_streams
-                gained += reassemble_streams(src, g, blocked, pending_s, own, soft=soft)
+                gained += reassemble_streams(src, g, blocked, pending_s, own, soft=soft, kinds=kinds)
                 pending_s = [r for r in pending_s if r.status in ("partial", "corrupt")
                              or (r.status == "unverified" and r.note == NOT_PROVEN)]
             if gained and todo:

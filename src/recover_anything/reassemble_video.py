@@ -72,11 +72,15 @@ def _samples(moov: bytes, base: int):
 
 
 class _Video:
-    def __init__(self, src, geom, blocked: bytearray, start: int):
+    def __init__(self, src, geom, blocked: bytearray, start: int, kinds=None):
+        from .reassemble_stream import ClusterKinds
         self.src, self.g, self.blocked, self.start = src, geom, blocked, start
         self.cs = geom.cluster_size
         self.last = geom.last_cluster
-        self._plaus: dict = {}
+        from .reassemble import _or
+        self.kinds = kinds or ClusterKinds(src, geom)
+        self.free = _or(blocked, self.kinds.unusable())  # (the clusters in use don't change during one rebuild)
+        self._plaus: dict = {}  # (a last cluster, judged by the part the file uses)
         self.file_len = 0  # set once the index says how long the file is
         self.ambiguous = False
         self.heif = False
@@ -87,6 +91,12 @@ class _Video:
         judged: a last cluster is mostly leftover data from older files)."""
         if used is None and index is not None and self.file_len:
             used = self.file_len - index * self.cs
+        if used is None or used >= self.cs:
+            while True:  # (a whole cluster: the map already leaves out what can't be a video's)
+                n = self.free.find(0, c + 1, self.last + 1)
+                if n < 0 or n not in skip:
+                    return None if n < 0 else n
+                c = n
         while True:
             n = self.blocked.find(0, c + 1, self.last + 1)
             if n < 0:
@@ -100,6 +110,9 @@ class _Video:
         neither can JPEG image data (every 0xFF in it is followed by 0x00 or a
         restart marker), which is what most leftover data on a camera card is."""
         used = self.cs if used is None or used >= self.cs else max(0, used)
+        if used == self.cs:
+            from .reassemble_stream import OTHER
+            return self.kinds(c) == OTHER
         key = (c, used)
         v = self._plaus.get(key)
         if v is None:
@@ -437,11 +450,13 @@ class _Video:
         return None
 
 
-def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None, soft=None) -> int:
+def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None, soft=None, kinds=None) -> int:
     """Rebuild each video, first trying the clusters of files saved but not
     proven only after every unclaimed one (`soft`), then without that
     preference if the first try can't finish. Returns how many are now ok."""
     from .reassemble import _or, own_clusters
+    from .reassemble_stream import ClusterKinds
+    kinds = kinds or ClusterKinds(src, geom)
     done = 0
     for r in records:
         start = geom.cluster_at(r.start)
@@ -452,7 +467,7 @@ def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None
             for m in maps:
                 m[start] = 0
                 try:
-                    got = _Video(src, geom, m, start).run(r.expected_size)
+                    got = _Video(src, geom, m, start, kinds).run(r.expected_size)
                 except Exception:
                     got = None
                 if got and not got[2]:

@@ -188,6 +188,23 @@ def mp3_side(h: bytes, n: int):
     return mdb, bits, n - 4 - crc - side
 
 
+def mp3_side_end(h: bytes) -> int:
+    """Bytes from a Layer III frame's start through its side information: all
+    of the frame the reservoir check reads."""
+    if len(h) < 4:
+        return 4
+    v1, mono = (h[1] >> 3) & 3 == 3, h[3] >> 6 == 3
+    return 4 + (0 if h[1] & 1 else 2) + ((17 if mono else 32) if v1 else (9 if mono else 17))
+
+
+def mp3_info_frame(h: bytes) -> bool:
+    """Is this frame (first 42 bytes) a Xing, Info or VBRI header? An encoder
+    writes one as a song's first frame, never later, so one after the first
+    frame is another recording starting."""
+    e = mp3_side_end(h)
+    return h[e:e + 4] in (b"Xing", b"Info") or h[36:40] == b"VBRI"
+
+
 class Reservoir:
     """Layer III's bit reservoir ties each frame to the one before: its main
     data begins main_data_begin bytes back, in room the frames before left
@@ -257,6 +274,9 @@ def measure_mp3(read, start: int, limit: int) -> Result:
         if pos + n > limit:
             reason = "last frame cut short"
             break
+        if key is not None and mp3_info_frame(w.get(pos, 42)):
+            reason = "another recording starts here"
+            break
         side = mp3_side(w.get(pos, 40), n)
         if side is not None and res.step(side) == "bad":
             reason = "a frame of another recording follows here"  # its data can't be where it points
@@ -300,6 +320,52 @@ def _mp3_first(read):
     return mp3_frame(read(pos, 4))
 
 
+TAG_MAY_FOLLOW = ("all of its sound checked, but it ends exactly where a cluster does, so the song's "
+                  "tag (title, artist) may be in a part of the card that couldn't be found")
+
+
+def mp3_tag_may_follow(read, end: int, at_boundary: bool) -> bool:
+    """An MP3 whose own header gives the length of its sound can still carry
+    a 128-byte ID3v1 tag after it. Where the sound ends exactly at a cluster
+    boundary and no tag closes the file, the tag (if any) would be in the next
+    piece, which may be anywhere: the end isn't proven."""
+    return at_boundary and read(max(0, end - 128), 3) != b"TAG"
+
+
+UNMARKED = ("every frame checked, but a song with no tag could begin at a cluster boundary inside it "
+            "without leaving a trace; check that it plays to the end")
+
+
+def mp3_unmarked_start(read, length: int, ph: int, cs: int) -> bool:
+    """Could another song begin inside this one without a trace? A song's
+    first frame points 0 bytes back (its reservoir is empty), and one with no
+    tag or Info frame begins with nothing else. Where this recording's frame
+    ends exactly at a cluster boundary and the file broke there, such a song
+    starting in the next cluster lines up frame for frame and passes every
+    check, up to the very length the first song's Info header gives. So a
+    frame after the first that starts at a cluster boundary and points 0
+    bytes back may be where the data stops being this file's. (Tried and
+    dropped: the encoder's padding counter. A song with no tag at 128 kbit/s
+    and 44.1 kHz meets a cluster boundary every 49 frames, exactly where its
+    counter is back where a new song's starts.)
+    `ph` is how far into a cluster the file's first byte sits."""
+    w = _Win(read, 0)
+    h = w.get(0, 10)
+    pos = 10 + _synchsafe(h[6:10]) + (10 if h[5] & 0x10 else 0) if h[:3] == b"ID3" and len(h) >= 10 else 0
+    first = True
+    while pos + 4 <= length:
+        f = mp3_frame(w.get(pos, 4))
+        if f is None:
+            break
+        if not first and (ph + pos) % cs == 0:
+            side = mp3_side(w.get(pos, 40), f[0])
+            if side is not None and side[0] == 0:
+                return True
+        first = False
+        pos += f[0]
+    return False
+
+
 def validate_mp3(read, length: int, sized: bool, after: bytes = b"", grid=None, layout_known: bool = False, **_):
     m = measure_mp3(read, 0, length)
     nxt, first = mp3_frame(after[:4]), _mp3_first(read)
@@ -311,6 +377,11 @@ def validate_mp3(read, length: int, sized: bool, after: bytes = b"", grid=None, 
     if sized and m.end == length and after[:3] != b"TAG" and _runs_on(read, length, after, grid, 4, _mp3_continues):
         return "lost", OTHER_FILE, "structure"
     st = _sized_verdict(m, length, sized, "every frame checked", "structure", ends_here, tail_ok)
+    if st[0] == "ok" and not sized and not layout_known and grid and \
+            mp3_tag_may_follow(read, m.end, (grid[0] + m.end) % grid[1] == 0):
+        return "unverified", TAG_MAY_FOLLOW, "structure"
+    if st[0] == "ok" and not layout_known and grid and mp3_unmarked_start(read, m.end, grid[0], grid[1]):
+        return "unverified", UNMARKED, "structure"
     if st[0] == "ok" and not sized and m.kind != "start":
         return "unverified", NO_START, "structure"
     return st
@@ -362,6 +433,113 @@ def _flac_header(h: bytes):
     return bs, v, p + 1
 
 
+class _BitReader:
+    """Reads a byte string bit by bit, most significant first."""
+    __slots__ = ("d", "p", "n")
+
+    def __init__(self, d: bytes, byte_pos: int):
+        self.d, self.p, self.n = d, byte_pos * 8, len(d) * 8
+
+    def get(self, k: int) -> int:
+        if self.p + k > self.n:
+            raise IndexError
+        a, b = self.p >> 3, (self.p + k + 7) >> 3
+        v = int.from_bytes(self.d[a:b], "big") >> ((b << 3) - self.p - k)
+        self.p += k
+        return v & ((1 << k) - 1)
+
+    def unary(self) -> int:
+        """Zero bits up to the next one bit (which is read too)."""
+        z = 0
+        while True:
+            if self.p >= self.n:
+                raise IndexError
+            a, r = self.p >> 3, self.p & 7
+            byte = (self.d[a] << r) & 0xFF
+            if byte:
+                lead = 8 - byte.bit_length()
+                self.p += lead + 1
+                return z + lead
+            z += 8 - r
+            self.p += 8 - r
+
+
+_FLAC_BPS = {1: 8, 2: 12, 4: 16, 5: 20, 6: 24, 7: 32}
+
+
+def flac_frame_len(data: bytes, hlen: int, bs: int, bps: int):
+    """The length in bytes of the FLAC frame starting data (checksum
+    included), from its subframes: their headers, warm-up samples,
+    predictor coefficients and Rice-coded residual give every bit. None if
+    they don't parse (or data stops first). A frame's checksum closes at
+    many places by chance (1 in 65536 bytes); only this one is its end."""
+    try:
+        ch_code, size_code = data[3] >> 4, (data[3] >> 1) & 7
+        if size_code:
+            bps = _FLAC_BPS.get(size_code, 0)
+        if not bps or ch_code > 10:
+            return None
+        nch = ch_code + 1 if ch_code < 8 else 2
+        side = {8: 1, 9: 0, 10: 1}.get(ch_code)
+        b = _BitReader(data, hlen)  # (hlen counts the header's own checksum)
+        for c in range(nch):
+            sbps = bps + (1 if c == side else 0)
+            if b.get(1):
+                return None
+            t = b.get(6)
+            if b.get(1):
+                sbps -= b.unary() + 1  # 'wasted' low bits
+                if sbps <= 0:
+                    return None
+            if t == 0:
+                b.get(sbps)
+            elif t == 1:
+                b.p += bs * sbps
+            elif 8 <= t <= 12 or t >= 32:
+                order = t - 8 if t <= 12 else t - 31
+                if order > bs:
+                    return None
+                b.p += order * sbps
+                if t >= 32:
+                    prec = b.get(4) + 1
+                    if prec == 16:
+                        return None
+                    b.get(5)
+                    b.p += order * prec
+                method = b.get(2)
+                if method > 1:
+                    return None
+                pbits, esc = (4, 15) if method == 0 else (5, 31)
+                porder = b.get(4)
+                parts = 1 << porder
+                if bs % parts or (bs >> porder) < order:
+                    return None
+                for i in range(parts):
+                    n = (bs >> porder) - (order if i == 0 else 0)
+                    k = b.get(pbits)
+                    if k == esc:
+                        b.p += n * b.get(5)
+                    else:
+                        for _ in range(n):
+                            b.unary()
+                            b.p += k
+            else:
+                return None
+            if b.p > b.n:
+                return None
+        end = (b.p + 7) >> 3
+        if end + 2 > len(data) or b.get((8 - (b.p & 7)) & 7):  # (padding to a byte: zeros)
+            return None
+        return end + 2
+    except IndexError:
+        return None
+
+
+def flac_bps(info: bytes) -> int:
+    """Bits per sample from a STREAMINFO block."""
+    return (((info[12] & 1) << 4) | (info[13] >> 4)) + 1
+
+
 def measure_flac(read, start: int, limit: int) -> Result:
     pos, info = 4, None
     for _ in range(4096):
@@ -381,6 +559,7 @@ def measure_flac(read, start: int, limit: int) -> Result:
     min_fs = int.from_bytes(info[4:7], "big")
     max_fs = int.from_bytes(info[7:10], "big") or (16 << 20)
     total = ((info[13] & 15) << 32) | int.from_bytes(info[14:18], "big")
+    bps = flac_bps(info)
     samples, index = 0, 0
     tab = _CRC16
     while pos < limit:
@@ -390,9 +569,24 @@ def measure_flac(read, start: int, limit: int) -> Result:
         if hd is None or hd[1] != (samples if var else index):
             return Result(pos, False, ".flac", "frames stop here", break_pos=pos)
         bs, _num, hlen = hd
-        last = total and samples + bs >= total
+        if total and samples + bs > total:  # (an encoder makes the last frame exactly as long as what's left)
+            return Result(pos, False, ".flac", "a frame runs past the end the file gives: another file's",
+                          break_pos=pos)
+        last = total and samples + bs == total
         data = read(start + pos, min(max_fs + 2, limit - pos))
         crc, end = 0, 0
+        if last:
+            # Nothing follows the last frame to confirm where its checksum
+            # closes, and over a few kB of another file's data it closes
+            # somewhere by chance: only its own length (from its subframes) counts.
+            n = flac_frame_len(data, hlen, bs, bps)
+            if n is None:
+                return Result(pos, False, ".flac", "the last frame is cut short or isn't whole", break_pos=pos)
+            for b in data[:n]:
+                crc = ((crc << 8) & 0xFFFF) ^ tab[(crc >> 8) ^ b]
+            if crc:
+                return Result(pos, False, ".flac", "checksum mismatch in a frame", break_pos=pos)
+            return Result(pos + n, True, ".flac")
         for i, b in enumerate(data):
             crc = ((crc << 8) & 0xFFFF) ^ tab[(crc >> 8) ^ b]
             if crc == 0 and i + 1 >= max(hlen + 3, min_fs if last else 0):
@@ -534,6 +728,59 @@ def probe_ts(head: bytes) -> bool:
     return bool(head[p + 1] & 0x40) and pid in (0x0000, 0x0011, 0x001F) and not head[p + 1] & 0x80
 
 
+# A recording's streams all start within its first second or so; a stream id
+# (PID) first seen later, and not listed in its own tables (PAT and PMT), is
+# another file's data: a 0x47 byte that happens to sit where the next packet
+# would start. A new PID has no counter to check, so nothing else catches it.
+TS_SETTLE = 1000
+
+
+def _ts_tables(p: bytes, pmts: set, listed: set) -> None:
+    """Learn the PIDs a PAT or PMT section in this packet lists (p starts at
+    the sync byte). Sections whose CRC fails are ignored."""
+    if len(p) < 12 or not p[1] & 0x40:
+        return
+    pid = ((p[1] & 0x1F) << 8) | p[2]
+    if pid != 0 and pid not in pmts:
+        return
+    i = 4 + (1 + p[4] if (p[3] >> 4) & 2 else 0)
+    if i >= len(p):
+        return
+    i += 1 + p[i]  # pointer field
+    if i + 3 > len(p):
+        return
+    tid, slen = p[i], ((p[i + 1] & 0x0F) << 8) | p[i + 2]
+    sec = p[i:i + 3 + slen]
+    if slen < 13 or len(sec) < 3 + slen or crc32_msb(sec[:-4], 0xFFFFFFFF) != struct.unpack(">I", sec[-4:])[0]:
+        return
+    if pid == 0 and tid == 0:
+        body = sec[8:-4]
+        for k in range(0, len(body) - 3, 4):
+            ppid = ((body[k + 2] & 0x1F) << 8) | body[k + 3]
+            listed.add(ppid)
+            if body[k:k + 2] != b"\x00\x00":  # program 0 names the network PID
+                pmts.add(ppid)
+    elif tid == 2:
+        listed.add(((sec[8] & 0x1F) << 8) | sec[9])  # the clock's PID
+        j = 12 + (((sec[10] & 0x0F) << 8) | sec[11])
+        while j + 5 <= len(sec) - 4:
+            listed.add(((sec[j + 1] & 0x1F) << 8) | sec[j + 2])
+            j += 5 + (((sec[j + 3] & 0x0F) << 8) | sec[j + 4])
+
+
+def ts_pid_ok(p: bytes, n: int, seen: set, pmts: set, listed: set) -> bool:
+    """Packet n (p from its sync byte) may belong to this recording: its PID
+    was seen before, or it is still early, or the recording's tables list it."""
+    pid = ((p[1] & 0x1F) << 8) | p[2]
+    _ts_tables(p, pmts, listed)
+    if pid in seen:
+        return True
+    if n >= TS_SETTLE and pid > 0x1F and pid != 0x1FFF and pid not in listed:
+        return False
+    seen.add(pid)
+    return True
+
+
 def measure_ts(read, start: int, limit: int) -> Result:
     lay = _ts_layout(read(start, 1024))
     if not lay:
@@ -542,6 +789,7 @@ def measure_ts(read, start: int, limit: int) -> Result:
     ext = ".ts" if stride == 188 else ".mts"
     cc: dict = {}
     firsts: list = []  # each stream's first counter: a recorder starts every one at 0
+    seen, pmts, listed = set(), set(), set()
     clock = TsClock()
     pos, n, reason = 0, 0, "packets stop here"
     while pos + stride <= limit:
@@ -557,6 +805,10 @@ def measure_ts(read, start: int, limit: int) -> Result:
             pid = ((p[1] & 0x1F) << 8) | p[2]
             afc, c = (p[3] >> 4) & 3, p[3] & 15
             if afc == 0:
+                bad = True
+                break
+            if not ts_pid_ok(blk[q + off:q + stride], n, seen, pmts, listed):
+                reason = "a packet of a stream this recording never had (another file's data?)"
                 bad = True
                 break
             if pid != 0x1FFF and afc & 1:

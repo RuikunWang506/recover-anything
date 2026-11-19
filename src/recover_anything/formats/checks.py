@@ -270,6 +270,32 @@ def _avi_streams(read, length: int):
     return codecs, movi, idx1
 
 
+def avi_index_bad(idx: bytes, chunks: dict, movi: int, whole: bool):
+    """Where the AVI's index ('idx1') stops matching its movie data, or None.
+    `chunks` maps each chunk's position to (fourcc, size), for every chunk of
+    the movie list when `whole`. Each 16-byte entry gives a chunk's fourcc,
+    flags, position and size, so the whole index is checked against what was
+    walked: an entry pointing at no chunk is another file's data (the start
+    of another video, read where this one's index went on elsewhere)."""
+    base = None
+    for k in range(0, len(idx) - 15, 16):
+        ck, flags, off, size = struct.unpack("<4sIII", idx[k:k + 16])
+        if base is None:  # offsets count from the 'movi' fourcc (or just after it), or from the file's start
+            base = next((b for b in (movi, movi + 4, 0) if b + off in chunks), None)
+            if base is None:
+                return movi if whole else None
+        got = chunks.get(base + off)
+        if got is None:
+            if whole:
+                return base + off
+            continue
+        if (got[0] != b"LIST") if flags & 1 else (got != (ck, size)):  # (AVIIF_LIST: a 'rec ' group)
+            return base + off
+    if whole and len(idx) % 16:
+        return movi
+    return None
+
+
 def _validate_avi(read, length: int, layout_known: bool, deep: bool = True):
     codecs, movi, idx1 = _avi_streams(read, length)
     if movi is None:
@@ -312,15 +338,11 @@ def _validate_avi(read, length: int, layout_known: bool, deep: bool = True):
                 unproven += 1
         pos += 8 + size + (size & 1)
     if idx1:
+        whole = len(chunks) < MAX_FRAMES and idx1[1] - idx1[0] <= 16 * MAX_FRAMES
         raw = read(idx1[0], min(idx1[1] - idx1[0], 16 * MAX_FRAMES))
-        base = None
-        for k in range(0, len(raw) - 15, 16):
-            ck, _flags, off, size = struct.unpack("<4sIII", raw[k:k + 16])
-            if base is None:  # offsets count from the 'movi' fourcc (or just after it), or from the file's start
-                base = next((b for b in (movi[0], movi[0] + 4, 0) if b + off in chunks), 0)
-            got = chunks.get(base + off)
-            if got and got != (ck, size):
-                return "corrupt", "the index doesn't match the movie data at byte %d" % (base + off), base + off
+        bad = avi_index_bad(raw, chunks, movi[0], whole)
+        if bad is not None:
+            return "corrupt", "the index doesn't match the movie data at byte %d" % bad, bad
     if checked and not unproven:
         if decoded:
             return "ok", "%d of %d frames decoded, the rest checked at both ends" % (decoded, checked) \
