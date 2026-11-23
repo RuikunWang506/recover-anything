@@ -5,7 +5,7 @@ Status on 23 November 2026. It began as the handoff from the cloud build session
 ## Where things stand
 
 - **Repo:** github.com/RuikunWang506/recover-anything, branch `main`, public since 9 November 2026. Changes reach `main` through pull requests, which need all five CI jobs to pass.
-- **Size:** about 16,700 lines of Python in `src/` and 285 tests.
+- **Size:** about 16,700 lines of Python in `src/` and 286 tests.
 - **CI:** green on all five jobs: the tests on Ubuntu with Python 3.9 and on Ubuntu, macOS and Windows with 3.13, plus a job that builds the package and runs the installed wheel. On the latest Ubuntu, a step also checks the NTFS reader on a real NTFS volume (`tests/test_ntfs_real.py`).
 - **Self-test:** every file recovered byte for byte on all 7 simulated cards: FAT32 and exFAT; deleted, formatted, formatted then reused, and heavily fragmented.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
@@ -144,7 +144,14 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
   - **Winning proofs back (next, see the roadmap):** a stand-in needs the skipped file to be *newer* than the video (it overwrote the video's cluster); a real split skips files that were already there when the video was recorded. Comparing the skipped files' dates (folder entries, EXIF, `mvhd`) with the video's own would separate the two, if the clocks can be trusted.
 - **2.3: an MKV/WebM split inside its first cluster is rebuilt.** Its first cluster is often megabytes, so all that measured whole was its header, under 4 KB, which the carver dropped; the rebuilder never saw the video. The header is kept now (`head_only`) and dropped again in `pipeline.scan` if nothing more was found (a 71-byte one had been saved as "unverified"). MKV-only cards 1-60: saved byte for byte 1,494 → 1,556; WebM 1,465 → 1,522.
 - **2.5: a stream rebuilt but not proven is tried again in later rounds**, once other files have taken their clusters out of the way (TS cards 1-8: +1 proven; a few more MP3s saved byte for byte). A retried carved recording must still mark its start: its origin is "reassembled" by then, and `_settle` now checks that too.
-- **2.6 and 2.7 not started.**
+- **2.7 not started.**
+
+## Added on 23 November 2026, later (Phase 2: 2.6, the rebuild with the fewest jumps)
+
+- **2.6: when several pieces pass, a WebM or MKV rebuild keeps the one with the fewest jumps.** Inside a frame's data nothing is checked, so many candidates pass a search: the jump can go at any slot of the frame, and the first that passes is often one that jumps into another deleted file's cluster and back out (WebM card 1, `screen041.webm`: 2873 → 3717 → 4170 where the video goes 2877 → 4170). For walkers with `rank` (only `_Mkv`), `_Rebuild._search` now goes on for `RANK_EXTRA` (64) trials after the first that passes and keeps the one with the fewest jumps, stopping at once on one with a single jump.
+  - **Measured** (only which bytes are saved changes; what's proven, and 0 wrong, stay the same): WebM-only cards 1-60, saved byte for byte 298 → 306; seeds 1-30, rebuilds holding another file's piece 14 → 10. MKV-only cards 1-60: unchanged (352). Mixed cards 1-20: WebM 14 → 15; same time.
+  - **Tried:** 256 extra trials got 2 more WebMs (308) but cost about 10% more time on WebM cards. Preferring the later slot among equal jumps lost as many as it won: the cluster right after a run is often another deleted file's, and taking it shifts the jump by one (card 8, `screen043.webm`).
+  - **What's left:** the rest are the stand-in case itself: one cluster inside a frame, with the same number of jumps either way (card 1, `screen029.webm`: 2460 for 2878). Nothing in the file tells them apart; the date idea in the roadmap might.
 
 ## Tried and dropped
 
