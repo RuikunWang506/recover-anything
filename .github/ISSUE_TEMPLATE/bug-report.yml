@@ -27,4 +27,4 @@ body:
     attributes:
       label: Computer and version
       description: Your system, and what `recover-anything --version` prints.
-      placeholder: Windows 11, recover-anything 0.2.2
+      placeholder: Windows 11, recover-anything 0.2.3
