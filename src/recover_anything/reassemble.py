@@ -616,8 +616,11 @@ def reassemble_all(src, res, found: list[Found], progress=None, passes: int = 3)
             if pending_s:
                 from .reassemble_stream import reassemble_streams
                 gained += reassemble_streams(src, g, blocked, pending_s, own, soft=soft, kinds=kinds)
+                # (a rebuild that couldn't be proven may be, once others' clusters are settled:
+                # a join can then be the first cluster the file could go on in)
                 pending_s = [r for r in pending_s if r.status in ("partial", "corrupt")
-                             or (r.status == "unverified" and r.note == NOT_PROVEN)]
+                             or (r.status == "unverified" and (r.note == NOT_PROVEN
+                                                               or r.meta.get("reassembled_from")))]
             if gained and todo:
                 jpeg_round()
             if not gained or not (pending_v or pending_s or todo):

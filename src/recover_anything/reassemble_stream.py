@@ -1134,10 +1134,12 @@ class _Mkv(_Walker):
     must pass its codec's check (H.264/H.265 units, VP9/VP8/AV1 headers:
     more.VIDEO_FRAME_CHECKS), and cluster times must go forward. A frame's
     data past what its check reads proves nothing about the clusters it
-    fills, so a join only counts when a checked header falls in the cluster
-    right after it, and only where no other cluster could have come next
+    fills, so a join only counts when a checked header falls in the clusters
+    on both sides of it, and only where no other cluster could have come next
     (first_choice): frames of another video of the same kind pass these
-    checks too."""
+    checks too. (Both sides: when a newer file took one of a deleted video's
+    clusters, the cluster before it, another deleted file's, can fill that
+    place inside a frame, the join after it skipping the newer file.)"""
 
     need = 8
     first_choice = True
@@ -1173,6 +1175,10 @@ class _Mkv(_Walker):
             i = bisect.bisect_left(checks, s)
             if i == len(checks) or checks[i] >= s + g:
                 return False  # the cluster after the join lies inside a frame's data
+            if i == 0 or checks[i - 1] < s - g:
+                # ... or the one before it: a deleted file's cluster can stand in there
+                # for one this video lost to a newer file, the join then skipping that
+                return False
         return True
 
     def snapshot(self):
@@ -1682,7 +1688,8 @@ def _settle(src, geom, blocked, r, rb, out, start, was, own) -> bool:
         r.status, r.note = "ok", "every piece checked"
     elif r.kind == "mp3" and more.mp3_tag_may_follow(_Path(src, geom, clusters).read, length, length % cs == 0):
         r.status, r.note = "unverified", more.TAG_MAY_FOLLOW
-    elif r.origin == "carved" and not rb_start_marked(src, geom, clusters, length, r.kind):
+    elif r.origin in ("carved", "reassembled") and not rb_start_marked(src, geom, clusters, length, r.kind):
+        # ("reassembled": carved, and rebuilt once already without proof, now tried again)
         r.status, r.note = "unverified", more.NO_START
     elif _unit_follows(src, geom, clusters, length, r.kind):
         r.status, r.note = "unverified", ("every frame checked, but another recording's data follows it in "
@@ -1694,6 +1701,8 @@ def _settle(src, geom, blocked, r, rb, out, start, was, own) -> bool:
         r.meta["reassembled_from"] = pieces
         if r.origin == "carved":
             r.origin = "reassembled"
+    elif r.meta.pop("reassembled_from", None) and r.origin == "reassembled":
+        r.origin = "carved"  # (tried again, it turned out to be in one piece)
     if r.status == "ok":
         own(r)
         return True
