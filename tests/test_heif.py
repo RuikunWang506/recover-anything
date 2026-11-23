@@ -46,7 +46,10 @@ def test_a_deleted_iphone_photo_comes_back_recovered(workdir):
 def test_a_split_iphone_photo_is_rebuilt(workdir):
     """The phone fills the hole a deleted photo left, then goes on past the next
     photo. That photo checks out, so its clusters are its own, and the tiles
-    say where the rest of this one is."""
+    say where the rest of this one is. It's saved byte for byte, but not
+    marked recovered: the clusters on either side of the jump hold no tile
+    start, and there another deleted file's cluster could stand in for one a
+    newer file took (tests/test_stand_in_cluster.py)."""
     img = os.path.join(workdir, "split.img")
     heic, other = F.make_heic(6, size=600_000), F.make_heic(7, size=300_000)
     with Fat32Card(img, **SMALL) as card:
@@ -57,9 +60,11 @@ def test_a_split_iphone_photo_is_rebuilt(workdir):
         cl = card.write_file("IMG_0002.HEIC", heic)
         card.format()
     assert any(b != a + 1 for a, b in zip(cl, cl[1:]))
-    got = recovered_hashes(scan(img, workers=1))
-    assert sha(other) in got
-    assert sha(heic) in got and got[sha(heic)].meta.get("reassembled_from", 1) > 1
+    res = scan(img, workers=1)
+    assert sha(other) in recovered_hashes(res)
+    saved = {sha(r.read(res._src)): r for r in res.found}
+    assert sha(heic) in saved and saved[sha(heic)].meta.get("reassembled_from", 1) > 1
+    assert saved[sha(heic)].status == "unverified" and "opens" in saved[sha(heic)].note
 
 
 def test_a_split_photo_whose_break_cant_be_placed_is_only_saved(workdir):

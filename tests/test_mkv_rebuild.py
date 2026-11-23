@@ -4,7 +4,7 @@ cluster right after it, and where no other cluster could have come next."""
 import os
 import random
 
-from conftest import SMALL, recovered_hashes, sha
+from conftest import SMALL, UNPROVEN_JOIN, saved_hashes, sha
 from recover_anything import reassemble_stream as RS
 from recover_anything.pipeline import scan
 from recover_anything.simcard import files as F
@@ -53,8 +53,9 @@ def _found(res, data):
 def test_a_split_webm_deleted_by_accident_is_rebuilt(workdir):
     video = F.make_mkv(5, clusters=3, webm=True)
     res = _split(workdir, video, hole=30)
-    assert sha(video) in recovered_hashes(res)
-    assert recovered_hashes(res)[sha(video)].meta.get("reassembled_from") == 2
+    got = saved_hashes(res)[sha(video)]                # byte for byte, from 2 pieces
+    assert got.meta.get("reassembled_from") == 2
+    assert got.status == UNPROVEN_JOIN                 # (the join lies inside a frame)
 
 
 def test_a_join_another_cluster_could_have_filled_is_not_proof(workdir):

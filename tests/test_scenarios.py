@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from conftest import SMALL, recovered_hashes, sha
+from conftest import SMALL, UNPROVEN_JOIN, recovered_hashes, saved_hashes, sha
 from recover_anything.pipeline import scan
 from recover_anything.simcard import scenarios
 
@@ -150,9 +150,10 @@ def test_fragmented_video_is_rebuilt(workdir, moov_first):
         card.format(recreate_dirs=["DCIM", "DCIM/100CANON"])
     assert any(b != a + 1 for a, b in zip(cl, cl[1:])), "test setup should fragment the video"
     res = scan(img, workers=1)
-    got = recovered_hashes(res)
-    assert sha(v) in got
+    got = saved_hashes(res)
+    assert sha(v) in got                                # byte for byte
     assert got[sha(v)].meta.get("reassembled_from", 1) > 1
+    assert got[sha(v)].status == UNPROVEN_JOIN
 
 
 def test_fragmented_video_with_long_pcm_audio_is_rebuilt(workdir):
@@ -179,8 +180,8 @@ def test_fragmented_video_with_long_pcm_audio_is_rebuilt(workdir):
         cl = card.write_file("DCIM/100CANON/MVI_0041.MOV", v)
         card.format()
     assert any(b != a + 1 for a, b in zip(cl, cl[1:])), "test setup should fragment the video"
-    got = recovered_hashes(scan(img, workers=1))
-    assert sha(v) in got
+    got = saved_hashes(scan(img, workers=1))
+    assert sha(v) in got                                # byte for byte (its long audio table didn't stop it)
 
 
 @pytest.mark.parametrize("fs", ["FAT32", "exFAT"])

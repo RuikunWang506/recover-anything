@@ -235,6 +235,15 @@ class _Video:
             full = nxt
         n = (total + cs - 1) // cs
         full = full[:n]
+        conf = self._confirmed(len(full), checks, fixed, v_end)
+        if any(b != a + 1 and not (i - 1 in conf and i in conf)
+               for i, (a, b) in enumerate(zip(full, full[1:]), 1)):
+            # A cluster that holds no frame start is placed only by its count:
+            # whatever free cluster comes next fits there. Next to a jump, that
+            # can be another deleted file's, standing in for one of this video's
+            # that a newer file took (the jump skips that file). So a jump only
+            # counts where a frame start is checked on both sides of it.
+            self.ambiguous = True
         if self.ambiguous:
             full = self._fewest_jumps(full, checks, fixed, v_end)
         rd = lambda o, k: self.vread(full, o, k)  # noqa: E731
@@ -250,10 +259,7 @@ class _Video:
         as it is, or part running on from the checked cluster before it and
         the rest running up to the checked cluster after it. The file stays
         'check that it plays'; this only makes it far more likely to play."""
-        cs = self.cs
-        conf = {0} | set(fixed) | set(range(v_end // cs, len(full)))
-        for o, _sz, _h in checks:
-            conf.update(range(o // cs, (o + 4) // cs + 1))
+        conf = self._confirmed(len(full), checks, fixed, v_end)
         out = list(full)
         used = set(out)
 
@@ -291,6 +297,15 @@ class _Video:
                 used |= set(best)
                 out[a:i] = best
         return out
+
+    def _confirmed(self, n, checks, fixed, v_end) -> set:
+        """The file's clusters that something checks: its start, the index,
+        and every one holding a frame start."""
+        cs = self.cs
+        conf = {0} | set(fixed) | set(range(v_end // cs, n))
+        for o, _sz, _h in checks:
+            conf.update(range(o // cs, (o + 4) // cs + 1))
+        return conf
 
     def _materialize(self, path, fixed, upto):
         full = list(path)
@@ -482,7 +497,8 @@ def reassemble_videos(src, geom, blocked: bytearray, records, own, progress=None
         r.extents = _extents(geom, clusters, length)
         if ambiguous:
             r.status = "unverified"
-            r.note = "rebuilt, but some pieces could not be confirmed; check that it plays"
+            r.note = "rebuilt, but some pieces could not be confirmed; check that it %s" % (
+                "opens" if r.ext in (".heic", ".heif") else "plays")
             r.meta["unsure_layout"] = True  # not evidence of where other files are
         else:
             r.status = "ok"

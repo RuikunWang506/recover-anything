@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from conftest import SMALL, recovered_hashes, sha
+from conftest import SMALL, UNPROVEN_JOIN, recovered_hashes, saved_hashes, sha
 from recover_anything.pipeline import scan
 from recover_anything.simcard.fat32 import Fat32Card
 
@@ -55,7 +55,8 @@ def test_lost_folders_are_known_as_folders(workdir):
 def card5(tmp_path_factory):
     """Regression, from a randomized card (seed 5): two videos split around a
     folder's cluster, a dashcam clip and an unproven HEIC photo were both
-    rebuilt from the wrong pieces. Now the first is recovered, and the second,
+    rebuilt from the wrong pieces. Now the first comes back byte for byte (its
+    jumps have frame data on one side: 'check that it plays'), and the second,
     whose break falls inside one large frame where nothing can be checked,
     comes back byte for byte (still labeled 'check that it plays', because
     nothing proves those clusters)."""
@@ -77,7 +78,7 @@ def card5(tmp_path_factory):
 
 def test_a_video_split_around_a_folder_and_a_dashcam_clip_is_rebuilt(card5):
     sc, log, res = card5
-    assert sha(log["DCIM/MVI_0047.MP4"]) in recovered_hashes(res)
+    assert saved_hashes(res)[sha(log["DCIM/MVI_0047.MP4"])].status == UNPROVEN_JOIN  # byte for byte
 
 
 def test_an_unchecked_stretch_is_filled_with_the_fewest_jumps(card5):
