@@ -239,9 +239,17 @@ def carve(src, region_start: int, region_end: int, align: int, base: int, known_
             inside[kind] = off + last if not complete and last is not None and kind != "pdf" else off + length
         if kinds and group_of(kind, ext) not in kinds:
             continue
+        head_only = False
         if kind != "jpeg" and not complete and length < 4096:
-            continue
+            if kind != "mkv":
+                continue
+            # A Matroska file's first cluster is often megabytes, so when it's broken
+            # early, all that measures whole is its header. Keep it for the rebuilder
+            # (pipeline drops it again if that finds no more).
+            head_only = True
         rec = Found(kind=kind, ext=ext, extents=[(off, length)], origin="carved", deleted=True)
+        if head_only:
+            rec.meta["head_only"] = True
         rec.status = "unverified" if complete else "partial"
         rec.note = "" if complete else reason
         rec.meta["next_header"] = nxt

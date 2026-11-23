@@ -595,6 +595,7 @@ def scan(path: str, kinds=None, include_live: bool = False, reassemble: bool = T
         pass
     _mark_unreadable(all_found, bad)
     res.found = [r for r in all_found if r.status != "embedded" and not r.meta.get("moved_to_trash")
+                 and not (r.meta.get("head_only") and r.size < 4096)  # (a bare header nothing was found for)
                  and not r.meta.get("trash_record") and not r.meta.get("clutter")
                  and (include_live or not r.meta.get("live") or r.meta.get("trash")
                       or r.meta.get("card_unreadable"))]
