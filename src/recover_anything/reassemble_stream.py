@@ -26,6 +26,7 @@ MAX_TRIALS = 6000     # candidate pieces tried per file, in all
 MAX_PIECES = 64       # more breaks than this: give up on the file
 SPAN = 8              # clusters a single unit (page, frame) may stretch over
 KEEP_STATES = 256     # walker states kept for the latest clusters (see _Rebuild.run)
+RANK_EXTRA = 64       # trials after the first that passes, looking for one with fewer jumps (see _search)
 
 
 class _Path:
@@ -1143,6 +1144,7 @@ class _Mkv(_Walker):
 
     need = 8
     first_choice = True
+    rank = True  # (several pieces can pass inside a frame's data: _search picks the fewest jumps)
     ends_known = True  # (it decides its own end: see advance)
     MAX_STEP = 600  # seconds a cluster's time may jump ahead
 
@@ -1496,6 +1498,7 @@ class _Rebuild:
     def _search(self, first: int, u: int, snap, span: int = SPAN):
         """Try the next piece starting at each slot the failing unit covers."""
         slots = range(first, min(len(self.path), first + span))
+        best = None  # (jumps, trial, stop after this many trials) of the best that passed (walkers with `rank`)
         for skip_soft in ((True, False) if self.soft is not None else (False,)):
             # Round robin over the slots: the k-th candidate for every slot
             # before the (k+1)-th for any, so a break in a later slot is found
@@ -1508,9 +1511,11 @@ class _Rebuild:
             taken = {j: set(self.path[:j]) for j in slots}
             live = sorted(slots, key=lambda j: (self.path[j] == self.path[j - 1] + 1, j))
             for _k in range(MAX_SCAN):
-                if not live or self.trials >= MAX_TRIALS:
+                if not live or self.trials >= MAX_TRIALS or (best and self.trials >= best[2]):
                     break
                 for j in list(live):
+                    if best and self.trials >= best[2]:
+                        break
                     prefix = self.path[:j]
                     c = self.next_free(state[j], taken[j], skip_soft)
                     while c is not None and (c == self.path[j] or (not skip_soft and self.soft is not None
@@ -1523,7 +1528,22 @@ class _Rebuild:
                     self.trials += 1
                     trial = prefix + [c]
                     if self._passes(trial, j, snap, span):
-                        return trial
+                        if not getattr(self.w, "rank", False):
+                            return trial
+                        # Inside a video frame's data many pieces pass, and the first is
+                        # often one that jumps into another file's cluster and back out
+                        # (2873 -> 3717 -> 4170 where the video goes 2877 -> 4170: WebM
+                        # card 1). So look on a while and keep the one with the fewest
+                        # jumps, the earliest found among equals (a later slot is no
+                        # likelier: the cluster right after a run is often another
+                        # deleted file's, and taking it shifts the jump by one).
+                        jumps = sum(1 for a, b in zip(trial[first - 1:], trial[first:]) if b != a + 1)
+                        if jumps <= 1:
+                            return trial  # (one jump is what a break takes: look no further)
+                        if best is None or jumps < best[0]:
+                            best = (jumps, trial, best[2] if best else self.trials + RANK_EXTRA)
+            if best:
+                return best[1]
         return None
 
     def _passes(self, trial, j, snap, span: int = SPAN) -> bool:
