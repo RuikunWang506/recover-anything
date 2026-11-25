@@ -5,7 +5,7 @@ Status on 23 November 2026. It began as the handoff from the cloud build session
 ## Where things stand
 
 - **Repo:** github.com/RuikunWang506/recover-anything, branch `main`, public since 9 November 2026. Changes reach `main` through pull requests, which need all five CI jobs to pass.
-- **Size:** about 16,700 lines of Python in `src/` and 286 tests.
+- **Size:** about 16,700 lines of Python in `src/` and 287 tests.
 - **CI:** green on all five jobs: the tests on Ubuntu with Python 3.9 and on Ubuntu, macOS and Windows with 3.13, plus a job that builds the package and runs the installed wheel. On the latest Ubuntu, a step also checks the NTFS reader on a real NTFS volume (`tests/test_ntfs_real.py`).
 - **Self-test:** every file recovered byte for byte on all 7 simulated cards: FAT32 and exFAT; deleted, formatted, formatted then reused, and heavily fragmented.
 - **Stress test:** 9 randomized cards with fixed seeds. It recovered 432 of 432 files byte for byte, including 104 of 104 fragmented photos and 32 of 32 videos (12 of them fragmented). No file was marked recovered unless it was exact.
@@ -152,6 +152,10 @@ The first review's fixes (the fail-closed guard, crash-proof parsers and honest 
   - **Measured** (only which bytes are saved changes; what's proven, and 0 wrong, stay the same): WebM-only cards 1-60, saved byte for byte 298 → 306; seeds 1-30, rebuilds holding another file's piece 14 → 10. MKV-only cards 1-60: unchanged (352). Mixed cards 1-20: WebM 14 → 15; same time.
   - **Tried:** 256 extra trials got 2 more WebMs (308) but cost about 10% more time on WebM cards. Preferring the later slot among equal jumps lost as many as it won: the cluster right after a run is often another deleted file's, and taking it shifts the jump by one (card 8, `screen043.webm`).
   - **What's left:** the rest are the stand-in case itself: one cluster inside a frame, with the same number of jumps either way (card 1, `screen029.webm`: 2460 for 2878). Nothing in the file tells them apart, and the files' dates can't either (see "Tried and dropped").
+
+## Added on 25 November 2026 (CI: Windows ran out of disk space)
+
+- **The Windows job ran out of disk space on four pull requests in a row** ("No space left on device" in the quick self-test, after every test had passed). A `Source` holds a plain file number, so one a test never closed stayed open until the run ended, and 64 of the tests' 71 scans never closed theirs. Windows can't delete an open file, so pytest's cleanup skipped those cards without a word, and test cards take their full size there (320 MB for `SMALL`). `tests/conftest.py` now closes every card image a test opened before its folder is deleted, and the module fixture in `test_rebuild_evidence.py` closes its own. Checked on macOS by listing the files still open after each test: 7 cards from two test files before, none now (only a module's shared card, while its tests run). `Source.close` is now safe to call twice: a second `os.close` could close another file given the same number (`tests/test_source_close.py`). The Windows job prints its free disk space after the tests ("disk space left after the tests (details)").
 
 ## Tried and dropped
 

@@ -183,8 +183,13 @@ class Source:
         return data + bytes(n - len(data)) if len(data) < n else data
 
     def close(self) -> None:
+        # Once only: a second os.close could close another file that has
+        # since been given the same number.
+        fd, self._fd = self._fd, -1
+        if fd < 0:
+            return
         try:
-            os.close(self._fd)
+            os.close(fd)
         except OSError:
             pass
 

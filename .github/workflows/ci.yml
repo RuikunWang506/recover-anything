@@ -28,6 +28,14 @@ jobs:
         if: always() && runner.os != 'Linux'
         shell: bash
         run: cat "$GITHUB_WORKSPACE/guard-diag.txt" || echo "no details recorded"
+      - name: disk space left after the tests (details)
+        # Test cards take their full size on Windows; one left open can't be deleted.
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='Free GB';e={[math]::Round($_.Free / 1GB, 1)}}
+          $left = Get-ChildItem "$env:TEMP" -Directory -Filter 'pytest-of-*' -ErrorAction SilentlyContinue | Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum
+          "pytest folders left in TEMP: {0} files, {1:N1} GB" -f $left.Count, ($left.Sum / 1GB)
       - name: selftest (quick)
         run: recover-anything selftest --quick
       - name: NTFS reader on a real NTFS volume (mkntfs, ntfs-3g)
