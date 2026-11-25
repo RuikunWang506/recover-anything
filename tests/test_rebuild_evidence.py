@@ -73,7 +73,9 @@ def card5(tmp_path_factory):
         sc = scenarios.mixed_device(str(tmp_path_factory.mktemp("card5")), 5)
     finally:
         Card.write_file = orig
-    return sc, log, scan(sc.image, workers=1)
+    res = scan(sc.image, workers=1)
+    yield sc, log, res
+    res._src.close()
 
 
 def test_a_video_split_around_a_folder_and_a_dashcam_clip_is_rebuilt(card5):
